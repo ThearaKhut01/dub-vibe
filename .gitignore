@@ -1,0 +1,42 @@
+# --- Dependencies ---
+node_modules/
+.venv/
+
+# --- Frontend build artifacts ---
+frontend/dist/
+frontend/vite.config.js
+frontend/vite.config.d.ts
+frontend/*.tsbuildinfo
+
+# --- Rust / Tauri build outputs ---
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# --- Sidecar output (created by scripts/build-backend-sidecar.ps1) ---
+# Bundle models are copied in from %LOCALAPPDATA%\DubVibe Studio\models at build time.
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
+
+# --- Python ---
+__pycache__/
+*.pyc
+
+# --- Runtime data (project media, chunks, stems, sqlite) ---
+/data/
+backend/data/
+
+# --- Downloaded model cache (managed via Model Manager) ---
+/models/
+
+# --- Debug / local artifacts ---
+duck-debug.mp4
+*.log
+
+# --- Secrets ---
+.env
+.env.*
+
+# --- Editor / OS ---
+.vscode/
+.DS_Store
+Thumbs.db

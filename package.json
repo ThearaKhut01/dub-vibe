@@ -1,0 +1,21 @@
+{
+  "name": "dub-vibe",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "concurrently \"npm run frontend\" \"npm run backend\"",
+    "frontend": "npm --prefix frontend run dev -- --host 0.0.0.0",
+    "setup:backend": "py -3.10 -m venv .venv && .venv\\Scripts\\python.exe -m pip install -r backend/requirements.txt",
+    "build:sidecar": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\build-backend-sidecar.ps1",
+    "backend": ".venv\\Scripts\\python.exe -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8001 --reload",
+    "build": "npm --prefix frontend run build",
+    "preview": "npm --prefix frontend run preview -- --host 0.0.0.0",
+    "tauri:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\run-tauri-dev.ps1",
+    "tauri:build": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\run-tauri-build.ps1",
+    "desktop": "npm run tauri:dev"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "concurrently": "^9.0.1"
+  }
+}
