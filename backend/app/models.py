@@ -80,7 +80,7 @@ class ProcessingRequest(BaseModel):
     platform_style: Literal['original', 'vertical', 'standard', 'square'] = 'original'
     platform_fit: Literal['blur', 'crop'] = 'blur'
     # Voice engine + acting (movie dubbing).
-    tts_provider: str = 'auto'           # auto | gemini | openai | edge | mms_khm | sapi5
+    tts_provider: str = 'auto'           # auto | gemini | openai | edge | mms_khm | mms_khm_base | sapi5
     tts_model: str | None = None         # provider-specific TTS model
     emotion: str = 'Auto'                # Auto = analyzed per line
     intensity: int = Field(default=70, ge=0, le=100)

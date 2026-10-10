@@ -316,19 +316,27 @@ def delete_qwen() -> None:
     shutil.rmtree(qwen_local.qwen_model_dir(), ignore_errors=True)
 
 
+
 # ---------------------------------------------------------------------------
 # Khmer offline TTS (MMS-VITS). Non-commercial license (cc-by-nc-4.0).
 # Downloaded only when the user clicks Download; never fetched automatically.
+# Each Khmer model has its own job key, so downloads never interfere.
 # ---------------------------------------------------------------------------
 
-MMS_KHM_JOB_ID = 'mms-tts-khm'
+MMS_JOB_PREFIX = 'mms-tts:'
 
 
-def mms_khm_status() -> dict:
+def _mms_job_id(engine_id: str) -> str:
+    return f'{MMS_JOB_PREFIX}{engine_id}'
+
+
+def mms_status(engine_id: str) -> dict:
     from . import mms_tts_local
 
-    job = _DOWNLOADS.get(MMS_KHM_JOB_ID)
-    installed = mms_tts_local.is_installed()
+    spec = mms_tts_local.spec_for(engine_id)
+    job_id = _mms_job_id(engine_id)
+    job = _DOWNLOADS.get(job_id)
+    installed = mms_tts_local.is_installed(engine_id)
     if job and job.get('status') == 'downloading':
         status = 'downloading'
     elif job and job.get('status') == 'error':
@@ -337,69 +345,76 @@ def mms_khm_status() -> dict:
         status = 'installed'
     else:
         status = 'not_installed'
-    size_mb = round(_dir_size_mb(mms_tts_local.mms_model_dir()), 1) if installed else None
+    size_mb = round(_dir_size_mb(mms_tts_local.mms_model_dir(engine_id)), 1) if installed else None
     return {
-        'id': MMS_KHM_JOB_ID,
-        'name': 'Khmer MMS-VITS (offline Khmer voice, non-commercial)',
-        'repo': mms_tts_local.MMS_KHM_REPO,
+        'id': engine_id,
+        'name': spec.name,
+        'repo': spec.repo,
         'installed': installed,
-        'loaded': False,
+        'loaded': engine_id in mms_tts_local._LOADED,
         'selected': False,
         'status': status,
         'progress': job.get('progress', 0) if job else 0,
         'downloaded_mb': round(job.get('downloaded', 0), 1) if job else 0,
-        'total_mb': mms_tts_local.MMS_KHM_SIZE_MB,
+        'total_mb': spec.size_mb,
         'size_mb': size_mb,
-        'path': str(mms_tts_local.mms_model_dir()) if installed else None,
+        'path': str(mms_tts_local.mms_model_dir(engine_id)) if installed else None,
         'error': job.get('error') if job else None,
     }
 
 
-def start_download_mms_khm() -> dict:
+def mms_statuses() -> list[dict]:
     from . import mms_tts_local
 
+    return [mms_status(engine_id) for engine_id in mms_tts_local.MMS_MODELS]
+
+
+def start_download_mms(engine_id: str) -> dict:
+    from . import mms_tts_local
+
+    spec = mms_tts_local.spec_for(engine_id)
+    job_id = _mms_job_id(engine_id)
     with _STATE_LOCK:
-        job = _DOWNLOADS.get(MMS_KHM_JOB_ID)
+        job = _DOWNLOADS.get(job_id)
         if job and job.get('status') == 'downloading':
             return job
-        if mms_tts_local.is_installed():
+        if mms_tts_local.is_installed(engine_id):
             return {'status': 'installed', 'progress': 100}
         free_bytes = shutil.disk_usage(models_root()).free
-        needed = mms_tts_local.MMS_KHM_SIZE_MB * 1024 * 1024 * 1.25
+        needed = spec.size_mb * 1024 * 1024 * 1.25
         if free_bytes < needed:
             raise ValueError(
                 f'Not enough disk space: {needed / 2**30:.1f} GB needed, '
                 f'{free_bytes / 2**30:.1f} GB free on {models_root()}'
             )
         job = {'status': 'downloading', 'progress': 0, 'downloaded': 0.0, 'error': None}
-        _DOWNLOADS[MMS_KHM_JOB_ID] = job
+        _DOWNLOADS[job_id] = job
 
     def worker() -> None:
         try:
             def job_progress(percent: int) -> None:
-                job.update(progress=percent, downloaded=mms_tts_local.MMS_KHM_SIZE_MB * percent / 100)
+                job.update(progress=percent, downloaded=spec.size_mb * percent / 100)
 
-            mms_tts_local.download(job_progress)
+            mms_tts_local.download(engine_id, job_progress)
             job.update(status='installed', progress=100)
         except Exception as error:  # noqa: BLE001
             job.update(status='error', error=str(error))
 
-    threading.Thread(target=worker, name='download-mms-tts-khm', daemon=True).start()
+    threading.Thread(target=worker, name=f'download-{engine_id}', daemon=True).start()
     return job
 
 
-def delete_mms_khm() -> None:
+def delete_mms(engine_id: str) -> None:
     from . import mms_tts_local
 
+    job_id = _mms_job_id(engine_id)
     with _STATE_LOCK:
-        job = _DOWNLOADS.get(MMS_KHM_JOB_ID)
+        job = _DOWNLOADS.get(job_id)
         if job and job.get('status') == 'downloading':
             raise ValueError('Cannot delete a model while it is downloading.')
-        mms_tts_local.unload()
-        _DOWNLOADS.pop(MMS_KHM_JOB_ID, None)
-    shutil.rmtree(mms_tts_local.mms_model_dir(), ignore_errors=True)
-
-
+        mms_tts_local.unload(engine_id)
+        _DOWNLOADS.pop(job_id, None)
+    shutil.rmtree(mms_tts_local.mms_model_dir(engine_id), ignore_errors=True)
 # ---------------------------------------------------------------------------
 # Demucs 6-stem separation model (audio separation feature)
 # ---------------------------------------------------------------------------

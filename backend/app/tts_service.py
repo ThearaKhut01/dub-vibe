@@ -3,11 +3,11 @@
 One service for every interface. Resolution order:
   1. Character profile override (provider + voice live on the character).
   2. Requested provider preference.
-  3. Quality-ordered fallback: gemini -> openai -> edge -> mms_khm -> sapi5.
+  3. Quality-ordered fallback: gemini -> openai -> edge -> mms_khm -> mms_khm_base -> sapi5.
 Language capability is checked per provider (Khmer is NOT claimed where the
 provider does not officially support it — it falls back to Edge TTS, which
-does support Khmer). mms_khm is an offline Khmer-only model used when Edge
-TTS is unavailable. Paid API results are cached under
+does support Khmer). mms_khm and mms_khm_base are offline Khmer-only models
+used when Edge TTS is unavailable. Paid API results are cached under
 %LOCALAPPDATA%-style model root: cache/tts/<provider>/ so identical requests
 (text + voice + model + acting style + speed) never cost twice.
 """
@@ -29,8 +29,8 @@ from .online_providers import (
     openai_synthesize,
 )
 
-QUALITY_ORDER = ['gemini', 'openai', 'edge', 'mms_khm', 'sapi5']
-OFFLINE_KHMER_PROVIDERS = ('mms_khm',)
+QUALITY_ORDER = ['gemini', 'openai', 'edge', 'mms_khm', 'mms_khm_base', 'sapi5']
+OFFLINE_KHMER_PROVIDERS = ('mms_khm', 'mms_khm_base')
 
 
 def tts_cache_dir(provider: str) -> Path:
@@ -61,7 +61,7 @@ def language_supported(provider: str, lang_code: str) -> bool:
         return lang in gemini_capabilities(GEMINI_DEFAULT_MODEL)['languages']
     if provider == 'openai':
         return lang in openai_capabilities(OPENAI_DEFAULT_MODEL)['languages']
-    if provider == 'mms_khm':
+    if provider in OFFLINE_KHMER_PROVIDERS:
         return lang == 'km'
     return True  # Edge TTS (incl. Khmer) and SAPI5 carry their own voices
 
@@ -71,7 +71,7 @@ def _default_voice(provider: str, requested: str | None) -> str:
         return requested if requested in GEMINI_VOICES else 'Kore'
     if provider == 'openai':
         return requested if requested in OPENAI_VOICES else 'alloy'
-    if provider == 'mms_khm':
+    if provider in OFFLINE_KHMER_PROVIDERS:
         return 'khm-single'
     return requested or 'auto'
 
@@ -131,10 +131,10 @@ def synthesize_line(text: str, out_path: str, *, provider_pref: str, language_na
                 from .providers import EdgeTTSProvider
 
                 asyncio.run(EdgeTTSProvider().synthesize(text, voice, out_path, language_name))
-            elif provider == 'mms_khm':
+            elif provider in OFFLINE_KHMER_PROVIDERS:
                 from .mms_tts_local import MmsKhmerProvider
 
-                MmsKhmerProvider().synthesize(text, voice, out_path, language_name, speed=speed)
+                MmsKhmerProvider(provider).synthesize(text, voice, out_path, language_name, speed=speed)
             elif provider == 'sapi5':
                 from .providers import Pyttsx3Provider
 

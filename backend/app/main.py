@@ -55,8 +55,8 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
 from urllib.parse import quote
 
-from backend.app.chunking import SmartChunkEngine, format_timestamp
-from backend.app import acting, api_keys, cuda_pack, model_manager, online_providers, speaker_diarization, tts_service
+from backend.app.chunking import SmartChunkEngine, format_timestamp, split_subtitle_cues
+from backend.app import acting, api_keys, cuda_pack, mms_tts_local, model_manager, online_providers, speaker_diarization, tts_service
 from backend.app.models import ProjectRequest, ProjectSummary, ProviderSettings, ProcessingRequest, SegmentSplit, SegmentUpdate, WorkflowProgress
 from backend.app.providers import (
     FasterWhisperProvider,
@@ -182,10 +182,11 @@ def find_media_tool(name: str) -> str | None:
 
 def build_srt(segments: list[dict[str, Any]]) -> str:
     lines: list[str] = []
-    for index, segment in enumerate(segments, start=1):
-        start = format_timestamp(float(segment.get('start', 0))).replace('.', ',')
-        end = format_timestamp(float(segment.get('end', 0))).replace('.', ',')
-        text = str(segment.get('text', '')).replace('\r', ' ').replace('\n', ' ').strip()
+    cues = [cue for segment in segments for cue in split_subtitle_cues(segment)]
+    for index, cue in enumerate(cues, start=1):
+        start = format_timestamp(float(cue.get('start', 0))).replace('.', ',')
+        end = format_timestamp(float(cue.get('end', 0))).replace('.', ',')
+        text = str(cue.get('text', '')).replace('\r', ' ').strip()
         lines.extend((str(index), f'{start} --> {end}', text, ''))
     return '\n'.join(lines)
 
@@ -388,7 +389,7 @@ async def list_all_models() -> dict[str, Any]:
             {
                 'id': 'mms-khm',
                 'name': 'Khmer MMS-VITS (offline Khmer TTS)',
-                'models': [model_manager.mms_khm_status()],
+                'models': model_manager.mms_statuses(),
             },
         ],
         'settings': model_manager.load_settings(),
@@ -529,27 +530,40 @@ async def qwen_model_status() -> dict[str, Any]:
     return model_manager.qwen_status()
 
 
+def _mms_engine_or_404(engine_id: str) -> str:
+    if engine_id not in mms_tts_local.MMS_MODELS:
+        raise HTTPException(status_code=404, detail=f'Unknown Khmer TTS model: {engine_id}')
+    return engine_id
+
+
 @app.get('/api/models/mms-khm')
-async def mms_khm_model_status() -> dict[str, Any]:
-    return model_manager.mms_khm_status()
+async def mms_models_list() -> dict[str, Any]:
+    return {'engine': 'mms-khm', 'models': model_manager.mms_statuses()}
 
 
-@app.post('/api/models/mms-khm/download')
-async def download_mms_khm_model() -> dict[str, Any]:
+@app.get('/api/models/mms/{engine_id}')
+async def mms_model_status(engine_id: str) -> dict[str, Any]:
+    return model_manager.mms_status(_mms_engine_or_404(engine_id))
+
+
+@app.post('/api/models/mms/{engine_id}/download')
+async def download_mms_model(engine_id: str) -> dict[str, Any]:
+    _mms_engine_or_404(engine_id)
     try:
-        job = model_manager.start_download_mms_khm()
+        job = model_manager.start_download_mms(engine_id)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    return {'status': 'ok', 'model': model_manager.MMS_KHM_JOB_ID, 'job': job}
+    return {'status': 'ok', 'model': engine_id, 'job': job}
 
 
-@app.delete('/api/models/mms-khm')
-async def delete_mms_khm_model() -> dict[str, str]:
+@app.delete('/api/models/mms/{engine_id}')
+async def delete_mms_model(engine_id: str) -> dict[str, str]:
+    _mms_engine_or_404(engine_id)
     try:
-        model_manager.delete_mms_khm()
+        model_manager.delete_mms(engine_id)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    return {'status': 'ok', 'deleted': model_manager.MMS_KHM_JOB_ID}
+    return {'status': 'ok', 'deleted': engine_id}
 
 
 # --- Online provider keys (stored in Windows Credential Manager, never sent
@@ -636,15 +650,18 @@ async def tts_capabilities(model: str | None = None) -> dict[str, Any]:
             'key_configured': True,
             'label': 'System TTS (offline)',
         },
-        'mms_khm': {
-            'voices': [],
-            'emotions': [],
-            'style_control': False,
-            'languages': ['km'],
-            'khmer_supported': True,
-            'key_configured': True,
-            'installed': model_manager.mms_khm_status()['installed'],
-            'label': 'Khmer MMS-VITS (offline)',
+        **{
+            engine_id: {
+                'voices': [],
+                'emotions': [],
+                'style_control': False,
+                'languages': ['km'],
+                'khmer_supported': True,
+                'key_configured': True,
+                'installed': model_manager.mms_status(engine_id)['installed'],
+                'label': spec.name,
+            }
+            for engine_id, spec in mms_tts_local.MMS_MODELS.items()
         },
         'emotions': online_providers.EMOTIONS,
     }

@@ -718,9 +718,11 @@ def get_provider_status() -> list[dict]:
     try:
         from . import mms_tts_local
 
-        mms_ok = mms_tts_local.is_installed()
+        mms_ok = mms_tts_local.is_installed('mms_khm')
+        mms_base_ok = mms_tts_local.is_installed('mms_khm_base')
     except Exception:
         mms_ok = False
+        mms_base_ok = False
 
     return [
         {
@@ -786,5 +788,13 @@ def get_provider_status() -> list[dict]:
             'connected': mms_ok,
             'primary': False,
             'fallback': mms_ok,
+        },
+        {
+            'id': 'mms_khm_base',
+            'name': 'Khmer MMS-VITS base (offline, non-commercial)',
+            'mode': 'LOCAL AI',
+            'connected': mms_base_ok,
+            'primary': False,
+            'fallback': mms_base_ok,
         },
     ]

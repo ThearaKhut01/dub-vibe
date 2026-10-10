@@ -38,7 +38,7 @@ interface StudioState {
   modelStorage: ModelStorageInfo | null;
   qwenModel: WhisperModelInfo | null;
   demucsModel: WhisperModelInfo | null;
-  mmsKhmModel: WhisperModelInfo | null;
+  mmsKhmModels: WhisperModelInfo[];
   cudaPack: CudaPackInfo | null;
   providerKeys: { gemini: { has_key: boolean }; openai: { has_key: boolean } };
   voiceCapabilities: Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean }> & { emotions?: string[] };
@@ -65,8 +65,8 @@ interface StudioState {
   deleteQwen: () => Promise<void>;
   downloadDemucs: () => Promise<void>;
   deleteDemucs: () => Promise<void>;
-  downloadMmsKhm: () => Promise<void>;
-  deleteMmsKhm: () => Promise<void>;
+  downloadMmsKhm: (engineId: string) => Promise<void>;
+  deleteMmsKhm: (engineId: string) => Promise<void>;
   downloadCudaPack: () => Promise<void>;
   deleteCudaPack: () => Promise<void>;
   detectSpeakers: () => Promise<{ speakers: string[]; message: string }>;
@@ -335,7 +335,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   modelStorage: null,
   qwenModel: null,
   demucsModel: null,
-  mmsKhmModel: null,
+  mmsKhmModels: [],
   cudaPack: null,
   providerKeys: { gemini: { has_key: false }, openai: { has_key: false } },
   voiceCapabilities: {},
@@ -387,10 +387,10 @@ export const useStudioStore = create<StudioState>((set, get) => ({
         readJson<ModelStorageInfo>('/api/models/storage').catch(() => null),
         readJson<WhisperModelInfo>('/api/models/qwen').catch(() => null),
         readJson<WhisperModelInfo>('/api/models/demucs').catch(() => null),
-        readJson<WhisperModelInfo>('/api/models/mms-khm').catch(() => null),
+        readJson<{ models: WhisperModelInfo[] }>('/api/models/mms-khm').catch(() => null),
         readJson<CudaPackInfo>('/api/models/cuda-pack').catch(() => null),
       ]);
-      set({ models, hardware, modelStorage: storage, qwenModel: qwen, demucsModel: demucs, mmsKhmModel: mmsKhm, cudaPack });
+      set({ models, hardware, modelStorage: storage, qwenModel: qwen, demucsModel: demucs, mmsKhmModels: mmsKhm?.models ?? [], cudaPack });
     } catch {
       // Backend offline; keep the last known state.
     }
@@ -495,16 +495,16 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     }
     await get().refreshModels();
   },
-  downloadMmsKhm: async () => {
-    const response = await fetch(`${apiBase}/api/models/mms-khm/download`, { method: 'POST' });
+  downloadMmsKhm: async (engineId) => {
+    const response = await fetch(`${apiBase}/api/models/mms/${engineId}/download`, { method: 'POST' });
     if (!response.ok) {
       const problem = await response.json().catch(() => ({}));
       throw new Error(problem.detail ?? `Unable to start the Khmer model download (HTTP ${response.status})`);
     }
     void get().refreshModels();
   },
-  deleteMmsKhm: async () => {
-    const response = await fetch(`${apiBase}/api/models/mms-khm`, { method: 'DELETE' });
+  deleteMmsKhm: async (engineId) => {
+    const response = await fetch(`${apiBase}/api/models/mms/${engineId}`, { method: 'DELETE' });
     if (!response.ok) {
       const problem = await response.json().catch(() => ({}));
       throw new Error(problem.detail ?? `Unable to delete the Khmer model (HTTP ${response.status})`);
@@ -1148,7 +1148,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       modelStorage: null,
       qwenModel: null,
       demucsModel: null,
-      mmsKhmModel: null,
+      mmsKhmModels: [],
       cudaPack: null,
       providerKeys: { gemini: { has_key: false }, openai: { has_key: false } },
       voiceCapabilities: {},
