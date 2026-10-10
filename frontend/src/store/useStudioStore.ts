@@ -38,9 +38,10 @@ interface StudioState {
   modelStorage: ModelStorageInfo | null;
   qwenModel: WhisperModelInfo | null;
   demucsModel: WhisperModelInfo | null;
+  mmsKhmModel: WhisperModelInfo | null;
   cudaPack: CudaPackInfo | null;
   providerKeys: { gemini: { has_key: boolean }; openai: { has_key: boolean } };
-  voiceCapabilities: Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string }> & { emotions?: string[] };
+  voiceCapabilities: Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean }> & { emotions?: string[] };
   characters: { speakers: string[]; characters: Record<string, Record<string, unknown>> };
   workflowSteps: WorkflowStep[];
   mediaLibrary: MediaAsset[];
@@ -64,6 +65,8 @@ interface StudioState {
   deleteQwen: () => Promise<void>;
   downloadDemucs: () => Promise<void>;
   deleteDemucs: () => Promise<void>;
+  downloadMmsKhm: () => Promise<void>;
+  deleteMmsKhm: () => Promise<void>;
   downloadCudaPack: () => Promise<void>;
   deleteCudaPack: () => Promise<void>;
   detectSpeakers: () => Promise<{ speakers: string[]; message: string }>;
@@ -77,7 +80,7 @@ interface StudioState {
   setProviderKey: (provider: string, key: string) => Promise<void>;
   removeProviderKey: (provider: string) => Promise<void>;
   testProvider: (provider: string) => Promise<{ models: string[] }>;
-  previewLine: (payload: { text: string; provider: string; voice?: string; model?: string; emotion: string; intensity: number; language: string }) => Promise<string>;
+  previewLine: (payload: { text: string; provider: string; voice?: string; model?: string; emotion: string; intensity: number; speed?: number; language: string }) => Promise<string>;
   refreshCharacters: () => Promise<void>;
   saveCharacters: (characters: Record<string, Record<string, unknown>>) => Promise<void>;
   hydrateStudio: () => Promise<void>;
@@ -88,7 +91,7 @@ interface StudioState {
   createProject: (name: string, mode: 'EDIT' | 'DUB', targetLanguage?: string) => Promise<ProjectSummary>;
   uploadMedia: (projectId: string, file: File) => Promise<void>;
   runChunk: (chunkSeconds: number | null) => Promise<{ message?: string } | undefined>;
-  runWorkflowStep: (workflow: 'transcribe' | 'translate' | 'tts', projectId?: string, options?: { targetLanguage?: string; voice?: string; transcribeLanguage?: string; beamSize?: number; ttsProvider?: string; ttsModel?: string; emotion?: string; intensity?: number; acting?: boolean; openaiActing?: boolean; openaiReview?: boolean; translationProvider?: string }) => Promise<void>;
+  runWorkflowStep: (workflow: 'transcribe' | 'translate' | 'tts', projectId?: string, options?: { targetLanguage?: string; voice?: string; transcribeLanguage?: string; beamSize?: number; ttsProvider?: string; ttsModel?: string; emotion?: string; intensity?: number; speed?: number; acting?: boolean; openaiActing?: boolean; openaiReview?: boolean; translationProvider?: string }) => Promise<void>;
   runExport: (options: {
     includeSubtitles: boolean;
     burnSubtitles: boolean;
@@ -332,6 +335,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   modelStorage: null,
   qwenModel: null,
   demucsModel: null,
+  mmsKhmModel: null,
   cudaPack: null,
   providerKeys: { gemini: { has_key: false }, openai: { has_key: false } },
   voiceCapabilities: {},
@@ -377,15 +381,16 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   },
   refreshModels: async () => {
     try {
-      const [models, hardware, storage, qwen, demucs, cudaPack] = await Promise.all([
+      const [models, hardware, storage, qwen, demucs, mmsKhm, cudaPack] = await Promise.all([
         readJson<WhisperModelInfo[]>('/api/models/faster-whisper'),
         readJson<HardwareInfo>('/api/system/hardware'),
         readJson<ModelStorageInfo>('/api/models/storage').catch(() => null),
         readJson<WhisperModelInfo>('/api/models/qwen').catch(() => null),
         readJson<WhisperModelInfo>('/api/models/demucs').catch(() => null),
+        readJson<WhisperModelInfo>('/api/models/mms-khm').catch(() => null),
         readJson<CudaPackInfo>('/api/models/cuda-pack').catch(() => null),
       ]);
-      set({ models, hardware, modelStorage: storage, qwenModel: qwen, demucsModel: demucs, cudaPack });
+      set({ models, hardware, modelStorage: storage, qwenModel: qwen, demucsModel: demucs, mmsKhmModel: mmsKhm, cudaPack });
     } catch {
       // Backend offline; keep the last known state.
     }
@@ -487,6 +492,22 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     if (!response.ok) {
       const problem = await response.json().catch(() => ({}));
       throw new Error(problem.detail ?? `Unable to delete Demucs (HTTP ${response.status})`);
+    }
+    await get().refreshModels();
+  },
+  downloadMmsKhm: async () => {
+    const response = await fetch(`${apiBase}/api/models/mms-khm/download`, { method: 'POST' });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(problem.detail ?? `Unable to start the Khmer model download (HTTP ${response.status})`);
+    }
+    void get().refreshModels();
+  },
+  deleteMmsKhm: async () => {
+    const response = await fetch(`${apiBase}/api/models/mms-khm`, { method: 'DELETE' });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(problem.detail ?? `Unable to delete the Khmer model (HTTP ${response.status})`);
     }
     await get().refreshModels();
   },
@@ -652,7 +673,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     try {
       const [keys, capabilities] = await Promise.all([
         readJson<{ gemini: { has_key: boolean }; openai: { has_key: boolean } }>('/api/providers/keys').catch(() => null),
-        readJson<Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string }> & { emotions?: string[] }>('/api/tts/capabilities').catch(() => null),
+        readJson<Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean }> & { emotions?: string[] }>('/api/tts/capabilities').catch(() => null),
       ]);
       set({
         providerKeys: keys ?? get().providerKeys,
@@ -973,6 +994,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
           tts_model: options?.ttsModel || null,
           emotion: options?.emotion ?? 'Auto',
           intensity: options?.intensity ?? 70,
+          speed: options?.speed ?? 1,
           acting: options?.acting ?? true,
           openai_acting: options?.openaiActing ?? false,
           openai_review: options?.openaiReview ?? false,
@@ -1126,6 +1148,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       modelStorage: null,
       qwenModel: null,
       demucsModel: null,
+      mmsKhmModel: null,
       cudaPack: null,
       providerKeys: { gemini: { has_key: false }, openai: { has_key: false } },
       voiceCapabilities: {},

@@ -3,10 +3,11 @@
 One service for every interface. Resolution order:
   1. Character profile override (provider + voice live on the character).
   2. Requested provider preference.
-  3. Quality-ordered fallback: gemini -> openai -> edge -> sapi5.
+  3. Quality-ordered fallback: gemini -> openai -> edge -> mms_khm -> sapi5.
 Language capability is checked per provider (Khmer is NOT claimed where the
 provider does not officially support it — it falls back to Edge TTS, which
-does support Khmer). Paid API results are cached under
+does support Khmer). mms_khm is an offline Khmer-only model used when Edge
+TTS is unavailable. Paid API results are cached under
 %LOCALAPPDATA%-style model root: cache/tts/<provider>/ so identical requests
 (text + voice + model + acting style + speed) never cost twice.
 """
@@ -28,7 +29,8 @@ from .online_providers import (
     openai_synthesize,
 )
 
-QUALITY_ORDER = ['gemini', 'openai', 'edge', 'sapi5']
+QUALITY_ORDER = ['gemini', 'openai', 'edge', 'mms_khm', 'sapi5']
+OFFLINE_KHMER_PROVIDERS = ('mms_khm',)
 
 
 def tts_cache_dir(provider: str) -> Path:
@@ -59,6 +61,8 @@ def language_supported(provider: str, lang_code: str) -> bool:
         return lang in gemini_capabilities(GEMINI_DEFAULT_MODEL)['languages']
     if provider == 'openai':
         return lang in openai_capabilities(OPENAI_DEFAULT_MODEL)['languages']
+    if provider == 'mms_khm':
+        return lang == 'km'
     return True  # Edge TTS (incl. Khmer) and SAPI5 carry their own voices
 
 
@@ -67,6 +71,8 @@ def _default_voice(provider: str, requested: str | None) -> str:
         return requested if requested in GEMINI_VOICES else 'Kore'
     if provider == 'openai':
         return requested if requested in OPENAI_VOICES else 'alloy'
+    if provider == 'mms_khm':
+        return 'khm-single'
     return requested or 'auto'
 
 
@@ -125,6 +131,10 @@ def synthesize_line(text: str, out_path: str, *, provider_pref: str, language_na
                 from .providers import EdgeTTSProvider
 
                 asyncio.run(EdgeTTSProvider().synthesize(text, voice, out_path, language_name))
+            elif provider == 'mms_khm':
+                from .mms_tts_local import MmsKhmerProvider
+
+                MmsKhmerProvider().synthesize(text, voice, out_path, language_name, speed=speed)
             elif provider == 'sapi5':
                 from .providers import Pyttsx3Provider
 
@@ -180,7 +190,7 @@ def strip_audio_silence(path: str) -> None:
 
 def preview_line(text: str, *, provider: str, language_name: str, lang_code: str,
                  voice: str | None, model: str | None, emotion: str, intensity: int,
-                 character_profile: dict | None, use_openai_acting: bool) -> str:
+                 character_profile: dict | None, use_openai_acting: bool, speed: float = 1.0) -> str:
     """Generate one preview line and return it as a base64 data URL for <audio>."""
     import base64
 
@@ -194,13 +204,13 @@ def preview_line(text: str, *, provider: str, language_name: str, lang_code: str
         character.get('next'),
         character.get('name'),
         language_name,
-        use_openai=use_openai_acting and provider not in ('sapi5',),
+        use_openai=use_openai_acting and provider not in ('sapi5', *OFFLINE_KHMER_PROVIDERS),
     )
     if emotion and emotion != 'Auto':
         analysis = {**analysis, 'emotion': emotion, 'intensity': intensity}
 
     key = cache_key(provider, model or '', voice or '', text,
-                    acting.style_instruction(provider, analysis), 1.0)
+                    acting.style_instruction(provider, analysis), speed)
     cached = _find_cached(provider, key)
     if not cached:
         from .providers import models_root
@@ -210,7 +220,7 @@ def preview_line(text: str, *, provider: str, language_name: str, lang_code: str
         temp_path = temp_dir / f'{key}.preview'
         synthesize_line(
             text, str(temp_path), provider_pref=provider, language_name=language_name,
-            lang_code=lang_code, voice_pref=voice, model_pref=model, speed=1.0,
+            lang_code=lang_code, voice_pref=voice, model_pref=model, speed=speed,
             emotion=emotion, intensity=intensity, character_profile=character_profile,
             analysis=analysis,
         )

@@ -385,6 +385,11 @@ async def list_all_models() -> dict[str, Any]:
                 'name': 'Demucs 6-stem (audio separation)',
                 'models': [model_manager.demucs_status()],
             },
+            {
+                'id': 'mms-khm',
+                'name': 'Khmer MMS-VITS (offline Khmer TTS)',
+                'models': [model_manager.mms_khm_status()],
+            },
         ],
         'settings': model_manager.load_settings(),
     }
@@ -524,6 +529,29 @@ async def qwen_model_status() -> dict[str, Any]:
     return model_manager.qwen_status()
 
 
+@app.get('/api/models/mms-khm')
+async def mms_khm_model_status() -> dict[str, Any]:
+    return model_manager.mms_khm_status()
+
+
+@app.post('/api/models/mms-khm/download')
+async def download_mms_khm_model() -> dict[str, Any]:
+    try:
+        job = model_manager.start_download_mms_khm()
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {'status': 'ok', 'model': model_manager.MMS_KHM_JOB_ID, 'job': job}
+
+
+@app.delete('/api/models/mms-khm')
+async def delete_mms_khm_model() -> dict[str, str]:
+    try:
+        model_manager.delete_mms_khm()
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {'status': 'ok', 'deleted': model_manager.MMS_KHM_JOB_ID}
+
+
 # --- Online provider keys (stored in Windows Credential Manager, never sent
 # back to the browser) --------------------------------------------------------
 
@@ -608,6 +636,16 @@ async def tts_capabilities(model: str | None = None) -> dict[str, Any]:
             'key_configured': True,
             'label': 'System TTS (offline)',
         },
+        'mms_khm': {
+            'voices': [],
+            'emotions': [],
+            'style_control': False,
+            'languages': ['km'],
+            'khmer_supported': True,
+            'key_configured': True,
+            'installed': model_manager.mms_khm_status()['installed'],
+            'label': 'Khmer MMS-VITS (offline)',
+        },
         'emotions': online_providers.EMOTIONS,
     }
 
@@ -648,6 +686,7 @@ async def tts_preview(payload: dict[str, Any]) -> dict[str, Any]:
             intensity=int(payload.get('intensity') or 70),
             character_profile=payload.get('character_profile'),
             use_openai_acting=bool(payload.get('openai_acting')) and api_keys.has_key('openai'),
+            speed=float(payload.get('speed') or 1.0),
         )
     except RuntimeError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error

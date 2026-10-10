@@ -9,7 +9,7 @@ DubVibe is a local-first AI video dubbing studio for Windows. It combines a dark
 - Media engine: FFmpeg/FFprobe (staged audio mixing, per-part renders, sidechain ducking)
 - Desktop shell: Tauri (NSIS installer, bundled Python backend sidecar + FFmpeg)
 - AI layer: interchangeable providers with automatic fallback —
-  Faster-Whisper (local) → Qwen3 4B (local translation) → Argos Translate (offline) → Google Translate (online, retried) → Gemini TTS / OpenAI TTS (online, keyed) → Edge TTS (online, retried) → SAPI5 (offline).
+  Faster-Whisper (local) → Qwen3 4B (local translation) → Argos Translate (offline) → Google Translate (online, retried) → Gemini TTS / OpenAI TTS (online, keyed) → Edge TTS (online, retried) → Khmer MMS-VITS (offline, Khmer only) → SAPI5 (offline).
   API keys live in Windows Credential Manager (never in the browser); AI acting analysis reads the scene and steers supported TTS engines; paid TTS results are cached.
 
 ## Quick start (development)
@@ -59,6 +59,8 @@ Projects (media, transcripts, translations, dub audio, chunk and export state) p
 All downloaded AI models live in one shared store — `%LOCALAPPDATA%\DubVibe Studio\models` — used identically by the local web UI and the packaged Windows app. The backend is the single source of truth: it discovers, downloads (with live progress), validates, loads, unloads, and deletes models; the browser never touches the filesystem.
 
 Open **AI Models** in the header to manage Faster-Whisper transcription models — Tiny, Base, Small, **Medium**, Large-v3, and Large-v3-Turbo. Each model shows its status (Not installed / Downloading / Installed / Loaded / Error) with controls matching the state, and a radio selects the model used for transcription. The panel also shows detected hardware (CPU/RAM/GPU with CUDA), disk usage, and transcription settings (language, beam size). Selected model, device, and compute persist in the app settings and are used by both interfaces. Transcriptions can be cancelled mid-run, keeping the segments found so far. After the first download, transcription runs fully offline.
+
+**Khmer offline voice (optional):** the fine-tuned `khmerttsopensource/khmer-tts` model (MMS-VITS, about 320 MB) is stored under `models\mms-tts\mms-tts-khm`. It is used only for Khmer, only after Edge TTS fails, and runs fully offline. Its license is **cc-by-nc-4.0 (non-commercial)**, so do not use it in commercial deployments.
 
 ## Settings
 

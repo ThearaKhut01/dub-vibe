@@ -715,6 +715,12 @@ def get_provider_status() -> list[dict]:
         qwen_ok = qwen_local.is_installed()
     except Exception:
         qwen_ok = False
+    try:
+        from . import mms_tts_local
+
+        mms_ok = mms_tts_local.is_installed()
+    except Exception:
+        mms_ok = False
 
     return [
         {
@@ -773,25 +779,12 @@ def get_provider_status() -> list[dict]:
             'primary': True,
             'fallback': False,
         },
-    ]
-            'connected': khmer_ok,
-            'primary': khmer_ok,
-            'fallback': False,
-        },
         {
-            'id': 'pyttsx3',
-            'name': 'System TTS (SAPI5)',
+            'id': 'mms_khm',
+            'name': 'Khmer MMS-VITS (offline, non-commercial)',
             'mode': 'LOCAL AI',
-            'connected': pyttsx3_ok,
+            'connected': mms_ok,
             'primary': False,
-            'fallback': pyttsx3_ok,
-        },
-        {
-            'id': 'edge_tts',
-            'name': 'Edge TTS',
-            'mode': 'FREE ONLINE',
-            'connected': edge_ok,
-            'primary': True,
-            'fallback': False,
+            'fallback': mms_ok,
         },
     ]

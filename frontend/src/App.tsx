@@ -123,6 +123,9 @@ function App() {
     demucsModel,
     downloadDemucs,
     deleteDemucs,
+    mmsKhmModel,
+    downloadMmsKhm,
+    deleteMmsKhm,
     cudaPack,
     downloadCudaPack,
     deleteCudaPack,
@@ -166,6 +169,7 @@ function App() {
   const [platformFit, setPlatformFit] = useState(() => localStorage.getItem('dubvibe-platform-fit') ?? 'blur');
   const [showModels, setShowModels] = useState(false);
   const [modelBusy, setModelBusy] = useState<string | null>(null);
+  const [mmsKhmConfirm, setMmsKhmConfirm] = useState(false);
   const [transcribeLanguage, setTranscribeLanguage] = useState(() => localStorage.getItem('dubvibe-transcribe-language') ?? '');
   const [beamSize, setBeamSize] = useState(() => Number(localStorage.getItem('dubvibe-beam-size') ?? 5));
   const [deleteTarget, setDeleteTarget] = useState<ProjectSummary | null>(null);
@@ -176,6 +180,12 @@ function App() {
   const [keyTestMessage, setKeyTestMessage] = useState('');
   const [keyBusy, setKeyBusy] = useState<string | null>(null);
   const [ttsProvider, setTtsProvider] = useState(() => localStorage.getItem('dubvibe-tts-provider') ?? 'auto');
+  useEffect(() => {
+    if (ttsProvider === 'mms_khm' && voiceCapabilities.mms_khm?.installed === false) {
+      setTtsProvider('auto');
+      localStorage.setItem('dubvibe-tts-provider', 'auto');
+    }
+  }, [ttsProvider, voiceCapabilities]);
   const [translationProvider, setTranslationProvider] = useState(() => localStorage.getItem('dubvibe-translation-provider') ?? 'auto');
   const [ttsModel, setTtsModel] = useState(() => localStorage.getItem('dubvibe-tts-model') ?? '');
   const [geminiModels, setGeminiModels] = useState<string[]>(() => {
@@ -183,6 +193,10 @@ function App() {
   });
   const [voiceEmotion, setVoiceEmotion] = useState(() => localStorage.getItem('dubvibe-emotion') ?? 'Auto');
   const [voiceIntensity, setVoiceIntensity] = useState(() => Number(localStorage.getItem('dubvibe-voice-intensity') ?? 70));
+  const [voiceSpeed, setVoiceSpeed] = useState(() => {
+    const saved = Number(localStorage.getItem('dubvibe-voice-speed') ?? 1);
+    return Number.isFinite(saved) && saved >= 0.5 && saved <= 1 ? saved : 1;
+  });
   const [actingEnabled, setActingEnabled] = useState(() => localStorage.getItem('dubvibe-acting') !== 'false');
   const [openaiActing, setOpenaiActing] = useState(() => localStorage.getItem('dubvibe-openai-acting') === 'true');
   const [openaiReview, setOpenaiReview] = useState(() => localStorage.getItem('dubvibe-openai-review') === 'true');
@@ -929,6 +943,7 @@ function App() {
     }
     if (activeStep.id === 'voice') {
       if (ttsProvider === 'edge') return new Set(['edge_tts']);
+      if (ttsProvider === 'mms_khm') return new Set(['mms_khm']);
       if (ttsProvider === 'sapi5') return new Set(['pyttsx3']);
       if (ttsProvider === 'gemini' || ttsProvider === 'openai') return new Set<string>();
       return new Set(['edge_tts', 'pyttsx3']);
@@ -1046,6 +1061,7 @@ function App() {
         model: ttsModel || undefined,
         emotion: voiceEmotion,
         intensity: voiceIntensity,
+        speed: voiceSpeed,
         language: targetLanguage,
       });
       setPreviewAudio(audio);
@@ -1077,7 +1093,9 @@ function App() {
   const providerCaps = ttsProvider && ttsProvider !== 'auto' ? voiceCapabilities[ttsProvider] : null;
   const targetLangCode = targetLanguage.toLowerCase().slice(0, 2);
   const langIssue = providerCaps && ttsProvider !== 'auto' && !providerCaps.languages.includes(targetLangCode)
-    ? `${targetLanguage} is not officially supported by ${ttsProvider === 'gemini' ? 'Gemini TTS' : 'OpenAI TTS'} — dubbing falls back to Edge TTS.`
+    ? ttsProvider === 'mms_khm'
+      ? `Khmer MMS-VITS only speaks Khmer — set target language to Khmer or choose another engine.`
+      : `${targetLanguage} is not officially supported by ${providerCaps.label} — dubbing falls back to Edge TTS.`
     : '';
 
   const handleStartDub = async () => {
@@ -1092,7 +1110,7 @@ function App() {
       if (chunkSelection && videoChunks.length === 0) {
         await runChunk(Number(chunkSelection) * 60);
       }
-      const voiceOptions = { targetLanguage, voice: selectedVoice, transcribeLanguage: transcribeLanguage || undefined, beamSize, translationProvider, ttsProvider, ttsModel: ttsModel || undefined, emotion: voiceEmotion, intensity: voiceIntensity, acting: actingEnabled, openaiActing, openaiReview };
+      const voiceOptions = { targetLanguage, voice: selectedVoice, transcribeLanguage: transcribeLanguage || undefined, beamSize, translationProvider, ttsProvider, ttsModel: ttsModel || undefined, emotion: voiceEmotion, intensity: voiceIntensity, speed: voiceSpeed, acting: actingEnabled, openaiActing, openaiReview };
       await runWorkflowStep('transcribe', undefined, voiceOptions);
       await runWorkflowStep('translate', undefined, voiceOptions);
       await runWorkflowStep('tts', undefined, voiceOptions);
@@ -1418,7 +1436,7 @@ function App() {
                 )}
                 <button
                   onClick={() => void handleStartDub()}
-                  disabled={busy || apiAvailable === false || !hasMedia}
+                  disabled={busy || apiAvailable === false || !hasMedia || (ttsProvider === 'mms_khm' && (voiceCapabilities.mms_khm?.installed === false || targetLanguage !== 'Khmer'))}
                   className="rounded-lg bg-gradient-to-r from-sky-500 to-violet-500 px-4 py-2 text-sm font-semibold text-white shadow-glow disabled:opacity-50"
                 >
                   {busy ? 'PROCESSING...' : 'START DUBBING'}
@@ -2427,6 +2445,11 @@ function App() {
                   <option value="gemini">Google Gemini TTS (premium)</option>
                   <option value="openai">OpenAI TTS</option>
                   <option value="edge">Edge TTS (free)</option>
+                  <option value="mms_khm" disabled={voiceCapabilities.mms_khm?.installed === false}>
+                    {voiceCapabilities.mms_khm?.installed === false
+                      ? 'Khmer MMS-VITS (offline) — download in AI Models'
+                      : 'Khmer MMS-VITS (offline, Khmer only)'}
+                  </option>
                   <option value="sapi5">System TTS (offline)</option>
                 </select>
                 {ttsProvider === 'gemini' && (
@@ -2482,6 +2505,19 @@ function App() {
                     </label>
                   </>
                 )}
+                <label className="mt-2 block text-[10px] text-slate-500">
+                  Speaking speed: {Math.round(voiceSpeed * 100)}%{voiceSpeed < 1 ? ' (slower)' : ' (normal)'}
+                  <input
+                    type="range"
+                    min={0.5}
+                    max={1}
+                    step={0.05}
+                    value={voiceSpeed}
+                    onChange={(event) => { setVoiceSpeed(Number(event.target.value)); localStorage.setItem('dubvibe-voice-speed', String(event.target.value)); }}
+                    title="Slows the generated voice. Only applies to Khmer MMS-VITS for now."
+                    className="mt-1 block w-full accent-sky-500"
+                  />
+                </label>
                 <label className="mt-2 flex items-center gap-2 text-xs text-slate-300">
                   <input
                     type="checkbox"
@@ -3381,6 +3417,80 @@ function App() {
                   )}
                   {demucsModel.status === 'error' && demucsModel.error && (
                     <p className="mt-3 rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[10px] text-rose-200">{demucsModel.error}</p>
+                  )}
+                </div>
+              )}
+
+              {mmsKhmModel && (
+                <div className={`mt-3 rounded-xl border p-4 ${mmsKhmModel.installed ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-white/10 bg-slate-900/80'}`}>
+                  <div className="flex items-start gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+                        <p className="text-sm font-medium text-slate-200">{mmsKhmModel.name}</p>
+                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${mmsKhmModel.status === 'downloading' ? 'bg-amber-500/20 text-amber-200'
+                            : mmsKhmModel.status === 'error' ? 'bg-rose-500/20 text-rose-200'
+                              : mmsKhmModel.installed ? 'bg-emerald-500/20 text-emerald-200'
+                                : 'bg-slate-700/60 text-slate-300'
+                          }`}>
+                          {mmsKhmModel.status === 'downloading' ? `Downloading ${mmsKhmModel.progress}%`
+                            : mmsKhmModel.status === 'error' ? 'Error'
+                              : mmsKhmModel.installed ? '✓ Installed' : 'Not installed'}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-xs leading-relaxed text-slate-500">
+                        {mmsKhmModel.installed
+                          ? `${mmsKhmModel.size_mb?.toFixed(0)} MB · Khmer voice, offline. Used only when Edge TTS is unavailable.`
+                          : `~${mmsKhmModel.total_mb} MB download · optional Khmer voice, works offline after install. Non-commercial license (cc-by-nc-4.0).`}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {mmsKhmModel.status === 'not_installed' && !mmsKhmConfirm && (
+                        <button
+                          onClick={() => setMmsKhmConfirm(true)}
+                          disabled={modelBusy !== null}
+                          className="shrink-0 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-200 hover:bg-sky-500/20 transition disabled:opacity-40"
+                        >
+                          Download
+                        </button>
+                      )}
+                      {mmsKhmModel.status === 'not_installed' && mmsKhmConfirm && (
+                        <>
+                          <button
+                            onClick={() => { setMmsKhmConfirm(false); void runModelAction('dl-mms-khm', downloadMmsKhm); }}
+                            disabled={modelBusy !== null}
+                            className="shrink-0 rounded-lg border border-sky-500/30 bg-sky-500/20 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/30 transition disabled:opacity-40"
+                          >
+                            Confirm download (~{mmsKhmModel.total_mb} MB)
+                          </button>
+                          <button
+                            onClick={() => setMmsKhmConfirm(false)}
+                            className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-white/5 transition"
+                          >
+                            Cancel
+                          </button>
+                        </>
+                      )}
+                      {mmsKhmModel.installed && (
+                        <button
+                          onClick={() => void runModelAction('del-mms-khm', deleteMmsKhm)}
+                          disabled={modelBusy !== null}
+                          className="shrink-0 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/20 transition disabled:opacity-40"
+                        >
+                          Delete
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  {mmsKhmModel.status === 'downloading' && (
+                    <div className="mt-3">
+                      <div className="h-2 overflow-hidden rounded-full bg-slate-800">
+                        <div className="h-full rounded-full bg-gradient-to-r from-sky-500 to-violet-500" style={{ width: `${mmsKhmModel.progress}%` }} />
+                      </div>
+                      <p className="mt-1 text-[10px] text-slate-500">{mmsKhmModel.downloaded_mb.toFixed(0)} MB / ~{mmsKhmModel.total_mb} MB</p>
+                    </div>
+                  )}
+                  {mmsKhmModel.status === 'error' && mmsKhmModel.error && (
+                    <p className="mt-3 rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[10px] text-rose-200">{mmsKhmModel.error}</p>
                   )}
                 </div>
               )}
