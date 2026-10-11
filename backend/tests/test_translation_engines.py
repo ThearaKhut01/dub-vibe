@@ -16,10 +16,20 @@ def _chain_keys(preference: str) -> list[str]:
     return [key for key, _ in HybridTranslationProvider(preference=preference)._chain()]
 
 
-def test_auto_chain_keeps_argos_before_google_and_excludes_nllb():
+def test_auto_chain_excludes_nllb_and_always_ends_with_google():
     # NLLB is opt-in; Auto must behave as it did before NLLB existed.
     keys = _chain_keys('auto')
     assert 'nllb' not in keys
+    assert keys[-1] == 'google'
+
+
+def test_auto_chain_puts_argos_before_google_when_argos_is_installed():
+    # Argos is optional: it is only in the chain when the package is present.
+    with mock.patch.object(providers, '_argos_available', return_value=True), \
+            mock.patch.object(providers.ArgosTranslationProvider, '__init__', return_value=None):
+        provider = HybridTranslationProvider(preference='auto')
+        provider._offline = object()
+        keys = [key for key, _ in provider._chain()]
     assert keys.index('argos') < keys.index('google')
 
 
