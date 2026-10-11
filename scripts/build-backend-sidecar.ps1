@@ -56,6 +56,12 @@ $arguments = @(
   "--collect-all", "tqdm",
   "--collect-all", "llama_cpp",
   "--collect-all", "huggingface_hub",
+  # Khmer MMS-VITS and NLLB are loaded lazily through transformers; the
+  # tokenizers need sentencepiece, and the .bin checkpoints are read with soundfile/yaml.
+  "--collect-all", "transformers",
+  "--collect-all", "sentencepiece",
+  "--collect-all", "soundfile",
+  "--collect-all", "yaml",
   "--add-binary", "$($ffmpeg.Source);.",
   "--add-binary", "$($ffprobe.Source);.",
   (Join-Path $projectRoot "backend\run_server.py")

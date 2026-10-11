@@ -1,0 +1,4 @@
+# Test-only dependencies. The runtime list (requirements.txt) is bundled into the
+# packaged app, so test tooling stays out of it.
+-r requirements.txt
+pytest>=8,<9

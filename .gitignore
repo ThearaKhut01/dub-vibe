@@ -20,6 +20,7 @@ src-tauri/binaries/*
 # --- Python ---
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # --- Runtime data (project media, chunks, stems, sqlite) ---
 /data/
