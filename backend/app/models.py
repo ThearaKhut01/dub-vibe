@@ -40,6 +40,7 @@ class WorkflowProgress(BaseModel):
     stage: str
     progress: int
     message: str
+    engine: str | None = None
 
 
 class ProcessingRequest(BaseModel):

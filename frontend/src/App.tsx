@@ -134,6 +134,10 @@ function App() {
     mmsKhmModels,
     downloadMmsKhm,
     deleteMmsKhm,
+    nllbModel,
+    downloadNllb,
+    deleteNllb,
+    activeTranslateEngine,
     cudaPack,
     downloadCudaPack,
     deleteCudaPack,
@@ -178,6 +182,7 @@ function App() {
   const [showModels, setShowModels] = useState(false);
   const [modelBusy, setModelBusy] = useState<string | null>(null);
   const [mmsKhmConfirm, setMmsKhmConfirm] = useState<string | null>(null);
+  const [nllbConfirm, setNllbConfirm] = useState(false);
   const [transcribeLanguage, setTranscribeLanguage] = useState(() => localStorage.getItem('dubvibe-transcribe-language') ?? '');
   const [beamSize, setBeamSize] = useState(() => Number(localStorage.getItem('dubvibe-beam-size') ?? 5));
   const [deleteTarget, setDeleteTarget] = useState<ProjectSummary | null>(null);
@@ -943,11 +948,19 @@ function App() {
     if (!activeStep) return new Set<string>();
     if (activeStep.id === 'transcribe') return new Set(['whisper']);
     if (activeStep.id === 'translate') {
-      if (translationProvider === 'google') return new Set(['google_translate']);
-      if (translationProvider === 'argos') return new Set(['argos_translate']);
-      const connected = (id: string) => providers.find((provider) => provider.id === id)?.connected ?? false;
-      if (connected('qwen')) return new Set(['qwen']);
-      return new Set([connected('argos_translate') ? 'argos_translate' : 'google_translate']);
+      // The running engine is announced by the backend at the start of the run.
+      // Use it when present; otherwise show the engine the user chose.
+      const engineRows: Record<string, string> = {
+        nllb: 'nllb',
+        qwen: 'qwen',
+        argos: 'argos_translate',
+        google: 'google_translate',
+      };
+      if (activeTranslateEngine && engineRows[activeTranslateEngine]) {
+        return new Set([engineRows[activeTranslateEngine]]);
+      }
+      if (translationProvider in engineRows) return new Set([engineRows[translationProvider]]);
+      return new Set<string>();
     }
     if (activeStep.id === 'voice') {
       if (ttsProvider === 'edge') return new Set(['edge_tts']);
@@ -964,6 +977,9 @@ function App() {
     }
     if (providerId === 'qwen') {
       return qwenModel && (qwenModel.status === 'downloading' || qwenModel.status === 'validating') ? qwenModel : null;
+    }
+    if (providerId === 'nllb') {
+      return nllbModel && (nllbModel.status === 'downloading' || nllbModel.status === 'validating') ? nllbModel : null;
     }
     return null;
   };
@@ -2332,6 +2348,9 @@ function App() {
                   className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200"
                 >
                   <option value="auto">Qwen3 4B (local) — default</option>
+                  <option value="nllb" disabled={!nllbModel?.installed}>
+                    {nllbModel?.installed ? 'NLLB-200 (offline)' : 'NLLB-200 (offline) — download in AI Models'}
+                  </option>
                   <option value="argos">Argos Translate (offline)</option>
                   <option value="google">Google Translate (online)</option>
                 </select>
@@ -3367,6 +3386,79 @@ function App() {
                 </div>
               )}
 
+              {nllbModel && (
+                <div className={`mt-3 rounded-xl border p-4 ${nllbModel.installed ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-white/10 bg-slate-900/80'}`}>
+                  <div className="flex items-start gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+                        <p className="text-sm font-medium text-slate-200">{nllbModel.name}</p>
+                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${nllbModel.status === 'downloading' ? 'bg-amber-500/20 text-amber-200'
+                            : nllbModel.status === 'error' ? 'bg-rose-500/20 text-rose-200'
+                              : nllbModel.installed ? 'bg-emerald-500/20 text-emerald-200'
+                                : 'bg-slate-700/60 text-slate-300'
+                          }`}>
+                          {nllbModel.status === 'downloading' ? `Downloading ${nllbModel.progress}%`
+                            : nllbModel.status === 'error' ? 'Error'
+                              : nllbModel.installed ? '✓ Installed' : 'Not installed'}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-xs leading-relaxed text-slate-500">
+                        {nllbModel.installed
+                          ? `${nllbModel.size_mb?.toFixed(0)} MB · offline translation. Choose it in Translation engine.`
+                          : `~${nllbModel.total_mb} MB download · offline translation, 200 languages. Research model, non-commercial license (cc-by-nc-4.0).`}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {nllbModel.status === 'not_installed' && !nllbConfirm && (
+                        <button
+                          onClick={() => setNllbConfirm(true)}
+                          disabled={modelBusy !== null}
+                          className="shrink-0 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-200 hover:bg-sky-500/20 transition disabled:opacity-40"
+                        >
+                          Download
+                        </button>
+                      )}
+                      {nllbModel.status === 'not_installed' && nllbConfirm && (
+                        <>
+                          <button
+                            onClick={() => { setNllbConfirm(false); void runModelAction('dl-nllb', downloadNllb); }}
+                            disabled={modelBusy !== null}
+                            className="shrink-0 rounded-lg border border-sky-500/30 bg-sky-500/20 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/30 transition disabled:opacity-40"
+                          >
+                            Confirm download (~{(nllbModel.total_mb / 1024).toFixed(1)} GB)
+                          </button>
+                          <button
+                            onClick={() => setNllbConfirm(false)}
+                            className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-white/5 transition"
+                          >
+                            Cancel
+                          </button>
+                        </>
+                      )}
+                      {nllbModel.installed && (
+                        <button
+                          onClick={() => void runModelAction('del-nllb', deleteNllb)}
+                          disabled={modelBusy !== null}
+                          className="shrink-0 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/20 transition disabled:opacity-40"
+                        >
+                          Delete
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  {nllbModel.status === 'downloading' && (
+                    <div className="mt-3">
+                      <div className="h-2 overflow-hidden rounded-full bg-slate-800">
+                        <div className="h-full rounded-full bg-gradient-to-r from-sky-500 to-violet-500" style={{ width: `${nllbModel.progress}%` }} />
+                      </div>
+                      <p className="mt-1 text-[10px] text-slate-500">{nllbModel.downloaded_mb.toFixed(0)} MB / ~{nllbModel.total_mb} MB</p>
+                    </div>
+                  )}
+                  {nllbModel.status === 'error' && nllbModel.error && (
+                    <p className="mt-3 rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[10px] text-rose-200">{nllbModel.error}</p>
+                  )}
+                </div>
+              )}
               {demucsModel && (
                 <div className={`mt-3 rounded-xl border p-4 ${demucsModel.installed ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-white/10 bg-slate-900/80'}`}>
                   <div className="flex items-start gap-3">

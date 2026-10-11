@@ -415,6 +415,92 @@ def delete_mms(engine_id: str) -> None:
         mms_tts_local.unload(engine_id)
         _DOWNLOADS.pop(job_id, None)
     shutil.rmtree(mms_tts_local.mms_model_dir(engine_id), ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# NLLB-200 offline translation (Meta). Non-commercial research license (cc-by-nc-4.0).
+# Downloaded only when the user clicks Download; never fetched automatically.
+# ---------------------------------------------------------------------------
+
+NLLB_JOB_ID = 'nllb-200'
+
+
+def nllb_status() -> dict:
+    from . import nllb_local
+
+    job = _DOWNLOADS.get(NLLB_JOB_ID)
+    installed = nllb_local.is_installed()
+    if job and job.get('status') == 'downloading':
+        status = 'downloading'
+    elif job and job.get('status') == 'error':
+        status = 'error'
+    elif installed:
+        status = 'installed'
+    else:
+        status = 'not_installed'
+    size_mb = round(_dir_size_mb(nllb_local.nllb_model_dir()), 1) if installed else None
+    return {
+        'id': nllb_local.NLLB_MODEL_ID,
+        'name': 'NLLB-200 600M (offline translation, non-commercial)',
+        'repo': nllb_local.NLLB_REPO,
+        'installed': installed,
+        'loaded': nllb_local._MODEL is not None,
+        'selected': False,
+        'status': status,
+        'progress': job.get('progress', 0) if job else 0,
+        'downloaded_mb': round(job.get('downloaded', 0), 1) if job else 0,
+        'total_mb': nllb_local.NLLB_SIZE_MB,
+        'size_mb': size_mb,
+        'path': str(nllb_local.nllb_model_dir()) if installed else None,
+        'error': job.get('error') if job else None,
+    }
+
+
+def start_download_nllb() -> dict:
+    from . import nllb_local
+
+    with _STATE_LOCK:
+        job = _DOWNLOADS.get(NLLB_JOB_ID)
+        if job and job.get('status') == 'downloading':
+            return job
+        if nllb_local.is_installed():
+            return {'status': 'installed', 'progress': 100}
+        free_bytes = shutil.disk_usage(models_root()).free
+        needed = nllb_local.NLLB_SIZE_MB * 1024 * 1024 * 1.25
+        if free_bytes < needed:
+            raise ValueError(
+                f'Not enough disk space: {needed / 2**30:.1f} GB needed, '
+                f'{free_bytes / 2**30:.1f} GB free on {models_root()}'
+            )
+        job = {'status': 'downloading', 'progress': 0, 'downloaded': 0.0, 'error': None}
+        _DOWNLOADS[NLLB_JOB_ID] = job
+
+    def worker() -> None:
+        try:
+            def job_progress(percent: int) -> None:
+                job.update(progress=percent, downloaded=nllb_local.NLLB_SIZE_MB * percent / 100)
+
+            nllb_local.download(job_progress)
+            job.update(status='installed', progress=100)
+        except Exception as error:  # noqa: BLE001
+            job.update(status='error', error=str(error))
+
+    threading.Thread(target=worker, name='download-nllb-200', daemon=True).start()
+    return job
+
+
+def delete_nllb() -> None:
+    from . import nllb_local
+
+    with _STATE_LOCK:
+        job = _DOWNLOADS.get(NLLB_JOB_ID)
+        if job and job.get('status') == 'downloading':
+            raise ValueError('Cannot delete a model while it is downloading.')
+        nllb_local.unload()
+        _DOWNLOADS.pop(NLLB_JOB_ID, None)
+    shutil.rmtree(nllb_local.nllb_model_dir(), ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Demucs 6-stem separation model (audio separation feature)
 # ---------------------------------------------------------------------------

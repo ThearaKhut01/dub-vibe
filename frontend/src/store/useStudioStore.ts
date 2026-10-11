@@ -37,6 +37,8 @@ interface StudioState {
   hardware: HardwareInfo | null;
   modelStorage: ModelStorageInfo | null;
   qwenModel: WhisperModelInfo | null;
+  nllbModel: WhisperModelInfo | null;
+  activeTranslateEngine: string | null;
   demucsModel: WhisperModelInfo | null;
   mmsKhmModels: WhisperModelInfo[];
   cudaPack: CudaPackInfo | null;
@@ -63,6 +65,8 @@ interface StudioState {
   cancelTranscription: () => Promise<void>;
   downloadQwen: () => Promise<void>;
   deleteQwen: () => Promise<void>;
+  downloadNllb: () => Promise<void>;
+  deleteNllb: () => Promise<void>;
   downloadDemucs: () => Promise<void>;
   deleteDemucs: () => Promise<void>;
   downloadMmsKhm: (engineId: string) => Promise<void>;
@@ -288,13 +292,14 @@ const connectProgressSocket = () => {
   progressSocket = socket;
   socket.onmessage = (event) => {
     try {
-      const message = JSON.parse(String(event.data)) as { project_id: string; stage: string; progress: number; message: string };
+      const message = JSON.parse(String(event.data)) as { project_id: string; stage: string; progress: number; message: string; engine?: string | null };
       useStudioStore.getState().appendLog(`[${message.stage}] ${message.message}`);
       const stepId = STAGE_TO_STEP[message.stage];
       useStudioStore.setState((state) => {
         if (!state.project.id || message.project_id !== state.project.id) return state;
         return {
           project: { ...state.project, progress: message.progress },
+          ...(message.stage === 'Translating' && message.engine ? { activeTranslateEngine: message.engine } : {}),
           workflowSteps: stepId
             ? state.workflowSteps.map((step) => step.id === stepId
               ? { ...step, status: 'Active', detail: message.message, progress: message.progress }
@@ -334,6 +339,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   hardware: null,
   modelStorage: null,
   qwenModel: null,
+  nllbModel: null,
+  activeTranslateEngine: null,
   demucsModel: null,
   mmsKhmModels: [],
   cudaPack: null,
@@ -381,16 +388,17 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   },
   refreshModels: async () => {
     try {
-      const [models, hardware, storage, qwen, demucs, mmsKhm, cudaPack] = await Promise.all([
+      const [models, hardware, storage, qwen, demucs, mmsKhm, nllb, cudaPack] = await Promise.all([
         readJson<WhisperModelInfo[]>('/api/models/faster-whisper'),
         readJson<HardwareInfo>('/api/system/hardware'),
         readJson<ModelStorageInfo>('/api/models/storage').catch(() => null),
         readJson<WhisperModelInfo>('/api/models/qwen').catch(() => null),
         readJson<WhisperModelInfo>('/api/models/demucs').catch(() => null),
         readJson<{ models: WhisperModelInfo[] }>('/api/models/mms-khm').catch(() => null),
+        readJson<WhisperModelInfo>('/api/models/nllb').catch(() => null),
         readJson<CudaPackInfo>('/api/models/cuda-pack').catch(() => null),
       ]);
-      set({ models, hardware, modelStorage: storage, qwenModel: qwen, demucsModel: demucs, mmsKhmModels: mmsKhm?.models ?? [], cudaPack });
+      set({ models, hardware, modelStorage: storage, qwenModel: qwen, demucsModel: demucs, mmsKhmModels: mmsKhm?.models ?? [], nllbModel: nllb, cudaPack });
     } catch {
       // Backend offline; keep the last known state.
     }
@@ -476,6 +484,22 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     if (!response.ok) {
       const problem = await response.json().catch(() => ({}));
       throw new Error(problem.detail ?? `Unable to delete Qwen (HTTP ${response.status})`);
+    }
+    await get().refreshModels();
+  },
+  downloadNllb: async () => {
+    const response = await fetch(`${apiBase}/api/models/nllb/download`, { method: 'POST' });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(problem.detail ?? `Unable to start the NLLB download (HTTP ${response.status})`);
+    }
+    void get().refreshModels();
+  },
+  deleteNllb: async () => {
+    const response = await fetch(`${apiBase}/api/models/nllb`, { method: 'DELETE' });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(problem.detail ?? `Unable to delete NLLB (HTTP ${response.status})`);
     }
     await get().refreshModels();
   },
@@ -974,6 +998,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     const label = workflow === 'tts' ? 'Generating dubbed voice' : workflow === 'transcribe' ? 'Transcribing' : 'Translating';
     set((state) => ({
       project: { ...state.project, status: 'Processing' },
+      activeTranslateEngine: null,
       workflowSteps: state.workflowSteps.map((step) => step.id === stepId
         ? { ...step, status: 'Active', detail: `${label}...`, progress: 20 }
         : step),
@@ -1147,6 +1172,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       hardware: null,
       modelStorage: null,
       qwenModel: null,
+      nllbModel: null,
+      activeTranslateEngine: null,
       demucsModel: null,
       mmsKhmModels: [],
       cudaPack: null,

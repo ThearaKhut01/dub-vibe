@@ -12,6 +12,7 @@ import time
 from abc import ABC, abstractmethod
 from functools import lru_cache
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -306,6 +307,39 @@ class ArgosTranslationProvider(TranslationProvider):
         )
 
     @staticmethod
+    def supports_pair(source_language: str, target_language: str) -> bool:
+        """Return True when Argos can translate source->target, directly or via English.
+
+        Mirrors translate(): a direct package, or a pivot through English. Answers
+        from the installed packages and the online catalogue without translating.
+        """
+        source = _resolve_lang_code(source_language)
+        target = _resolve_lang_code(target_language)
+        if source == target:
+            return True
+        try:
+            from argostranslate import package as argos_package, translate as argos_translate
+            from argostranslate import settings as argos_settings
+        except Exception:
+            return False
+
+        try:
+            argos_settings.data_dir = ArgosTranslationProvider._data_dir()
+            installed = argos_translate.get_installed_languages()
+            if ArgosTranslationProvider._find_installed_translation(installed, source, target) is not None:
+                return True
+            argos_package.update_package_index()
+            catalogue = {(p.from_code, p.to_code) for p in argos_package.get_available_packages()}
+            if (source, target) in catalogue:
+                return True
+            if source != 'en' and target != 'en':
+                return (source, 'en') in catalogue and ('en', target) in catalogue
+            return False
+        except Exception as error:
+            logger.warning('Argos pair check failed for %s->%s: %s', source, target, error)
+            return False
+
+    @staticmethod
     def _find_installed_translation(installed: list, source: str, target: str):
         """Return an installed translation for source->target, or None.
 
@@ -362,7 +396,10 @@ class GoogleTranslateProvider(TranslationProvider):
                 if attempt < self.max_attempts - 1:
                     # Exponential backoff with jitter rides out rate limits and
                     # transient network drops instead of failing the whole run.
-                    time.sleep(min(8.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.5))
+                    # A 429 means the endpoint wants a longer pause, so it waits longer.
+                    rate_limited = isinstance(error, HTTPError) and error.code == 429
+                    base = 15.0 if rate_limited else 0.5 * (2 ** attempt)
+                    time.sleep(min(60.0, base * (2 ** attempt if rate_limited else 1)) + random.uniform(0.0, 0.5))
         raise RuntimeError(
             f'Google Translate failed after {self.max_attempts} attempts: {last_error}'
         ) from last_error
@@ -378,10 +415,11 @@ class HybridTranslationProvider(TranslationProvider):
 
     def __init__(self, style_hint: str | None = None, preference: str = 'auto') -> None:
         self._qwen: TranslationProvider | None = None
+        self._nllb: TranslationProvider | None = None
         self._offline: TranslationProvider | None = None
         self._online = GoogleTranslateProvider()
         self._mode: str = 'online'
-        self._preference = preference if preference in ('qwen', 'argos', 'google') else 'auto'
+        self._preference = preference if preference in ('qwen', 'nllb', 'argos', 'google') else 'auto'
 
         try:
             from . import qwen_local
@@ -391,6 +429,15 @@ class HybridTranslationProvider(TranslationProvider):
                 self._mode = 'qwen'
         except Exception as error:
             logger.info('Qwen local translation unavailable: %s', error)
+
+        try:
+            from . import nllb_local
+
+            if nllb_local.is_installed():
+                self._nllb = nllb_local.NllbTranslationProvider()
+                self._mode = 'nllb'
+        except Exception as error:
+            logger.info('NLLB-200 translation unavailable: %s', error)
 
         if _argos_available():
             try:
@@ -405,8 +452,9 @@ class HybridTranslationProvider(TranslationProvider):
 
     def _chain(self) -> list[tuple[str, TranslationProvider]]:
         """Available providers, preference first, each entry at most once."""
+        # NLLB is opt-in: it is not in the Auto order, so Auto behaves as before.
         order = ([self._preference] if self._preference != 'auto' else []) + ['qwen', 'argos', 'google']
-        available = {'qwen': self._qwen, 'argos': self._offline, 'google': self._online}
+        available = {'qwen': self._qwen, 'nllb': self._nllb, 'argos': self._offline, 'google': self._online}
         chain: list[tuple[str, TranslationProvider]] = []
         for key in order:
             provider = available.get(key)
@@ -414,8 +462,42 @@ class HybridTranslationProvider(TranslationProvider):
                 chain.append((key, provider))
         return chain
 
+    def first_engine(self) -> str | None:
+        """Key of the engine that will be tried first ('qwen', 'nllb', 'argos', 'google') or None."""
+        chain = self._chain()
+        return chain[0][0] if chain else None
+
+    def check_preferred_engine(self, target_language: str, source_language: str = 'en') -> None:
+        """Raise before any translation if the engine the user chose cannot handle the language.
+
+        Only an explicit choice is checked. 'auto' keeps its fallback chain, and
+        Google is never checked here because it is the online last resort.
+        """
+        if self._preference == 'auto' or self._preference == 'google':
+            return
+        if self._preference == 'argos':
+            if self._offline is None:
+                raise RuntimeError('Argos Translate is not installed. Choose another translation engine.')
+            if not ArgosTranslationProvider.supports_pair(source_language, target_language):
+                raise RuntimeError(
+                    f'Argos Translate has no {source_language} -> {target_language} language package, '
+                    'so it cannot translate this project. Choose Google Translate or another engine.'
+                )
+        if self._preference == 'qwen' and self._qwen is None:
+            raise RuntimeError('Qwen3 4B is not downloaded. Install it in AI Models or choose another engine.')
+        if self._preference == 'nllb':
+            if self._nllb is None:
+                raise RuntimeError('NLLB-200 is not downloaded. Install it in AI Models or choose another engine.')
+            from . import nllb_local
+
+            for language in (source_language, target_language):
+                try:
+                    nllb_local.nllb_code(language)
+                except ValueError as error:
+                    raise RuntimeError(f'{error}. Choose Google Translate or another engine.') from error
+
     def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
-        modes = {'qwen': 'qwen', 'argos': 'offline', 'google': 'online'}
+        modes = {'qwen': 'qwen', 'nllb': 'nllb', 'argos': 'offline', 'google': 'online'}
         last_error: Exception | None = None
         for key, provider in self._chain():
             try:
@@ -716,6 +798,12 @@ def get_provider_status() -> list[dict]:
     except Exception:
         qwen_ok = False
     try:
+        from . import nllb_local
+
+        nllb_ok = nllb_local.is_installed()
+    except Exception:
+        nllb_ok = False
+    try:
         from . import mms_tts_local
 
         mms_ok = mms_tts_local.is_installed('mms_khm')
@@ -740,6 +828,14 @@ def get_provider_status() -> list[dict]:
             'connected': qwen_ok,
             'primary': qwen_ok,
             'fallback': False,
+        },
+        {
+            'id': 'nllb',
+            'name': 'NLLB-200 600M (translation)',
+            'mode': 'LOCAL AI',
+            'connected': nllb_ok,
+            'primary': False,
+            'fallback': nllb_ok,
         },
         {
             'id': 'argos_translate',

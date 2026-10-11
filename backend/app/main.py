@@ -205,8 +205,8 @@ def update_project(project_id: str, **updates: Any) -> ProjectSummary | None:
     return ProjectSummary(**project)
 
 
-async def emit_progress(project_id: str, stage: str, progress: int, message: str) -> None:
-    payload = WorkflowProgress(project_id=project_id, stage=stage, progress=progress, message=message).model_dump()
+async def emit_progress(project_id: str, stage: str, progress: int, message: str, engine: str | None = None) -> None:
+    payload = WorkflowProgress(project_id=project_id, stage=stage, progress=progress, message=message, engine=engine).model_dump()
     for connection in list(active_connections):
         try:
             await connection.send_json(payload)
@@ -391,6 +391,11 @@ async def list_all_models() -> dict[str, Any]:
                 'name': 'Khmer MMS-VITS (offline Khmer TTS)',
                 'models': model_manager.mms_statuses(),
             },
+            {
+                'id': 'nllb',
+                'name': 'NLLB-200 (offline translation)',
+                'models': [model_manager.nllb_status()],
+            },
         ],
         'settings': model_manager.load_settings(),
     }
@@ -528,6 +533,29 @@ async def delete_cuda_pack() -> dict[str, str]:
 @app.get('/api/models/qwen')
 async def qwen_model_status() -> dict[str, Any]:
     return model_manager.qwen_status()
+
+
+@app.get('/api/models/nllb')
+async def nllb_model_status() -> dict[str, Any]:
+    return model_manager.nllb_status()
+
+
+@app.post('/api/models/nllb/download')
+async def download_nllb_model() -> dict[str, Any]:
+    try:
+        job = model_manager.start_download_nllb()
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {'status': 'ok', 'model': model_manager.NLLB_JOB_ID, 'job': job}
+
+
+@app.delete('/api/models/nllb')
+async def delete_nllb_model() -> dict[str, str]:
+    try:
+        model_manager.delete_nllb()
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {'status': 'ok', 'deleted': model_manager.NLLB_JOB_ID}
 
 
 def _mms_engine_or_404(engine_id: str) -> str:
@@ -1564,6 +1592,16 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
 
     translator = HybridTranslationProvider(preference=payload.translation_provider)
     source_language = project.get('source_language', 'en')
+    try:
+        translator.check_preferred_engine(payload.target_language, source_language)
+    except RuntimeError as error:
+        update_project(payload.project_id, status='Ready', progress=52)
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    active_engine = translator.first_engine()
+    await emit_progress(
+        payload.project_id, 'Translating', 52,
+        f'Translating with {active_engine or "no engine"}.', engine=active_engine,
+    )
     total = len(segments)
     # Resume support: segments that already carry a translation are kept, so
     # re-running after a failure continues instead of starting over.
@@ -1587,8 +1625,12 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
             return translator.translate(segment['text'], payload.target_language, source_language)
 
         # A small bounded pool keeps long runs several times faster while the
-        # retry/backoff inside the provider absorbs rate limiting.
-        with ThreadPoolExecutor(max_workers=min(4, max(1, len(pending)))) as pool:
+        # retry/backoff inside the provider absorbs rate limiting. Google's free
+        # endpoint throttles parallel callers, and a single local model (Qwen, NLLB)
+        # runs one generation at a time behind its lock, so both run one line at a time.
+        serial_engines = ('google', 'nllb', 'qwen')
+        workers = 1 if translator.first_engine() in serial_engines else min(4, max(1, len(pending)))
+        with ThreadPoolExecutor(max_workers=min(workers, max(1, len(pending)))) as pool:
             futures = {pool.submit(work, segment): segment for segment in pending}
             for future in as_completed(futures):
                 segment = futures[future]
