@@ -39,6 +39,7 @@ interface StudioState {
   qwenModel: WhisperModelInfo | null;
   nllbModel: WhisperModelInfo | null;
   activeTranslateEngine: string | null;
+  activeSeparateEngine: string | null;
   demucsModel: WhisperModelInfo | null;
   mmsKhmModels: WhisperModelInfo[];
   cudaPack: CudaPackInfo | null;
@@ -300,6 +301,7 @@ const connectProgressSocket = () => {
         return {
           project: { ...state.project, progress: message.progress },
           ...(message.stage === 'Translating' && message.engine ? { activeTranslateEngine: message.engine } : {}),
+          ...(message.stage === 'Separating audio' && message.engine ? { activeSeparateEngine: message.engine } : {}),
           workflowSteps: stepId
             ? state.workflowSteps.map((step) => step.id === stepId
               ? { ...step, status: 'Active', detail: message.message, progress: message.progress }
@@ -341,6 +343,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   qwenModel: null,
   nllbModel: null,
   activeTranslateEngine: null,
+  activeSeparateEngine: null,
   demucsModel: null,
   mmsKhmModels: [],
   cudaPack: null,
@@ -365,7 +368,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   runSeparate: async () => {
     const projectId = get().project.id;
     get().appendLog('Separating original audio into voice and sound effects (this can take a while on CPU)...');
-    set((state) => ({ project: { ...state.project, status: 'Processing' } }));
+    set((state) => ({ project: { ...state.project, status: 'Processing' }, activeSeparateEngine: null }));
     try {
       const response = await fetch(`${apiBase}/api/process/separate`, {
         method: 'POST',
@@ -378,11 +381,11 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       }
       const payload = await response.json();
       get().appendLog(payload.message ?? 'Audio separated.', 'success');
-      set((state) => ({ project: { ...state.project, status: 'Ready' }, separated: true }));
+      set((state) => ({ project: { ...state.project, status: 'Ready' }, separated: true, activeSeparateEngine: null }));
       return payload as { message?: string };
     } catch (error) {
       get().appendLog(error instanceof Error ? error.message : 'Audio separation failed', 'error');
-      set((state) => ({ project: { ...state.project, status: 'Ready' } }));
+      set((state) => ({ project: { ...state.project, status: 'Ready' }, activeSeparateEngine: null }));
       throw error;
     }
   },
@@ -999,6 +1002,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     set((state) => ({
       project: { ...state.project, status: 'Processing' },
       activeTranslateEngine: null,
+      activeSeparateEngine: null,
       workflowSteps: state.workflowSteps.map((step) => step.id === stepId
         ? { ...step, status: 'Active', detail: `${label}...`, progress: 20 }
         : step),
@@ -1174,6 +1178,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       qwenModel: null,
       nllbModel: null,
       activeTranslateEngine: null,
+      activeSeparateEngine: null,
       demucsModel: null,
       mmsKhmModels: [],
       cudaPack: null,

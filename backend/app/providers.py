@@ -811,6 +811,13 @@ def get_provider_status() -> list[dict]:
     except Exception:
         mms_ok = False
         mms_base_ok = False
+    try:
+        from . import demucs_local
+
+        # Separation needs both the model and the package, so report ready only with both.
+        demucs_ok = demucs_local.is_installed() and importlib.util.find_spec('demucs') is not None
+    except Exception:
+        demucs_ok = False
 
     return [
         {
@@ -858,6 +865,14 @@ def get_provider_status() -> list[dict]:
             'name': 'Speaker Detection',
             'mode': 'LOCAL AI',
             'connected': importlib.util.find_spec('resemblyzer') is not None,
+            'primary': False,
+            'fallback': False,
+        },
+        {
+            'id': 'demucs',
+            'name': 'Demucs 6-stem (audio separation)',
+            'mode': 'LOCAL AI',
+            'connected': demucs_ok,
             'primary': False,
             'fallback': False,
         },

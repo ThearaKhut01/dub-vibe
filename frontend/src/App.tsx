@@ -138,6 +138,7 @@ function App() {
     downloadNllb,
     deleteNllb,
     activeTranslateEngine,
+    activeSeparateEngine,
     cudaPack,
     downloadCudaPack,
     deleteCudaPack,
@@ -945,6 +946,8 @@ function App() {
   // stage currently running, mapped to the provider rows that do the work.
   const activeStep = workflowSteps.find((step) => step.status === 'Active');
   const workingProviderIds = (() => {
+    // Audio separation is not a workflow step; the backend announces its engine directly.
+    if (activeSeparateEngine === 'demucs') return new Set(['demucs']);
     if (!activeStep) return new Set<string>();
     if (activeStep.id === 'transcribe') return new Set(['whisper']);
     if (activeStep.id === 'translate') {
@@ -980,6 +983,9 @@ function App() {
     }
     if (providerId === 'nllb') {
       return nllbModel && (nllbModel.status === 'downloading' || nllbModel.status === 'validating') ? nllbModel : null;
+    }
+    if (providerId === 'demucs') {
+      return demucsModel && (demucsModel.status === 'downloading' || demucsModel.status === 'validating') ? demucsModel : null;
     }
     return null;
   };

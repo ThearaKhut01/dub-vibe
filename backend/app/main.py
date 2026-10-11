@@ -1285,7 +1285,8 @@ async def process_separate(payload: ProcessingRequest) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail='FFmpeg must be installed and available on PATH to separate audio')
 
     await emit_progress(payload.project_id, 'Separating audio', 5,
-                        'Extracting voice and sound effects from the original audio...')
+                        'Extracting voice and sound effects from the original audio...',
+                        engine='demucs')
     update_project(payload.project_id, status='Processing')
 
     loop = asyncio.get_running_loop()
@@ -1322,6 +1323,7 @@ async def process_separate(payload: ProcessingRequest) -> dict[str, Any]:
                                 payload.project_id, 'Separating audio',
                                 5 + int(90 * percent / 100),
                                 f'Separating voice from sound effects: {percent}%...',
+                                engine='demucs',
                             ),
                             loop,
                         )
@@ -1405,7 +1407,7 @@ async def process_separate(payload: ProcessingRequest) -> dict[str, Any]:
     persist_project(payload.project_id)
     final_message = ('Voice, music, and sound effects separated. Exports now replace the original '
                      'dialogue with the dub while SFX/music stay on and duck under it.')
-    await emit_progress(payload.project_id, 'Separating audio', 100, final_message)
+    await emit_progress(payload.project_id, 'Separating audio', 100, final_message, engine='demucs')
     update_project(payload.project_id, status='Ready')
     return {'project_id': payload.project_id, 'status': 'ok', 'stems': project['stems'], 'message': final_message}
 
