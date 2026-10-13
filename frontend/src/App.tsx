@@ -1261,6 +1261,52 @@ function App() {
     return 'bg-slate-700/60 text-slate-200 border border-slate-600';
   }, [project.status]);
 
+  const modeSwitcher = (
+    <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3">
+      <div />
+      <div className="flex items-center gap-2" role="tablist" aria-label="Studio mode">
+        <button
+          role="tab"
+          aria-selected={mode === 'EDIT'}
+          onClick={() => setMode('EDIT')}
+          className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'EDIT' ? 'bg-slate-800 text-white ring-1 ring-white/20' : 'bg-slate-900 text-slate-400 hover:text-slate-200'}`}
+        >
+          EDIT MODE
+        </button>
+        <button
+          role="tab"
+          aria-selected={mode === 'DUB'}
+          onClick={() => setMode('DUB')}
+          className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'DUB' ? 'bg-sky-500 text-slate-950' : 'bg-slate-900 text-slate-400 hover:text-slate-200'}`}
+        >
+          DUB MODE
+        </button>
+        <button
+          role="tab"
+          aria-selected={mode === 'VOXCPM'}
+          onClick={() => setMode('VOXCPM')}
+          className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'VOXCPM' ? 'bg-violet-500 text-slate-950' : 'bg-slate-900 text-slate-400 hover:text-slate-200'}`}
+        >
+          VOXCPM MODE
+        </button>
+      </div>
+      <div className="flex items-center justify-end gap-3">
+        <div className="flex items-center justify-end gap-3">
+          {mode !== 'VOXCPM' && (
+            <>
+              <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-900 px-3 py-1.5 text-sm text-slate-300">
+                <Clock3 size={14} /> {project.duration}
+              </span>
+              <span className={`inline-flex items-center rounded-full px-3 py-1.5 text-xs font-semibold ${statusBadge}`}>
+                {project.status}
+              </span>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
   return (
     <div className="min-h-screen bg-[#050b14] text-slate-100">
       <header className="flex h-16 items-center justify-between border-b border-white/10 bg-slate-950/80 px-6 backdrop-blur-xl">
@@ -1298,46 +1344,12 @@ function App() {
         <input ref={fileInputRef} className="hidden" type="file" accept="video/*" onChange={(event) => { void handleImport(event.target.files?.[0]); event.currentTarget.value = ''; }} />
       </header>
 
-      <div className="flex items-center gap-3 border-b border-white/10 bg-slate-950/60 px-5 py-3">
-        <div className="flex items-center gap-2" role="tablist" aria-label="Studio mode">
-          <button
-            role="tab"
-            aria-selected={mode === 'EDIT'}
-            onClick={() => setMode('EDIT')}
-            className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'EDIT' ? 'bg-slate-800 text-white ring-1 ring-white/20' : 'bg-slate-900 text-slate-400 hover:text-slate-200'}`}
-          >
-            EDIT MODE
-          </button>
-          <button
-            role="tab"
-            aria-selected={mode === 'DUB'}
-            onClick={() => setMode('DUB')}
-            className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'DUB' ? 'bg-sky-500 text-slate-950' : 'bg-slate-900 text-slate-400 hover:text-slate-200'}`}
-          >
-            DUB MODE
-          </button>
-          <button
-            role="tab"
-            aria-selected={mode === 'VOXCPM'}
-            onClick={() => setMode('VOXCPM')}
-            className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'VOXCPM' ? 'bg-violet-500 text-slate-950' : 'bg-slate-900 text-slate-400 hover:text-slate-200'}`}
-          >
-            VOXCPM MODE
-          </button>
-        </div>
-        {mode !== 'VOXCPM' && (
-          <>
-            <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-900 px-3 py-1.5 text-sm text-slate-300">
-              <Clock3 size={14} /> {project.duration}
-            </span>
-            <span className={`inline-flex items-center rounded-full px-3 py-1.5 text-xs font-semibold ${statusBadge}`}>
-              {project.status}
-            </span>
-          </>
-        )}
-      </div>
-
-      {mode === 'VOXCPM' ? <VoxcpmWorkspace /> : (
+      {mode === 'VOXCPM' ? (
+        <>
+          <div className="border-b border-white/10 bg-slate-950/60 px-5 py-3">{modeSwitcher}</div>
+          <VoxcpmWorkspace />
+        </>
+      ) : (
       <main className="grid h-[calc(100vh-64px)] grid-cols-[220px_minmax(0,1fr)_340px]">
         <aside className="border-r border-white/10 bg-slate-950/80 p-4">
           <div className="mb-4">
@@ -1429,6 +1441,7 @@ function App() {
 
         <section className="flex min-w-0 flex-col border-r border-white/10 bg-slate-950/60">
           <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
+            {modeSwitcher}
             <div className="flex items-center justify-between rounded-2xl border border-white/10 bg-slate-900/80 p-4">
               <div className="flex items-center gap-4 min-w-0">
                 <div className="rounded-xl bg-gradient-to-br from-emerald-400 to-cyan-500 p-2 text-slate-950 shrink-0">
