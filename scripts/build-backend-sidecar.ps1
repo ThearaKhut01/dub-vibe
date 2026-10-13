@@ -62,6 +62,9 @@ $arguments = @(
   "--collect-all", "sentencepiece",
   "--collect-all", "soundfile",
   "--collect-all", "yaml",
+  "--collect-all", "voxcpm",
+  "--collect-all", "librosa",
+  "--collect-all", "wetext",
   "--add-binary", "$($ffmpeg.Source);.",
   "--add-binary", "$($ffprobe.Source);.",
   (Join-Path $projectRoot "backend\run_server.py")

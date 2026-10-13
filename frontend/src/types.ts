@@ -71,6 +71,8 @@ export interface WhisperModelInfo {
   size_mb: number | null;
   path: string | null;
   error: string | null;
+  // Set only by the VoxCPM2 status: why the model is not usable (missing or incomplete files).
+  verify_error?: string | null;
 }
 
 export interface HardwareInfo {

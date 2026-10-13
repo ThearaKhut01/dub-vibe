@@ -42,6 +42,7 @@ interface StudioState {
   activeSeparateEngine: string | null;
   demucsModel: WhisperModelInfo | null;
   mmsKhmModels: WhisperModelInfo[];
+  voxcpmModel: WhisperModelInfo | null;
   cudaPack: CudaPackInfo | null;
   providerKeys: { gemini: { has_key: boolean }; openai: { has_key: boolean } };
   voiceCapabilities: Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean }> & { emotions?: string[] };
@@ -49,8 +50,8 @@ interface StudioState {
   workflowSteps: WorkflowStep[];
   mediaLibrary: MediaAsset[];
   activeTool: string;
-  mode: 'EDIT' | 'DUB';
-  setMode: (mode: 'EDIT' | 'DUB') => void;
+  mode: 'EDIT' | 'DUB' | 'VOXCPM';
+  setMode: (mode: 'EDIT' | 'DUB' | 'VOXCPM') => void;
   setActiveTool: (tool: string) => void;
   setProjectName: (name: string) => void;
   appendLog: (message: string, level?: LogEntry['level']) => void;
@@ -72,6 +73,8 @@ interface StudioState {
   deleteDemucs: () => Promise<void>;
   downloadMmsKhm: (engineId: string) => Promise<void>;
   deleteMmsKhm: (engineId: string) => Promise<void>;
+  downloadVoxcpm: () => Promise<void>;
+  deleteVoxcpm: () => Promise<void>;
   downloadCudaPack: () => Promise<void>;
   deleteCudaPack: () => Promise<void>;
   detectSpeakers: () => Promise<{ speakers: string[]; message: string }>;
@@ -346,6 +349,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   activeSeparateEngine: null,
   demucsModel: null,
   mmsKhmModels: [],
+  voxcpmModel: null,
   cudaPack: null,
   providerKeys: { gemini: { has_key: false }, openai: { has_key: false } },
   voiceCapabilities: {},
@@ -354,7 +358,13 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   mediaLibrary: initialMedia,
   activeTool: 'Auto Dubbing',
   mode: 'DUB',
-  setMode: (mode) => set((state) => ({ ...state, mode, project: { ...state.project, mode } })),
+  // VoxCPM Mode is a standalone workspace, not a video project mode, so the
+  // project record keeps its last EDIT/DUB value.
+  setMode: (mode) => set((state) => (
+    mode === 'VOXCPM'
+      ? { ...state, mode }
+      : { ...state, mode, project: { ...state.project, mode } }
+  )),
   setActiveTool: (tool) => set({ activeTool: tool }),
   setProjectName: (name) => set((state) => ({ project: { ...state.project, name } })),
   appendLog: (message, level = 'info') =>
@@ -391,7 +401,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   },
   refreshModels: async () => {
     try {
-      const [models, hardware, storage, qwen, demucs, mmsKhm, nllb, cudaPack] = await Promise.all([
+      const [models, hardware, storage, qwen, demucs, mmsKhm, nllb, voxcpm, cudaPack] = await Promise.all([
         readJson<WhisperModelInfo[]>('/api/models/faster-whisper'),
         readJson<HardwareInfo>('/api/system/hardware'),
         readJson<ModelStorageInfo>('/api/models/storage').catch(() => null),
@@ -399,9 +409,10 @@ export const useStudioStore = create<StudioState>((set, get) => ({
         readJson<WhisperModelInfo>('/api/models/demucs').catch(() => null),
         readJson<{ models: WhisperModelInfo[] }>('/api/models/mms-khm').catch(() => null),
         readJson<WhisperModelInfo>('/api/models/nllb').catch(() => null),
+        readJson<WhisperModelInfo>('/api/models/voxcpm').catch(() => null),
         readJson<CudaPackInfo>('/api/models/cuda-pack').catch(() => null),
       ]);
-      set({ models, hardware, modelStorage: storage, qwenModel: qwen, demucsModel: demucs, mmsKhmModels: mmsKhm?.models ?? [], nllbModel: nllb, cudaPack });
+      set({ models, hardware, modelStorage: storage, qwenModel: qwen, demucsModel: demucs, mmsKhmModels: mmsKhm?.models ?? [], voxcpmModel: voxcpm, nllbModel: nllb, cudaPack });
     } catch {
       // Backend offline; keep the last known state.
     }
@@ -535,6 +546,22 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     if (!response.ok) {
       const problem = await response.json().catch(() => ({}));
       throw new Error(problem.detail ?? `Unable to delete the Khmer model (HTTP ${response.status})`);
+    }
+    await get().refreshModels();
+  },
+  downloadVoxcpm: async () => {
+    const response = await fetch(`${apiBase}/api/models/voxcpm/download`, { method: 'POST' });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(problem.detail ?? `Unable to start the VoxCPM2 download (HTTP ${response.status})`);
+    }
+    void get().refreshModels();
+  },
+  deleteVoxcpm: async () => {
+    const response = await fetch(`${apiBase}/api/models/voxcpm`, { method: 'DELETE' });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(problem.detail ?? `Unable to delete VoxCPM2 (HTTP ${response.status})`);
     }
     await get().refreshModels();
   },
@@ -1181,6 +1208,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       activeSeparateEngine: null,
       demucsModel: null,
       mmsKhmModels: [],
+      voxcpmModel: null,
       cudaPack: null,
       providerKeys: { gemini: { has_key: false }, openai: { has_key: false } },
       voiceCapabilities: {},

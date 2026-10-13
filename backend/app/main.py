@@ -56,7 +56,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from urllib.parse import quote
 
 from backend.app.chunking import SmartChunkEngine, format_timestamp, split_subtitle_cues
-from backend.app import acting, api_keys, cuda_pack, mms_tts_local, model_manager, online_providers, speaker_diarization, tts_service
+from backend.app import acting, api_keys, cuda_pack, mms_tts_local, model_manager, online_providers, speaker_diarization, tts_service, voxcpm_local
 from backend.app.models import ProjectRequest, ProjectSummary, ProviderSettings, ProcessingRequest, SegmentSplit, SegmentUpdate, WorkflowProgress
 from backend.app.providers import (
     FasterWhisperProvider,
@@ -564,6 +564,130 @@ def _mms_engine_or_404(engine_id: str) -> str:
     return engine_id
 
 
+@app.get('/api/models/voxcpm')
+async def voxcpm_model_status() -> dict[str, Any]:
+    return model_manager.voxcpm_status()
+
+
+@app.post('/api/models/voxcpm/download')
+async def download_voxcpm_model() -> dict[str, Any]:
+    try:
+        job = model_manager.start_download_voxcpm()
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {'status': 'ok', 'model': 'voxcpm2', 'job': job}
+
+
+@app.delete('/api/models/voxcpm')
+async def delete_voxcpm_model() -> dict[str, str]:
+    try:
+        model_manager.delete_voxcpm()
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {'status': 'ok', 'deleted': 'voxcpm2'}
+
+
+# --- VoxCPM Mode: standalone voice generation (no video needed) ---------------
+
+@app.get('/api/voxcpm/hardware')
+async def voxcpm_hardware() -> dict[str, Any]:
+    from . import voxcpm_local
+
+    return await run_in_threadpool(voxcpm_local.hardware_report)
+
+
+@app.post('/api/voxcpm/references')
+async def upload_voxcpm_reference(file: UploadFile = File(...)) -> dict[str, Any]:
+    from . import voxcpm_workspace
+
+    data = await file.read(voxcpm_workspace.MAX_REFERENCE_BYTES + 1)
+    try:
+        reference_id = voxcpm_workspace.save_reference(data, file.filename or '')
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {'status': 'ok', 'reference_id': reference_id, 'name': file.filename}
+
+
+@app.post('/api/voxcpm/jobs')
+async def start_voxcpm_job(payload: dict[str, Any]) -> dict[str, Any]:
+    from . import voxcpm_workspace
+
+    if not payload.get('mode'):
+        raise HTTPException(status_code=422, detail='Choose a generation mode.')
+    try:
+        job = voxcpm_workspace.start_job(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {'status': 'ok', 'job': job}
+
+
+@app.get('/api/voxcpm/jobs/{job_id}')
+async def get_voxcpm_job(job_id: str) -> dict[str, Any]:
+    from . import voxcpm_workspace
+
+    try:
+        return {'status': 'ok', 'job': voxcpm_workspace.public_job(job_id)}
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail='Job not found') from error
+
+
+@app.post('/api/voxcpm/jobs/{job_id}/cancel')
+async def cancel_voxcpm_job(job_id: str) -> dict[str, Any]:
+    from . import voxcpm_workspace
+
+    try:
+        return {'status': 'ok', 'job': voxcpm_workspace.cancel_job(job_id)}
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail='Job not found') from error
+
+
+@app.get('/api/voxcpm/jobs/{job_id}/audio')
+async def voxcpm_job_audio(job_id: str):
+    from . import voxcpm_workspace
+
+    try:
+        job = voxcpm_workspace.public_job(job_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail='Job not found') from error
+    output = job.get('output')
+    if job.get('status') != 'done' or not output or not Path(output).is_file():
+        raise HTTPException(status_code=409, detail='This job has no finished audio yet.')
+    return FileResponse(output, media_type='audio/wav', filename=f'voxcpm-{job_id}.wav')
+
+
+@app.post('/api/voxcpm/jobs/{job_id}/send-to-project/{project_id}')
+async def send_voxcpm_clip_to_project(job_id: str, project_id: str) -> dict[str, Any]:
+    """Copy a finished VoxCPM clip into a Dubbing project as a standalone audio file.
+
+    The clip goes to its own folder with a non-numeric name, so it never collides with
+    the numbered dub segments and does not change the dub timeline or the export.
+    """
+    from . import voxcpm_workspace
+
+    if project_id not in projects:
+        raise HTTPException(status_code=404, detail='Project not found')
+    try:
+        job = voxcpm_workspace.public_job(job_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail='Job not found') from error
+    output = job.get('output')
+    if job.get('status') != 'done' or not output or not Path(output).is_file():
+        raise HTTPException(status_code=409, detail='This job has no finished audio to send.')
+    clip_dir = DATA_ROOT / project_id / 'voxcpm-clips'
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    target = clip_dir / f'voxcpm-{job_id}.wav'
+    await run_in_threadpool(shutil.copyfile, output, target)
+    return {'status': 'ok', 'project_id': project_id, 'file': target.name, 'duration': job.get('duration')}
+
+
+@app.post('/api/voxcpm/unload')
+async def unload_voxcpm() -> dict[str, str]:
+    from . import voxcpm_workspace
+
+    await run_in_threadpool(voxcpm_workspace.unload_model)
+    return {'status': 'ok', 'loaded': 'false'}
+
+
 @app.get('/api/models/mms-khm')
 async def mms_models_list() -> dict[str, Any]:
     return {'engine': 'mms-khm', 'models': model_manager.mms_statuses()}
@@ -677,6 +801,16 @@ async def tts_capabilities(model: str | None = None) -> dict[str, Any]:
             'khmer_supported': True,
             'key_configured': True,
             'label': 'System TTS (offline)',
+        },
+        'voxcpm2': {
+            'voices': [],
+            'emotions': [],
+            'style_control': False,
+            'languages': sorted(voxcpm_local.VERIFIED_LANGUAGE_CODES),
+            'khmer_supported': True,
+            'key_configured': True,
+            'installed': model_manager.voxcpm_status()['installed'],
+            'label': voxcpm_local.NAME,
         },
         **{
             engine_id: {

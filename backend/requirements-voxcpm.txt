@@ -1,0 +1,38 @@
+# Optional offline VoxCPM2 TTS (English). Install with --no-deps so pip does not
+# upgrade the pinned transformers 4.x / fastapi stack. Its runtime imports are the
+# small packages listed below plus torch, transformers (4.x), numpy, soundfile.
+voxcpm==2.0.3
+torchaudio==2.11.0
+einops==0.8.2
+huggingface-hub==0.36.2
+pydantic==2.9.2
+pydantic-core==2.23.4
+annotated-types
+typing-extensions
+regex
+safetensors
+tqdm
+librosa==0.11.0
+lazy_loader
+soxr
+audioread
+joblib
+scikit-learn
+numba
+pooch
+decorator
+platformdirs
+msgpack
+wetext==0.1.8
+inflect==7.5.0
+typeguard==4.6.0
+more_itertools
+contractions==0.1.73
+kaldifst==1.8.1
+textsearch==0.0.24
+anyascii==0.3.3
+pyahocorasick==2.3.1
+addict==2.4.0
+argbind==0.3.9
+simplejson==4.2.0
+sortedcontainers==2.4.0

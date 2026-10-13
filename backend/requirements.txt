@@ -8,8 +8,9 @@ argostranslate>=1.9,<2
 pyttsx3>=2.90,<3
 transformers>=4.45,<5
 soundfile>=0.12
-resemblyzer>=0.1,<0.2
 webrtcvad-wheels>=2.0.14
+# resemblyzer is installed with --no-deps in setup:backend (see package.json): its metadata
+# declares the obsolete 'typing' backport, which would shadow the standard library on Python 3.10.
 setuptools<81
 demucs>=4.0,<5
 pyinstaller>=6.10,<7
@@ -23,4 +24,5 @@ torch==2.14.1+cu126
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
 # Direct CUDA wheel (PyPI's 0.3.32 would be CPU-only)
-llama-cpp-python @ https://abetlen.github.io/llama-cpp-python/whl/cu124/llama_cpp_python-0.3.32-py3-none-win_amd64.whl
+# 0.2.69 is pinned because the 0.3.x CUDA wheels no longer download from the index (HTTP 404).
+llama-cpp-python @ https://github.com/abetlen/llama-cpp-python/releases/download/v0.2.69-cu124/llama_cpp_python-0.2.69-cp310-cp310-win_amd64.whl

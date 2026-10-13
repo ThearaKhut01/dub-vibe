@@ -38,6 +38,7 @@ import {
   Wand2,
 } from 'lucide-react';
 import { useStudioStore } from './store/useStudioStore';
+import { VoxcpmWorkspace } from './components/VoxcpmWorkspace';
 import type { ProjectSummary, OverlapProposal, FixOverlapsResponse } from './types';
 
 const toolActions = [
@@ -134,6 +135,9 @@ function App() {
     mmsKhmModels,
     downloadMmsKhm,
     deleteMmsKhm,
+    voxcpmModel,
+    downloadVoxcpm,
+    deleteVoxcpm,
     nllbModel,
     downloadNllb,
     deleteNllb,
@@ -184,6 +188,7 @@ function App() {
   const [modelBusy, setModelBusy] = useState<string | null>(null);
   const [mmsKhmConfirm, setMmsKhmConfirm] = useState<string | null>(null);
   const [nllbConfirm, setNllbConfirm] = useState(false);
+  const [voxcpmConfirm, setVoxcpmConfirm] = useState(false);
   const [transcribeLanguage, setTranscribeLanguage] = useState(() => localStorage.getItem('dubvibe-transcribe-language') ?? '');
   const [beamSize, setBeamSize] = useState(() => Number(localStorage.getItem('dubvibe-beam-size') ?? 5));
   const [deleteTarget, setDeleteTarget] = useState<ProjectSummary | null>(null);
@@ -791,7 +796,9 @@ function App() {
     setProjectName(file.name.replace(/\.[^.]+$/, ''));
     setNotice(`Uploading ${file.name} to the local processing service...`);
     try {
-      const created = await createProject(file.name.replace(/\.[^.]+$/, ''), mode, targetLanguage);
+      // Video import only exists in EDIT and DUB; VoxCPM Mode never creates a video project.
+      const projectMode = mode === 'EDIT' ? 'EDIT' : 'DUB';
+      const created = await createProject(file.name.replace(/\.[^.]+$/, ''), projectMode, targetLanguage);
       await uploadMedia(created.id, file);
       setNotice(`${file.name} imported. Ready to transcribe.`);
     } catch (error) {
@@ -968,6 +975,7 @@ function App() {
     if (activeStep.id === 'voice') {
       if (ttsProvider === 'edge') return new Set(['edge_tts']);
       if (ttsProvider === 'mms_khm' || ttsProvider === 'mms_khm_base') return new Set([ttsProvider]);
+      if (ttsProvider === 'voxcpm2') return new Set(['voxcpm2']);
       if (ttsProvider === 'sapi5') return new Set(['pyttsx3']);
       if (ttsProvider === 'gemini' || ttsProvider === 'openai') return new Set<string>();
       return new Set(['edge_tts', 'pyttsx3']);
@@ -1290,6 +1298,46 @@ function App() {
         <input ref={fileInputRef} className="hidden" type="file" accept="video/*" onChange={(event) => { void handleImport(event.target.files?.[0]); event.currentTarget.value = ''; }} />
       </header>
 
+      <div className="flex items-center gap-3 border-b border-white/10 bg-slate-950/60 px-5 py-3">
+        <div className="flex items-center gap-2" role="tablist" aria-label="Studio mode">
+          <button
+            role="tab"
+            aria-selected={mode === 'EDIT'}
+            onClick={() => setMode('EDIT')}
+            className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'EDIT' ? 'bg-slate-800 text-white ring-1 ring-white/20' : 'bg-slate-900 text-slate-400 hover:text-slate-200'}`}
+          >
+            EDIT MODE
+          </button>
+          <button
+            role="tab"
+            aria-selected={mode === 'DUB'}
+            onClick={() => setMode('DUB')}
+            className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'DUB' ? 'bg-sky-500 text-slate-950' : 'bg-slate-900 text-slate-400 hover:text-slate-200'}`}
+          >
+            DUB MODE
+          </button>
+          <button
+            role="tab"
+            aria-selected={mode === 'VOXCPM'}
+            onClick={() => setMode('VOXCPM')}
+            className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'VOXCPM' ? 'bg-violet-500 text-slate-950' : 'bg-slate-900 text-slate-400 hover:text-slate-200'}`}
+          >
+            VOXCPM MODE
+          </button>
+        </div>
+        {mode !== 'VOXCPM' && (
+          <>
+            <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-900 px-3 py-1.5 text-sm text-slate-300">
+              <Clock3 size={14} /> {project.duration}
+            </span>
+            <span className={`inline-flex items-center rounded-full px-3 py-1.5 text-xs font-semibold ${statusBadge}`}>
+              {project.status}
+            </span>
+          </>
+        )}
+      </div>
+
+      {mode === 'VOXCPM' ? <VoxcpmWorkspace /> : (
       <main className="grid h-[calc(100vh-64px)] grid-cols-[220px_minmax(0,1fr)_340px]">
         <aside className="border-r border-white/10 bg-slate-950/80 p-4">
           <div className="mb-4">
@@ -1380,32 +1428,6 @@ function App() {
         </aside>
 
         <section className="flex min-w-0 flex-col border-r border-white/10 bg-slate-950/60">
-          <div className="flex items-center justify-between border-b border-white/10 px-5 py-3">
-            <div className="flex items-center gap-3">
-              <button
-                onClick={() => setMode('EDIT')}
-                className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'EDIT' ? 'bg-slate-800 text-white' : 'bg-slate-900 text-slate-400'}`}
-              >
-                EDIT MODE
-              </button>
-              <button
-                onClick={() => setMode('DUB')}
-                className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'DUB' ? 'bg-sky-500 text-slate-950' : 'bg-slate-900 text-slate-400'}`}
-              >
-                DUB MODE
-              </button>
-            </div>
-
-            <div className="flex items-center gap-3 text-sm text-slate-300">
-              <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-900 px-3 py-1.5">
-                <Clock3 size={14} /> {project.duration}
-              </span>
-              <span className={`inline-flex items-center rounded-full px-3 py-1.5 text-xs font-semibold ${statusBadge}`}>
-                {project.status}
-              </span>
-            </div>
-          </div>
-
           <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
             <div className="flex items-center justify-between rounded-2xl border border-white/10 bg-slate-900/80 p-4">
               <div className="flex items-center gap-4 min-w-0">
@@ -2472,6 +2494,11 @@ function App() {
                   <option value="gemini">Google Gemini TTS (premium)</option>
                   <option value="openai">OpenAI TTS</option>
                   <option value="edge">Edge TTS (free)</option>
+                  <option value="voxcpm2" disabled={voiceCapabilities['voxcpm2']?.installed === false}>
+                    {voiceCapabilities['voxcpm2']?.installed === false
+                      ? 'VoxCPM2 (offline, English) — download in AI Models'
+                      : 'VoxCPM2 (offline, English)'}
+                  </option>
                   {KHMER_MMS_ENGINES.map((engineId) => (
                     <option key={engineId} value={engineId} disabled={voiceCapabilities[engineId]?.installed === false}>
                       {voiceCapabilities[engineId]?.installed === false
@@ -2904,6 +2931,7 @@ function App() {
 
         </aside>
       </main>
+      )}
 
       {editingSegment && editDraft && (
         <div className="fixed bottom-6 right-6 z-40 w-96 rounded-2xl border border-indigo-500/30 bg-slate-950 p-4 shadow-2xl">
@@ -3282,6 +3310,9 @@ function App() {
                           : 'No NVIDIA GPU detected on this machine'}
                         {cudaPack.installed ? ' · pack installed' : ''}
                       </p>
+                      <p className="mt-0.5 text-[10px] text-slate-500">
+                        Accelerates Faster-Whisper transcription only. VoxCPM uses the GPU when a CUDA build of torch is installed; MMS, NLLB, and Demucs run on CPU.
+                      </p>
                     </div>
                     <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-semibold ${cudaPack.status === 'installed' ? 'bg-emerald-500/20 text-emerald-200'
                         : cudaPack.status === 'downloading' ? 'bg-amber-500/20 text-amber-200'
@@ -3518,6 +3549,80 @@ function App() {
                   )}
                   {demucsModel.status === 'error' && demucsModel.error && (
                     <p className="mt-3 rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[10px] text-rose-200">{demucsModel.error}</p>
+                  )}
+                </div>
+              )}
+
+              {voxcpmModel && (
+                <div className={`mt-3 rounded-xl border p-4 ${voxcpmModel.installed ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-white/10 bg-slate-900/80'}`}>
+                  <div className="flex items-start gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+                        <p className="text-sm font-medium text-slate-200">{voxcpmModel.name}</p>
+                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${voxcpmModel.status === 'downloading' ? 'bg-amber-500/20 text-amber-200'
+                            : voxcpmModel.status === 'error' ? 'bg-rose-500/20 text-rose-200'
+                              : voxcpmModel.installed ? 'bg-emerald-500/20 text-emerald-200'
+                                : 'bg-slate-700/60 text-slate-300'
+                          }`}>
+                          {voxcpmModel.status === 'downloading' ? `Downloading ${voxcpmModel.progress}%`
+                            : voxcpmModel.status === 'error' ? 'Error'
+                              : voxcpmModel.installed ? '✓ Installed' : 'Not installed'}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-xs leading-relaxed text-slate-500">
+                        {voxcpmModel.installed
+                          ? `${voxcpmModel.size_mb?.toFixed(0)} MB · Offline English voice (Apache-2.0, commercial use allowed). CPU works but is slow; a CUDA GPU is much faster.`
+                          : `~${(voxcpmModel.total_mb / 1024).toFixed(1)} GB download · offline English voice. Apache-2.0 license. Slow on CPU; a CUDA GPU is recommended.`}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {voxcpmModel.status === 'not_installed' && !voxcpmConfirm && (
+                        <button
+                          onClick={() => setVoxcpmConfirm(true)}
+                          disabled={modelBusy !== null}
+                          className="shrink-0 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-200 hover:bg-sky-500/20 transition disabled:opacity-40"
+                        >
+                          Download
+                        </button>
+                      )}
+                      {voxcpmModel.status === 'not_installed' && voxcpmConfirm && (
+                        <>
+                          <button
+                            onClick={() => { setVoxcpmConfirm(false); void runModelAction('dl-voxcpm2', () => downloadVoxcpm()); }}
+                            disabled={modelBusy !== null}
+                            className="shrink-0 rounded-lg border border-sky-500/30 bg-sky-500/20 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/30 transition disabled:opacity-40"
+                          >
+                            Confirm download (~{(voxcpmModel.total_mb / 1024).toFixed(1)} GB)
+                          </button>
+                          <button
+                            onClick={() => setVoxcpmConfirm(false)}
+                            className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-white/5 transition"
+                          >
+                            Cancel
+                          </button>
+                        </>
+                      )}
+                      {voxcpmModel.installed && (
+                        <button
+                          onClick={() => void runModelAction('del-voxcpm2', () => deleteVoxcpm())}
+                          disabled={modelBusy !== null}
+                          className="shrink-0 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/20 transition disabled:opacity-40"
+                        >
+                          Delete
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  {voxcpmModel.status === 'downloading' && (
+                    <div className="mt-3">
+                      <div className="h-2 overflow-hidden rounded-full bg-slate-800">
+                        <div className="h-full rounded-full bg-gradient-to-r from-sky-500 to-violet-500" style={{ width: `${voxcpmModel.progress}%` }} />
+                      </div>
+                      <p className="mt-1 text-[10px] text-slate-500">{voxcpmModel.downloaded_mb.toFixed(0)} MB / ~{voxcpmModel.total_mb} MB</p>
+                    </div>
+                  )}
+                  {voxcpmModel.status === 'error' && voxcpmModel.error && (
+                    <p className="mt-3 rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[10px] text-rose-200">{voxcpmModel.error}</p>
                   )}
                 </div>
               )}

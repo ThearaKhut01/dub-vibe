@@ -812,6 +812,12 @@ def get_provider_status() -> list[dict]:
         mms_ok = False
         mms_base_ok = False
     try:
+        from . import voxcpm_local
+
+        voxcpm_ok = voxcpm_local.is_installed()
+    except Exception:
+        voxcpm_ok = False
+    try:
         from . import demucs_local
 
         # Separation needs both the model and the package, so report ready only with both.
@@ -891,6 +897,14 @@ def get_provider_status() -> list[dict]:
             'connected': edge_ok,
             'primary': True,
             'fallback': False,
+        },
+        {
+            'id': 'voxcpm2',
+            'name': 'VoxCPM2 (offline, English, Apache-2.0)',
+            'mode': 'LOCAL AI',
+            'connected': voxcpm_ok,
+            'primary': False,
+            'fallback': voxcpm_ok,
         },
         {
             'id': 'mms_khm',

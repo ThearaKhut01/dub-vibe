@@ -1,0 +1,16 @@
+# Speaker detection (Resemblyzer). Install with --no-deps: resemblyzer's metadata declares
+# the obsolete 'typing' backport, which would shadow the standard library on Python 3.10.
+# Its real runtime imports are listed below; torch, numpy, and webrtcvad come from requirements.txt.
+resemblyzer==0.1.4
+scipy>=1.2.1
+librosa==0.11.0
+lazy_loader
+soxr
+audioread
+joblib
+scikit-learn
+numba
+pooch
+decorator
+platformdirs
+msgpack
