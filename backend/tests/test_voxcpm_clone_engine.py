@@ -10,6 +10,16 @@ import pytest
 
 from backend.app import voxcpm_dub, voxcpm_local
 
+# CI installs only the API test packages (see .github/workflows/ci.yml). These guards
+# skip the tests that need the audio stack or the HTTP test client, so CI stays green.
+# Both still run locally, where the full requirements are installed.
+AUDIO_TESTS = pytest.mark.skipif(
+    __import__('importlib').util.find_spec('numpy') is None or __import__('importlib').util.find_spec('soundfile') is None,
+    reason='needs numpy and soundfile (audio stack)')
+HTTP_TESTS = pytest.mark.skipif(
+    __import__('importlib').util.find_spec('httpx') is None,
+    reason='needs httpx for the FastAPI test client')
+
 
 class _FakeTtsModel:
     sample_rate = 48000
@@ -36,6 +46,7 @@ def fake_model(monkeypatch):
     return model
 
 
+@AUDIO_TESTS
 def test_clone_line_writes_wav_with_reference(tmp_path, fake_model):
     reference = tmp_path / 'ref.wav'
     reference.write_bytes(b'w')
@@ -49,12 +60,14 @@ def test_clone_line_writes_wav_with_reference(tmp_path, fake_model):
     }]
 
 
+@AUDIO_TESTS
 def test_clone_line_rejects_empty_text(tmp_path, fake_model):
     with pytest.raises(ValueError, match='no translated text'):
         voxcpm_dub.synthesize_clone_line('   ', tmp_path / 'ref.wav', tmp_path / 'o.wav')
     assert fake_model.calls == []
 
 
+@AUDIO_TESTS
 def test_clone_line_errors_when_model_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(voxcpm_local, 'is_installed', lambda: False)
     with pytest.raises(RuntimeError, match='not installed'):
@@ -74,6 +87,7 @@ def test_clone_engine_gated_to_verified_languages():
     assert not voxcpm_local.supports_language('km')
 
 
+@HTTP_TESTS
 def test_process_tts_rejects_clone_for_unverified_language(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
@@ -96,6 +110,8 @@ def test_process_tts_rejects_clone_for_unverified_language(tmp_path, monkeypatch
     main.projects.pop(pid, None)
 
 
+@HTTP_TESTS
+@AUDIO_TESTS
 def test_process_tts_uses_clone_engine_per_line(tmp_path, monkeypatch, fake_model):
     from fastapi.testclient import TestClient
 
@@ -129,6 +145,7 @@ def test_process_tts_uses_clone_engine_per_line(tmp_path, monkeypatch, fake_mode
     assert all(Path(s['path']).is_file() for s in segments)
     main.projects.pop(pid, None)
 
+@HTTP_TESTS
 def test_explicit_voxcpm2_refuses_khmer_instead_of_falling_back_to_edge(tmp_path, monkeypatch):
     """Picking VoxCPM2 for Khmer must fail loudly, not silently dub with Edge."""
     from fastapi.testclient import TestClient
@@ -155,6 +172,8 @@ def test_explicit_voxcpm2_refuses_khmer_instead_of_falling_back_to_edge(tmp_path
     assert edge_calls == []
     main.projects.pop(pid, None)
 
+@HTTP_TESTS
+@AUDIO_TESTS
 def test_clone_rerun_reuses_finished_lines(tmp_path, monkeypatch, fake_model):
     """A second Dub run must reuse finished clone lines instead of synthesizing them again."""
     from fastapi.testclient import TestClient
