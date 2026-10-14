@@ -587,107 +587,6 @@ async def delete_voxcpm_model() -> dict[str, str]:
     return {'status': 'ok', 'deleted': 'voxcpm2'}
 
 
-# --- VoxCPM Mode: standalone voice generation (no video needed) ---------------
-
-@app.get('/api/voxcpm/hardware')
-async def voxcpm_hardware() -> dict[str, Any]:
-    from . import voxcpm_local
-
-    return await run_in_threadpool(voxcpm_local.hardware_report)
-
-
-@app.post('/api/voxcpm/references')
-async def upload_voxcpm_reference(file: UploadFile = File(...)) -> dict[str, Any]:
-    from . import voxcpm_workspace
-
-    data = await file.read(voxcpm_workspace.MAX_REFERENCE_BYTES + 1)
-    try:
-        reference_id = voxcpm_workspace.save_reference(data, file.filename or '')
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    return {'status': 'ok', 'reference_id': reference_id, 'name': file.filename}
-
-
-@app.post('/api/voxcpm/jobs')
-async def start_voxcpm_job(payload: dict[str, Any]) -> dict[str, Any]:
-    from . import voxcpm_workspace
-
-    if not payload.get('mode'):
-        raise HTTPException(status_code=422, detail='Choose a generation mode.')
-    try:
-        job = voxcpm_workspace.start_job(payload)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    return {'status': 'ok', 'job': job}
-
-
-@app.get('/api/voxcpm/jobs/{job_id}')
-async def get_voxcpm_job(job_id: str) -> dict[str, Any]:
-    from . import voxcpm_workspace
-
-    try:
-        return {'status': 'ok', 'job': voxcpm_workspace.public_job(job_id)}
-    except KeyError as error:
-        raise HTTPException(status_code=404, detail='Job not found') from error
-
-
-@app.post('/api/voxcpm/jobs/{job_id}/cancel')
-async def cancel_voxcpm_job(job_id: str) -> dict[str, Any]:
-    from . import voxcpm_workspace
-
-    try:
-        return {'status': 'ok', 'job': voxcpm_workspace.cancel_job(job_id)}
-    except KeyError as error:
-        raise HTTPException(status_code=404, detail='Job not found') from error
-
-
-@app.get('/api/voxcpm/jobs/{job_id}/audio')
-async def voxcpm_job_audio(job_id: str):
-    from . import voxcpm_workspace
-
-    try:
-        job = voxcpm_workspace.public_job(job_id)
-    except KeyError as error:
-        raise HTTPException(status_code=404, detail='Job not found') from error
-    output = job.get('output')
-    if job.get('status') != 'done' or not output or not Path(output).is_file():
-        raise HTTPException(status_code=409, detail='This job has no finished audio yet.')
-    return FileResponse(output, media_type='audio/wav', filename=f'voxcpm-{job_id}.wav')
-
-
-@app.post('/api/voxcpm/jobs/{job_id}/send-to-project/{project_id}')
-async def send_voxcpm_clip_to_project(job_id: str, project_id: str) -> dict[str, Any]:
-    """Copy a finished VoxCPM clip into a Dubbing project as a standalone audio file.
-
-    The clip goes to its own folder with a non-numeric name, so it never collides with
-    the numbered dub segments and does not change the dub timeline or the export.
-    """
-    from . import voxcpm_workspace
-
-    if project_id not in projects:
-        raise HTTPException(status_code=404, detail='Project not found')
-    try:
-        job = voxcpm_workspace.public_job(job_id)
-    except KeyError as error:
-        raise HTTPException(status_code=404, detail='Job not found') from error
-    output = job.get('output')
-    if job.get('status') != 'done' or not output or not Path(output).is_file():
-        raise HTTPException(status_code=409, detail='This job has no finished audio to send.')
-    clip_dir = DATA_ROOT / project_id / 'voxcpm-clips'
-    clip_dir.mkdir(parents=True, exist_ok=True)
-    target = clip_dir / f'voxcpm-{job_id}.wav'
-    await run_in_threadpool(shutil.copyfile, output, target)
-    return {'status': 'ok', 'project_id': project_id, 'file': target.name, 'duration': job.get('duration')}
-
-
-@app.post('/api/voxcpm/unload')
-async def unload_voxcpm() -> dict[str, str]:
-    from . import voxcpm_workspace
-
-    await run_in_threadpool(voxcpm_workspace.unload_model)
-    return {'status': 'ok', 'loaded': 'false'}
-
-
 @app.get('/api/models/mms-khm')
 async def mms_models_list() -> dict[str, Any]:
     return {'engine': 'mms-khm', 'models': model_manager.mms_statuses()}
@@ -811,6 +710,16 @@ async def tts_capabilities(model: str | None = None) -> dict[str, Any]:
             'key_configured': True,
             'installed': model_manager.voxcpm_status()['installed'],
             'label': voxcpm_local.NAME,
+        },
+        'voxcpm_clone': {
+            'voices': [],
+            'emotions': [],
+            'style_control': False,
+            'languages': sorted(voxcpm_local.VERIFIED_LANGUAGE_CODES),
+            'khmer_supported': False,
+            'key_configured': True,
+            'installed': model_manager.voxcpm_status()['installed'],
+            'label': 'VoxCPM2 Voice Clone (English, own voice)',
         },
         **{
             engine_id: {
@@ -1865,6 +1774,11 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail='Transcribe and translate the video before generating voice')
     if any(not segment.get('translation') for segment in segments):
         raise HTTPException(status_code=409, detail='Translate the transcript before generating voice')
+    # An explicit VoxCPM engine must not silently fall back to Edge for a language it can't speak.
+    if payload.tts_provider == 'voxcpm2':
+        from . import voxcpm_local
+        if not voxcpm_local.supports_language(_resolve_lang_code(payload.target_language)):
+            raise HTTPException(status_code=409, detail=f'VoxCPM2 only speaks English here, so it cannot dub {payload.target_language}. Choose another voice engine or an English target.')
 
     await emit_progress(payload.project_id, 'Generating Voice', 70, 'Assigning voices and synthesizing dubbed audio...')
     update_project(payload.project_id, status='Processing', progress=70)
@@ -1907,6 +1821,23 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
         return labels
 
     mixed_labels = mixed_voice_labels(segments) if payload.voice == 'mixed' else None
+    clone_references: dict[str, Path] | None = None
+    if payload.tts_provider == 'voxcpm_clone':
+        from . import voxcpm_dub
+
+        try:
+            voxcpm_dub.check_project({**project, 'id': payload.project_id}, payload.target_language)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        ffmpeg = find_media_tool('ffmpeg')
+        if not ffmpeg:
+            raise HTTPException(status_code=409, detail='FFmpeg was not found. Install FFmpeg to build voice references.')
+        clone_references = await run_in_threadpool(
+            voxcpm_dub.build_references, ffmpeg, {**project, 'id': payload.project_id},
+            voxcpm_dub.dub_dir(payload.project_id),
+        )
+        if not clone_references:
+            raise HTTPException(status_code=409, detail='Could not cut a voice reference from the source audio.')
     # Resume support: audio files generated by an earlier (failed or partial)
     # run are reused, so re-running Dub continues instead of starting over.
     previous_by_id = {str(item.get('id')): item for item in project.get('audio_segments', [])}
@@ -1924,8 +1855,11 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
             profile = characters.get(char_name) or {}
             expected_voice = profile.get('voice') or (mixed_labels[index] if mixed_labels is not None else payload.voice)
             stored_voice = str(previous.get('voice') or '') if previous else ''
-            if previous and Path(str(previous.get('path') or '')).is_file() and \
-                    (stored_voice == expected_voice or stored_voice.endswith(f":{expected_voice}")):
+            # Clone lines are stored as 'voxcpm_clone:<speaker>', so they match only the same speaker.
+            clone_voice = f"{voxcpm_dub.CLONE_ENGINE}:{char_name}" if clone_references is not None else None
+            voice_matches = (stored_voice == clone_voice) if clone_references is not None else (
+                stored_voice == expected_voice or stored_voice.endswith(f":{expected_voice}"))
+            if previous and Path(str(previous.get('path') or '')).is_file() and voice_matches:
                 audio_segments.append({
                     'id': segment['id'],
                     'start': segment['start'],
@@ -1936,6 +1870,26 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
                     'path': previous['path'],
                 })
                 reused += 1
+            elif clone_references is not None:
+                # VoxCPM clone engine: speak the line in the speaker's own voice. Never
+                # falls back to another engine, so the cloned voice can't silently change.
+                from . import voxcpm_dub
+
+                reference = clone_references.get(char_name) or next(iter(clone_references.values()))
+                clone_out = audio_dir / f'{index + 1:04d}.wav'
+                await run_in_threadpool(
+                    voxcpm_dub.synthesize_clone_line, segment['translation'], reference, clone_out,
+                )
+                audio_segments.append({
+                    'id': segment['id'],
+                    'start': segment['start'],
+                    'end': segment['end'],
+                    'source_start': float(segment['start']),
+                    'text': segment['translation'],
+                    'character': char_name,
+                    'voice': f"{voxcpm_dub.CLONE_ENGINE}:{char_name}",
+                    'path': str(clone_out),
+                })
             else:
                 previous_text = str(segments[index - 1].get('translation') or '') if index > 0 else None
                 following_text = str(segments[index + 1].get('translation') or '') if index + 1 < total_segments else None

@@ -50,8 +50,8 @@ interface StudioState {
   workflowSteps: WorkflowStep[];
   mediaLibrary: MediaAsset[];
   activeTool: string;
-  mode: 'EDIT' | 'DUB' | 'VOXCPM';
-  setMode: (mode: 'EDIT' | 'DUB' | 'VOXCPM') => void;
+  mode: 'EDIT' | 'DUB';
+  setMode: (mode: 'EDIT' | 'DUB') => void;
   setActiveTool: (tool: string) => void;
   setProjectName: (name: string) => void;
   appendLog: (message: string, level?: LogEntry['level']) => void;
@@ -358,13 +358,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   mediaLibrary: initialMedia,
   activeTool: 'Auto Dubbing',
   mode: 'DUB',
-  // VoxCPM Mode is a standalone workspace, not a video project mode, so the
-  // project record keeps its last EDIT/DUB value.
-  setMode: (mode) => set((state) => (
-    mode === 'VOXCPM'
-      ? { ...state, mode }
-      : { ...state, mode, project: { ...state.project, mode } }
-  )),
+  setMode: (mode) => set((state) => ({ ...state, mode, project: { ...state.project, mode } })),
   setActiveTool: (tool) => set({ activeTool: tool }),
   setProjectName: (name) => set((state) => ({ project: { ...state.project, name } })),
   appendLog: (message, level = 'info') =>

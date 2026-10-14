@@ -38,7 +38,6 @@ import {
   Wand2,
 } from 'lucide-react';
 import { useStudioStore } from './store/useStudioStore';
-import { VoxcpmWorkspace } from './components/VoxcpmWorkspace';
 import type { ProjectSummary, OverlapProposal, FixOverlapsResponse } from './types';
 
 const toolActions = [
@@ -796,7 +795,7 @@ function App() {
     setProjectName(file.name.replace(/\.[^.]+$/, ''));
     setNotice(`Uploading ${file.name} to the local processing service...`);
     try {
-      // Video import only exists in EDIT and DUB; VoxCPM Mode never creates a video project.
+      // Video import only exists in EDIT and DUB.
       const projectMode = mode === 'EDIT' ? 'EDIT' : 'DUB';
       const created = await createProject(file.name.replace(/\.[^.]+$/, ''), projectMode, targetLanguage);
       await uploadMedia(created.id, file);
@@ -1129,6 +1128,8 @@ function App() {
   };
 
   const providerCaps = ttsProvider && ttsProvider !== 'auto' ? voiceCapabilities[ttsProvider] : null;
+  // VoxCPM2 is verified for English only; picking it for another target would silently use Edge.
+  const voxcpmUnavailable = voiceCapabilities['voxcpm2']?.installed === false || targetLanguage !== 'English';
 
   const handleStartDub = async () => {
     if (!hasMedia) {
@@ -1281,28 +1282,14 @@ function App() {
         >
           DUB MODE
         </button>
-        <button
-          role="tab"
-          aria-selected={mode === 'VOXCPM'}
-          onClick={() => setMode('VOXCPM')}
-          className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'VOXCPM' ? 'bg-violet-500 text-slate-950' : 'bg-slate-900 text-slate-400 hover:text-slate-200'}`}
-        >
-          VOXCPM MODE
-        </button>
       </div>
       <div className="flex items-center justify-end gap-3">
-        <div className="flex items-center justify-end gap-3">
-          {mode !== 'VOXCPM' && (
-            <>
-              <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-900 px-3 py-1.5 text-sm text-slate-300">
-                <Clock3 size={14} /> {project.duration}
-              </span>
-              <span className={`inline-flex items-center rounded-full px-3 py-1.5 text-xs font-semibold ${statusBadge}`}>
-                {project.status}
-              </span>
-            </>
-          )}
-        </div>
+        <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-900 px-3 py-1.5 text-sm text-slate-300">
+          <Clock3 size={14} /> {project.duration}
+        </span>
+        <span className={`inline-flex items-center rounded-full px-3 py-1.5 text-xs font-semibold ${statusBadge}`}>
+          {project.status}
+        </span>
       </div>
     </div>
   );
@@ -1344,12 +1331,6 @@ function App() {
         <input ref={fileInputRef} className="hidden" type="file" accept="video/*" onChange={(event) => { void handleImport(event.target.files?.[0]); event.currentTarget.value = ''; }} />
       </header>
 
-      {mode === 'VOXCPM' ? (
-        <>
-          <div className="border-b border-white/10 bg-slate-950/60 px-5 py-3">{modeSwitcher}</div>
-          <VoxcpmWorkspace />
-        </>
-      ) : (
       <main className="grid h-[calc(100vh-64px)] grid-cols-[220px_minmax(0,1fr)_340px]">
         <aside className="border-r border-white/10 bg-slate-950/80 p-4">
           <div className="mb-4">
@@ -2507,12 +2488,17 @@ function App() {
                   <option value="gemini">Google Gemini TTS (premium)</option>
                   <option value="openai">OpenAI TTS</option>
                   <option value="edge">Edge TTS (free)</option>
-                  <option value="voxcpm2" disabled={voiceCapabilities['voxcpm2']?.installed === false}>
+                  <option value="voxcpm2" disabled={voxcpmUnavailable}>
                     {voiceCapabilities['voxcpm2']?.installed === false
                       ? 'VoxCPM2 (offline, English) — download in AI Models'
-                      : 'VoxCPM2 (offline, English)'}
+                      : targetLanguage !== 'English' ? 'VoxCPM2 (offline, English) — target must be English' : 'VoxCPM2 (offline, English)'}
                   </option>
-                  {KHMER_MMS_ENGINES.map((engineId) => (
+                  <option value="voxcpm_clone" disabled={voxcpmUnavailable}>
+                    {voiceCapabilities['voxcpm2']?.installed === false
+                      ? 'VoxCPM2 Voice Clone (English) — download in AI Models'
+                      : targetLanguage !== 'English' ? 'VoxCPM2 Voice Clone (English) — target must be English' : 'VoxCPM2 Voice Clone (English, own voice)'}
+                  </option>
+                                    {KHMER_MMS_ENGINES.map((engineId) => (
                     <option key={engineId} value={engineId} disabled={voiceCapabilities[engineId]?.installed === false}>
                       {voiceCapabilities[engineId]?.installed === false
                         ? `${engineLabel(engineId)} — download in AI Models`
@@ -2944,7 +2930,6 @@ function App() {
 
         </aside>
       </main>
-      )}
 
       {editingSegment && editDraft && (
         <div className="fixed bottom-6 right-6 z-40 w-96 rounded-2xl border border-indigo-500/30 bg-slate-950 p-4 shadow-2xl">

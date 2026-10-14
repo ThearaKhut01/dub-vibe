@@ -54,18 +54,14 @@ While a workflow runs, progress streams live over WebSocket into the workflow pa
 
 Projects (media, transcripts, translations, dub audio, chunk and export state) persist in a local SQLite database and restore when the app reopens. The sidebar lists every project — click to switch, trash to delete (media and exports included). Each export's destination folder is remembered.
 
-## VoxCPM Mode
+## VoxCPM Voice Clone (DUB mode)
 
-The third header tab, **VOXCPM MODE**, is a standalone voice workspace for VoxCPM2. It needs no video and never changes a Dubbing project's timeline. It offers four generation modes:
+Choose **VoxCPM2 Voice Clone (English, own voice)** in the DUB mode voice engine list to dub a project in each speaker's own voice. For each speaker, the app cuts a short reference clip from that speaker's longest clean line in the source video, then speaks every translated line with VoxCPM2 in clone mode. The output uses the normal dub timeline, so overlap fitting and export work as they do for other engines.
 
-- **Text to Speech:** speaks the text in the default VoxCPM2 voice.
-- **Voice Design:** creates a voice from a plain-English description (the app adds the `(description)text` form the model expects).
-- **Voice Cloning:** speaks the text in the voice of one reference recording. Use only a voice you are authorized to use.
-- **Ultimate Cloning:** continues from a reference recording and requires its exact transcript.
-
-Each job reports progress and can be cancelled. Finished audio plays in the workspace, exports as a 16-bit WAV at 48 kHz, or can be sent to a Dubbing project as a standalone clip in its `voxcpm-clips` folder. Each generation runs in its own process, so the model's memory returns to the OS when the job ends. Generation is refused with a clear message when the machine lacks the free memory it needs (about 7 GB of RAM on CPU, or about 6 GB of VRAM on CUDA).
-
-Generation is verified for English. Speed on CPU is roughly 40–80 seconds per short line; an NVIDIA GPU with a CUDA build of torch is much faster.
+- Works only for English targets. Other languages are refused with a clear message instead of producing garbled audio.
+- A line that fails stops the run rather than falling back to another voice, so the cloned voice never silently changes. Re-running resumes from the finished lines.
+- Requires the VoxCPM2 model (download it in AI Models) and FFmpeg.
+- Generation is verified for English. Speed on CPU is roughly 40–80 seconds per short line; an NVIDIA GPU with a CUDA build of torch is much faster.
 
 **GPU Acceleration Pack (NVIDIA CUDA 12):** the pack speeds up Faster-Whisper transcription only. VoxCPM uses the GPU when a CUDA build of torch is installed. MMS, NLLB, and Demucs run on CPU.
 
