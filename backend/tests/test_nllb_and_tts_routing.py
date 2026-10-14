@@ -44,3 +44,49 @@ def test_english_never_routes_to_a_khmer_only_model():
 
 def test_explicit_khmer_model_routes_to_itself_first():
     assert tts_service.candidate_providers('mms_khm_base', 'km', None)[0] == 'mms_khm_base'
+
+
+def test_edge_never_receives_a_gemini_model():
+    # A model picked for Gemini must not be sent to Edge (it ignores models).
+    assert tts_service._model_for('edge', 'gemini-2.5-flash-preview-tts') is None
+
+
+def test_gemini_and_openai_keep_their_chosen_model():
+    assert tts_service._model_for('gemini', 'gemini-2.5-flash-preview-tts') == 'gemini-2.5-flash-preview-tts'
+    assert tts_service._model_for('openai', 'tts-1-hd') == 'tts-1-hd'
+
+
+def test_gemini_and_openai_fall_back_to_defaults_without_a_choice():
+    assert tts_service._model_for('gemini', None) == tts_service.GEMINI_DEFAULT_MODEL
+    assert tts_service._model_for('openai', None) == tts_service.OPENAI_DEFAULT_MODEL
+
+
+def test_cache_key_is_stable_for_engines_without_a_model():
+    assert tts_service.cache_key('edge', None, 'auto', 'hi', None, 1.0) == \
+        tts_service.cache_key('edge', '', 'auto', 'hi', None, 1.0)
+def test_stale_gemini_model_is_not_sent_to_edge(monkeypatch):
+    """Through the real synthesize_line path: a Gemini model chosen earlier must not reach Edge."""
+    seen: dict[str, object] = {}
+
+    def record_key(provider, model, voice, text, style, speed):
+        seen.setdefault(provider, model)
+        return 'k'
+
+    import backend.app.providers as providers
+
+    def stop_edge(self, *args, **kwargs):
+        raise RuntimeError('stop after cache key')
+
+    monkeypatch.setattr(tts_service, 'cache_key', record_key)
+    monkeypatch.setattr(tts_service, '_find_cached', lambda provider, key: None)
+    monkeypatch.setattr(tts_service.acting, 'style_instruction', lambda provider, analysis: None)
+    monkeypatch.setattr(providers.EdgeTTSProvider, 'synthesize', stop_edge)
+    try:
+        tts_service.synthesize_line(
+            'hi', 'out.mp3', provider_pref='edge', language_name='English', lang_code='en',
+            voice_pref=None, model_pref='gemini-2.5-flash-preview-tts', speed=1.0,
+            emotion='Neutral', intensity=70, character_profile=None, analysis={},
+        )
+    except RuntimeError:
+        pass
+    assert seen.get('edge') is None

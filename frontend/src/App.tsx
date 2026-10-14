@@ -2481,7 +2481,7 @@ function App() {
                 <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Voice engine &amp; acting</label>
                 <select
                   value={ttsProvider}
-                  onChange={(event) => { setTtsProvider(event.target.value); localStorage.setItem('dubvibe-tts-provider', event.target.value); }}
+                  onChange={(event) => { const next = event.target.value; setTtsProvider(next); localStorage.setItem('dubvibe-tts-provider', next); if (next !== 'gemini' && next !== 'openai') { setTtsModel(''); localStorage.removeItem('dubvibe-tts-model'); } }}
                   className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200"
                 >
                   <option value="auto">Auto — best available</option>

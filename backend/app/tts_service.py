@@ -44,7 +44,7 @@ def tts_cache_dir(provider: str) -> Path:
 
 
 def cache_key(provider: str, model: str, voice: str, text: str, style: str | None, speed: float) -> str:
-    material = '|'.join((provider, model, voice, text, style or '', f'{speed:.2f}'))
+    material = '|'.join((provider, model or '', voice, text, style or '', f'{speed:.2f}'))
     return hashlib.sha256(material.encode('utf-8')).hexdigest()
 
 
@@ -97,6 +97,15 @@ def candidate_providers(pref: str, lang_code: str, profile: dict | None) -> list
     return [provider for provider in ordered if language_supported(provider, lang_code)] or ['edge', 'sapi5']
 
 
+def _model_for(provider: str, model_pref: str | None) -> str | None:
+    """The model a provider should use. Only Gemini and OpenAI take a model name, so a model
+    chosen for one engine is never sent to another (for example a Gemini model to Edge)."""
+    if provider == 'gemini':
+        return model_pref or GEMINI_DEFAULT_MODEL
+    if provider == 'openai':
+        return model_pref or OPENAI_DEFAULT_MODEL
+    return None
+
 def synthesize_line(text: str, out_path: str, *, provider_pref: str, language_name: str,
                     lang_code: str, voice_pref: str | None, model_pref: str | None,
                     speed: float, emotion: str, intensity: int, character_profile: dict | None,
@@ -110,7 +119,7 @@ def synthesize_line(text: str, out_path: str, *, provider_pref: str, language_na
     attempts: list[str] = []
 
     for provider in candidates:
-        model = model_pref or (GEMINI_DEFAULT_MODEL if provider == 'gemini' else OPENAI_DEFAULT_MODEL) or model_pref
+        model = _model_for(provider, model_pref)
         voice = _default_voice(provider, profile.get('voice') or voice_pref)
         style = acting.style_instruction(provider, analysis)
         key = cache_key(provider, model, voice, text, style, speed)
