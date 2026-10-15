@@ -38,6 +38,7 @@ import {
   Wand2,
 } from 'lucide-react';
 import { useStudioStore } from './store/useStudioStore';
+import { DubbingTrackEditor } from './components/DubbingTrackEditor';
 import type { ProjectSummary, OverlapProposal, FixOverlapsResponse } from './types';
 
 const toolActions = [
@@ -65,13 +66,6 @@ const actionButtons = [
 
 const trackLabels = ['Video', 'Original Speech', 'Translation', 'Dubbed Voice', 'Subtitle'];
 
-const KHMER_MMS_ENGINES = ['mms_khm', 'mms_khm_base'];
-const isKhmerEngine = (provider: string) => KHMER_MMS_ENGINES.includes(provider);
-const KHMER_ENGINE_SHORT_LABELS: Record<string, string> = {
-  mms_khm: 'Khmer MMS-VITS (fine-tuned)',
-  mms_khm_base: 'Khmer MMS-VITS (base)',
-};
-const engineLabel = (engineId: string) => KHMER_ENGINE_SHORT_LABELS[engineId] ?? engineId;
 const apiBaseUrl = import.meta.env.DEV ? '' : 'http://127.0.0.1:8001';
 
 function App() {
@@ -131,9 +125,6 @@ function App() {
     demucsModel,
     downloadDemucs,
     deleteDemucs,
-    mmsKhmModels,
-    downloadMmsKhm,
-    deleteMmsKhm,
     voxcpmModel,
     downloadVoxcpm,
     deleteVoxcpm,
@@ -185,7 +176,6 @@ function App() {
   const [platformFit, setPlatformFit] = useState(() => localStorage.getItem('dubvibe-platform-fit') ?? 'blur');
   const [showModels, setShowModels] = useState(false);
   const [modelBusy, setModelBusy] = useState<string | null>(null);
-  const [mmsKhmConfirm, setMmsKhmConfirm] = useState<string | null>(null);
   const [nllbConfirm, setNllbConfirm] = useState(false);
   const [voxcpmConfirm, setVoxcpmConfirm] = useState(false);
   const [transcribeLanguage, setTranscribeLanguage] = useState(() => localStorage.getItem('dubvibe-transcribe-language') ?? '');
@@ -198,12 +188,6 @@ function App() {
   const [keyTestMessage, setKeyTestMessage] = useState('');
   const [keyBusy, setKeyBusy] = useState<string | null>(null);
   const [ttsProvider, setTtsProvider] = useState(() => localStorage.getItem('dubvibe-tts-provider') ?? 'auto');
-  useEffect(() => {
-    if (isKhmerEngine(ttsProvider) && voiceCapabilities[ttsProvider]?.installed === false) {
-      setTtsProvider('auto');
-      localStorage.setItem('dubvibe-tts-provider', 'auto');
-    }
-  }, [ttsProvider, voiceCapabilities]);
   const [translationProvider, setTranslationProvider] = useState(() => localStorage.getItem('dubvibe-translation-provider') ?? 'auto');
   const [ttsModel, setTtsModel] = useState(() => localStorage.getItem('dubvibe-tts-model') ?? '');
   const [geminiModels, setGeminiModels] = useState<string[]>(() => {
@@ -744,6 +728,7 @@ function App() {
   const previewUrl = videoUrl || (project.hasMedia && project.id
     ? `${apiBaseUrl}/api/projects/${project.id}/media?v=${mediaVersion}`
     : '');
+
   const dubbedPreviewUrl = exportFiles?.videoUrl ?? (dubbedVideoReady && project.id
     ? `${apiBaseUrl}/api/projects/${project.id}/export/video`
     : '');
@@ -973,7 +958,6 @@ function App() {
     }
     if (activeStep.id === 'voice') {
       if (ttsProvider === 'edge') return new Set(['edge_tts']);
-      if (ttsProvider === 'mms_khm' || ttsProvider === 'mms_khm_base') return new Set([ttsProvider]);
       if (ttsProvider === 'voxcpm2') return new Set(['voxcpm2']);
       if (ttsProvider === 'sapi5') return new Set(['pyttsx3']);
       if (ttsProvider === 'gemini' || ttsProvider === 'openai') return new Set<string>();
@@ -1476,7 +1460,7 @@ function App() {
                 )}
                 <button
                   onClick={() => void handleStartDub()}
-                  disabled={busy || apiAvailable === false || !hasMedia || (isKhmerEngine(ttsProvider) && (voiceCapabilities[ttsProvider]?.installed === false || targetLanguage !== 'Khmer'))}
+                  disabled={busy || apiAvailable === false || !hasMedia}
                   className="rounded-lg bg-gradient-to-r from-sky-500 to-violet-500 px-4 py-2 text-sm font-semibold text-white shadow-glow disabled:opacity-50"
                 >
                   {busy ? 'PROCESSING...' : 'START DUBBING'}
@@ -1825,6 +1809,21 @@ function App() {
               </div>
             )}
 
+            {transcript.length > 0 && project.id && (
+              <DubbingTrackEditor
+                projectId={project.id}
+                segments={transcript}
+                audio={dubAudioSegments}
+                targetLanguage={targetLanguage}
+                provider={ttsProvider === 'auto' ? 'edge' : ttsProvider}
+                currentTime={currentTime}
+                videoDuration={projectDurationSeconds}
+                onSeek={seekTo}
+                onNotice={setNotice}
+              />
+            )}
+
+            {/* Dubbing track editor sits above the timeline */}
             {/* CapCut Pro Timeline */}
             <div className="timeline-container rounded-2xl border border-white/[0.08] bg-[#0c1220] p-0 shadow-2xl overflow-hidden">
               {/* Timeline Header Controls */}
@@ -2498,13 +2497,6 @@ function App() {
                       ? 'VoxCPM2 Voice Clone (English) — download in AI Models'
                       : targetLanguage !== 'English' ? 'VoxCPM2 Voice Clone (English) — target must be English' : 'VoxCPM2 Voice Clone (English, own voice)'}
                   </option>
-                                    {KHMER_MMS_ENGINES.map((engineId) => (
-                    <option key={engineId} value={engineId} disabled={voiceCapabilities[engineId]?.installed === false}>
-                      {voiceCapabilities[engineId]?.installed === false
-                        ? `${engineLabel(engineId)} — download in AI Models`
-                        : `${engineLabel(engineId)} (Khmer only)`}
-                    </option>
-                  ))}
                   <option value="sapi5">System TTS (offline)</option>
                 </select>
                 {ttsProvider === 'gemini' && (
@@ -2568,7 +2560,7 @@ function App() {
                     step={0.05}
                     value={voiceSpeed}
                     onChange={(event) => { setVoiceSpeed(Number(event.target.value)); localStorage.setItem('dubvibe-voice-speed', String(event.target.value)); }}
-                    title="Slows the generated voice. Only applies to Khmer MMS-VITS for now."
+                    title="Slows the generated voice."
                     className="mt-1 block w-full accent-sky-500"
                   />
                 </label>
@@ -3625,79 +3617,6 @@ function App() {
                 </div>
               )}
 
-              {mmsKhmModels.map((model) => (
-                <div key={model.id} className={`mt-3 rounded-xl border p-4 ${model.installed ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-white/10 bg-slate-900/80'}`}>
-                  <div className="flex items-start gap-3">
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
-                        <p className="text-sm font-medium text-slate-200">{model.name}</p>
-                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${model.status === 'downloading' ? 'bg-amber-500/20 text-amber-200'
-                            : model.status === 'error' ? 'bg-rose-500/20 text-rose-200'
-                              : model.installed ? 'bg-emerald-500/20 text-emerald-200'
-                                : 'bg-slate-700/60 text-slate-300'
-                          }`}>
-                          {model.status === 'downloading' ? `Downloading ${model.progress}%`
-                            : model.status === 'error' ? 'Error'
-                              : model.installed ? '✓ Installed' : 'Not installed'}
-                        </span>
-                      </div>
-                      <p className="mt-1 text-xs leading-relaxed text-slate-500">
-                        {model.installed
-                          ? `${model.size_mb?.toFixed(0)} MB · Khmer voice, offline. Used only when Edge TTS is unavailable.`
-                          : `~${model.total_mb} MB download · optional Khmer voice, works offline after install. Non-commercial license (cc-by-nc-4.0).`}
-                      </p>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {model.status === 'not_installed' && mmsKhmConfirm !== model.id && (
-                        <button
-                          onClick={() => setMmsKhmConfirm(model.id)}
-                          disabled={modelBusy !== null}
-                          className="shrink-0 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-200 hover:bg-sky-500/20 transition disabled:opacity-40"
-                        >
-                          Download
-                        </button>
-                      )}
-                      {model.status === 'not_installed' && mmsKhmConfirm === model.id && (
-                        <>
-                          <button
-                            onClick={() => { setMmsKhmConfirm(null); void runModelAction(`dl-${model.id}`, () => downloadMmsKhm(model.id)); }}
-                            disabled={modelBusy !== null}
-                            className="shrink-0 rounded-lg border border-sky-500/30 bg-sky-500/20 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/30 transition disabled:opacity-40"
-                          >
-                            Confirm download (~{model.total_mb} MB)
-                          </button>
-                          <button
-                            onClick={() => setMmsKhmConfirm(null)}
-                            className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-white/5 transition"
-                          >
-                            Cancel
-                          </button>
-                        </>
-                      )}
-                      {model.installed && (
-                        <button
-                          onClick={() => void runModelAction(`del-${model.id}`, () => deleteMmsKhm(model.id))}
-                          disabled={modelBusy !== null}
-                          className="shrink-0 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/20 transition disabled:opacity-40"
-                        >
-                          Delete
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                  {model.status === 'downloading' && (
-                    <div className="mt-3">
-                      <div className="h-2 overflow-hidden rounded-full bg-slate-800">
-                        <div className="h-full rounded-full bg-gradient-to-r from-sky-500 to-violet-500" style={{ width: `${model.progress}%` }} />
-                      </div>
-                      <p className="mt-1 text-[10px] text-slate-500">{model.downloaded_mb.toFixed(0)} MB / ~{model.total_mb} MB</p>
-                    </div>
-                  )}
-                  {model.status === 'error' && model.error && (
-                    <p className="mt-3 rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[10px] text-rose-200">{model.error}</p>
-                  )}
-                </div>
-              ))}
 
               <div className="mt-4 rounded-xl border border-white/10 bg-slate-900/80 p-3">
                 <p className="mb-2 text-[10px] uppercase tracking-[0.18em] text-slate-500">Transcription settings</p>

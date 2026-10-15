@@ -22,6 +22,10 @@ export interface TimelineSegment {
   color: string;
   /** Backend file path of the synthesized dub audio (dub segments only). */
   path?: string;
+  /** Speaker gender chosen for this line's voice in the Dubbing Track editor. */
+  gender?: 'Male' | 'Female';
+  /** Generated clip length compared with its time slot (set after audio generation). */
+  fit?: { clip_seconds: number | null; slot_seconds: number; overrun_seconds: number; fits: boolean };
 }
 
 export interface WorkflowStep {

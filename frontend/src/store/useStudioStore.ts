@@ -41,7 +41,6 @@ interface StudioState {
   activeTranslateEngine: string | null;
   activeSeparateEngine: string | null;
   demucsModel: WhisperModelInfo | null;
-  mmsKhmModels: WhisperModelInfo[];
   voxcpmModel: WhisperModelInfo | null;
   cudaPack: CudaPackInfo | null;
   providerKeys: { gemini: { has_key: boolean }; openai: { has_key: boolean } };
@@ -71,8 +70,6 @@ interface StudioState {
   deleteNllb: () => Promise<void>;
   downloadDemucs: () => Promise<void>;
   deleteDemucs: () => Promise<void>;
-  downloadMmsKhm: (engineId: string) => Promise<void>;
-  deleteMmsKhm: (engineId: string) => Promise<void>;
   downloadVoxcpm: () => Promise<void>;
   deleteVoxcpm: () => Promise<void>;
   downloadCudaPack: () => Promise<void>;
@@ -84,6 +81,7 @@ interface StudioState {
   splitSegment: (projectId: string, segmentId: string, at: number) => Promise<void>;
   mergeSegmentWithNext: (projectId: string, segmentId: string) => Promise<void>;
   deleteSegment: (projectId: string, segmentId: string) => Promise<void>;
+  createSegment: (projectId: string, timing: { start: number; end: number }) => Promise<void>;
   refreshVoiceConfig: () => Promise<void>;
   setProviderKey: (provider: string, key: string) => Promise<void>;
   removeProviderKey: (provider: string) => Promise<void>;
@@ -116,6 +114,7 @@ interface StudioState {
   }) => Promise<{ vtt: string | null; videoUrl: string | null; parts: Array<{ index: number; name: string }>; folder: string | null; files: string[] }>;
   clearProject: () => void;
   updateDubAudioSegments: (segments: TimelineSegment[]) => void;
+  generateSegmentAudio: (projectId: string, segmentId: string, options: { gender: 'Male' | 'Female'; provider: string; targetLanguage: string; speed?: number }) => Promise<void>;
 }
 
 interface BackendProject {
@@ -199,6 +198,8 @@ const toProjectSummary = (raw: BackendProject): ProjectSummary => ({
   mediaSize: raw.media_size ?? null,
 });
 
+const genderOf = (value: unknown): 'Male' | 'Female' => (value === 'Female' ? 'Female' : 'Male');
+
 const workspaceToPatch = (workspace: WorkspacePayload, state: StudioState) => ({
   project: toProjectSummary(workspace.project),
   transcript: workspace.segments.map((segment, index) => ({
@@ -210,6 +211,7 @@ const workspaceToPatch = (workspace: WorkspacePayload, state: StudioState) => ({
     translation: String(segment.translation ?? ''),
     voice: String(segment.voice ?? 'Male Voice A'),
     color: index % 2 === 0 ? '#38bdf8' : '#a78bfa',
+    gender: genderOf(segment.gender),
   })),
   dubAudioSegments: workspace.audio_segments.map((segment, index) => ({
     id: String(segment.id ?? `dub-${index + 1}`),
@@ -221,6 +223,7 @@ const workspaceToPatch = (workspace: WorkspacePayload, state: StudioState) => ({
     voice: String(segment.voice ?? 'Dubbed Voice'),
     color: '#34d399',
     path: String(segment.path ?? ''),
+    gender: genderOf(segment.gender),
   })),
   workflowSteps: state.workflowSteps.map((step) => {
     const completed = step.id === 'import' ? workspace.workflow.imported
@@ -348,7 +351,6 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   activeTranslateEngine: null,
   activeSeparateEngine: null,
   demucsModel: null,
-  mmsKhmModels: [],
   voxcpmModel: null,
   cudaPack: null,
   providerKeys: { gemini: { has_key: false }, openai: { has_key: false } },
@@ -395,18 +397,17 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   },
   refreshModels: async () => {
     try {
-      const [models, hardware, storage, qwen, demucs, mmsKhm, nllb, voxcpm, cudaPack] = await Promise.all([
+      const [models, hardware, storage, qwen, demucs, nllb, voxcpm, cudaPack] = await Promise.all([
         readJson<WhisperModelInfo[]>('/api/models/faster-whisper'),
         readJson<HardwareInfo>('/api/system/hardware'),
         readJson<ModelStorageInfo>('/api/models/storage').catch(() => null),
         readJson<WhisperModelInfo>('/api/models/qwen').catch(() => null),
         readJson<WhisperModelInfo>('/api/models/demucs').catch(() => null),
-        readJson<{ models: WhisperModelInfo[] }>('/api/models/mms-khm').catch(() => null),
         readJson<WhisperModelInfo>('/api/models/nllb').catch(() => null),
         readJson<WhisperModelInfo>('/api/models/voxcpm').catch(() => null),
         readJson<CudaPackInfo>('/api/models/cuda-pack').catch(() => null),
       ]);
-      set({ models, hardware, modelStorage: storage, qwenModel: qwen, demucsModel: demucs, mmsKhmModels: mmsKhm?.models ?? [], voxcpmModel: voxcpm, nllbModel: nllb, cudaPack });
+      set({ models, hardware, modelStorage: storage, qwenModel: qwen, demucsModel: demucs, voxcpmModel: voxcpm, nllbModel: nllb, cudaPack });
     } catch {
       // Backend offline; keep the last known state.
     }
@@ -527,22 +528,6 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     }
     await get().refreshModels();
   },
-  downloadMmsKhm: async (engineId) => {
-    const response = await fetch(`${apiBase}/api/models/mms/${engineId}/download`, { method: 'POST' });
-    if (!response.ok) {
-      const problem = await response.json().catch(() => ({}));
-      throw new Error(problem.detail ?? `Unable to start the Khmer model download (HTTP ${response.status})`);
-    }
-    void get().refreshModels();
-  },
-  deleteMmsKhm: async (engineId) => {
-    const response = await fetch(`${apiBase}/api/models/mms/${engineId}`, { method: 'DELETE' });
-    if (!response.ok) {
-      const problem = await response.json().catch(() => ({}));
-      throw new Error(problem.detail ?? `Unable to delete the Khmer model (HTTP ${response.status})`);
-    }
-    await get().refreshModels();
-  },
   downloadVoxcpm: async () => {
     const response = await fetch(`${apiBase}/api/models/voxcpm/download`, { method: 'POST' });
     if (!response.ok) {
@@ -639,6 +624,66 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     if (patch.text !== undefined || patch.translation !== undefined) {
       set((state) => ({ dubAudioSegments: state.dubAudioSegments.filter((audio) => audio.id !== segmentId) }));
     }
+  },
+  generateSegmentAudio: async (projectId, segmentId, options) => {
+    const response = await fetch(`${apiBase}/api/projects/${projectId}/segments/${segmentId}/tts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        gender: options.gender,
+        provider: options.provider,
+        target_language: options.targetLanguage,
+        speed: options.speed ?? 1,
+      }),
+    });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(problem.detail ?? `Unable to generate audio (HTTP ${response.status})`);
+    }
+    const { audio } = await response.json();
+    // Replace this line's audio only now that the backend has written the new clip.
+    set((state) => ({
+      dubAudioSegments: [
+        ...state.dubAudioSegments.filter((item) => item.id !== segmentId),
+        {
+          id: String(audio.id),
+          speaker: String(audio.voice ?? 'Dubbed Voice'),
+          start: Number(audio.start ?? 0),
+          end: Number(audio.end ?? 0),
+          text: String(audio.text ?? ''),
+          translation: String(audio.text ?? ''),
+          voice: String(audio.voice ?? 'Dubbed Voice'),
+          color: '#34d399',
+          path: String(audio.path ?? ''),
+          gender: genderOf(audio.gender),
+          fit: audio.fit,
+        },
+      ].sort((a, b) => a.start - b.start),
+    }));
+  },
+  createSegment: async (projectId, timing) => {
+    const response = await fetch(`${apiBase}/api/projects/${projectId}/segments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(timing),
+    });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(problem.detail ?? `Unable to add the segment (HTTP ${response.status})`);
+    }
+    const { segment } = await response.json();
+    set((state) => ({
+      transcript: [...state.transcript, {
+        id: String(segment.id),
+        speaker: String(segment.speaker ?? 'Speaker 1'),
+        start: Number(segment.start),
+        end: Number(segment.end),
+        text: '',
+        translation: '',
+        voice: 'Male Voice A',
+        color: '#38bdf8',
+      }].sort((a, b) => a.start - b.start),
+    }));
   },
   splitSegment: async (projectId, segmentId, at) => {
     const segment = get().transcript.find((item) => item.id === segmentId);
@@ -1201,7 +1246,6 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       activeTranslateEngine: null,
       activeSeparateEngine: null,
       demucsModel: null,
-      mmsKhmModels: [],
       voxcpmModel: null,
       cudaPack: null,
       providerKeys: { gemini: { has_key: false }, openai: { has_key: false } },

@@ -8,7 +8,7 @@ from backend.app import tts_service, voxcpm_local
 
 def test_voxcpm_sits_after_edge_and_before_khmer_only_models():
     order = tts_service.QUALITY_ORDER
-    assert order.index('edge') < order.index('voxcpm2') < order.index('mms_khm')
+    assert order.index('edge') < order.index('voxcpm2')
 
 
 def test_auto_routing_for_english_prefers_edge_over_voxcpm():

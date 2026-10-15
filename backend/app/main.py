@@ -56,7 +56,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from urllib.parse import quote
 
 from backend.app.chunking import SmartChunkEngine, format_timestamp, split_subtitle_cues
-from backend.app import acting, api_keys, cuda_pack, mms_tts_local, model_manager, online_providers, speaker_diarization, tts_service, voxcpm_local
+from backend.app import acting, api_keys, cuda_pack, model_manager, online_providers, speaker_diarization, tts_service, voxcpm_local
+from backend.app import segment_tts
 from backend.app.models import ProjectRequest, ProjectSummary, ProviderSettings, ProcessingRequest, SegmentSplit, SegmentUpdate, WorkflowProgress
 from backend.app.providers import (
     FasterWhisperProvider,
@@ -387,11 +388,6 @@ async def list_all_models() -> dict[str, Any]:
                 'models': [model_manager.demucs_status()],
             },
             {
-                'id': 'mms-khm',
-                'name': 'Khmer MMS-VITS (offline Khmer TTS)',
-                'models': model_manager.mms_statuses(),
-            },
-            {
                 'id': 'nllb',
                 'name': 'NLLB-200 (offline translation)',
                 'models': [model_manager.nllb_status()],
@@ -558,65 +554,6 @@ async def delete_nllb_model() -> dict[str, str]:
     return {'status': 'ok', 'deleted': model_manager.NLLB_JOB_ID}
 
 
-def _mms_engine_or_404(engine_id: str) -> str:
-    if engine_id not in mms_tts_local.MMS_MODELS:
-        raise HTTPException(status_code=404, detail=f'Unknown Khmer TTS model: {engine_id}')
-    return engine_id
-
-
-@app.get('/api/models/voxcpm')
-async def voxcpm_model_status() -> dict[str, Any]:
-    return model_manager.voxcpm_status()
-
-
-@app.post('/api/models/voxcpm/download')
-async def download_voxcpm_model() -> dict[str, Any]:
-    try:
-        job = model_manager.start_download_voxcpm()
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    return {'status': 'ok', 'model': 'voxcpm2', 'job': job}
-
-
-@app.delete('/api/models/voxcpm')
-async def delete_voxcpm_model() -> dict[str, str]:
-    try:
-        model_manager.delete_voxcpm()
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    return {'status': 'ok', 'deleted': 'voxcpm2'}
-
-
-@app.get('/api/models/mms-khm')
-async def mms_models_list() -> dict[str, Any]:
-    return {'engine': 'mms-khm', 'models': model_manager.mms_statuses()}
-
-
-@app.get('/api/models/mms/{engine_id}')
-async def mms_model_status(engine_id: str) -> dict[str, Any]:
-    return model_manager.mms_status(_mms_engine_or_404(engine_id))
-
-
-@app.post('/api/models/mms/{engine_id}/download')
-async def download_mms_model(engine_id: str) -> dict[str, Any]:
-    _mms_engine_or_404(engine_id)
-    try:
-        job = model_manager.start_download_mms(engine_id)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    return {'status': 'ok', 'model': engine_id, 'job': job}
-
-
-@app.delete('/api/models/mms/{engine_id}')
-async def delete_mms_model(engine_id: str) -> dict[str, str]:
-    _mms_engine_or_404(engine_id)
-    try:
-        model_manager.delete_mms(engine_id)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    return {'status': 'ok', 'deleted': engine_id}
-
-
 # --- Online provider keys (stored in Windows Credential Manager, never sent
 # back to the browser) --------------------------------------------------------
 
@@ -720,19 +657,6 @@ async def tts_capabilities(model: str | None = None) -> dict[str, Any]:
             'key_configured': True,
             'installed': model_manager.voxcpm_status()['installed'],
             'label': 'VoxCPM2 Voice Clone (English, own voice)',
-        },
-        **{
-            engine_id: {
-                'voices': [],
-                'emotions': [],
-                'style_control': False,
-                'languages': ['km'],
-                'khmer_supported': True,
-                'key_configured': True,
-                'installed': model_manager.mms_status(engine_id)['installed'],
-                'label': spec.name,
-            }
-            for engine_id, spec in mms_tts_local.MMS_MODELS.items()
         },
         'emotions': online_providers.EMOTIONS,
     }
@@ -902,7 +826,7 @@ async def split_segment(project_id: str, segment_id: str, payload: SegmentSplit)
     segment_b = {**segment, 'id': f'{segment_id}b', 'start': round(at, 3),
                  'text': text2, 'translation': translation2}
     project['segments'][index:index + 1] = [segment_a, segment_b]
-    _drop_stale_dub_audio(project)  # structural edit: indexes shift
+    project['audio_segments'] = segment_tts.keep_audio_by_id(project.get('audio_segments', []), project['segments'])  # structural edit: keep unchanged clips
     persist_project(project_id)
     return {'status': 'ok', 'segments': [segment_a, segment_b]}
 
@@ -928,7 +852,7 @@ async def merge_segment_next(project_id: str, segment_id: str) -> dict[str, Any]
     }
     segments[index] = merged
     del segments[index + 1]
-    _drop_stale_dub_audio(project)  # structural edit: indexes shift
+    project['audio_segments'] = segment_tts.keep_audio_by_id(project.get('audio_segments', []), project['segments'])  # structural edit: keep unchanged clips
     persist_project(project_id)
     return {'status': 'ok', 'segment': merged}
 
@@ -942,9 +866,115 @@ async def delete_segment(project_id: str, segment_id: str) -> dict[str, Any]:
     if index < 0:
         raise HTTPException(status_code=404, detail='Segment not found')
     project['segments'].pop(index)
-    _drop_stale_dub_audio(project)  # structural edit: indexes shift
+    project['audio_segments'] = segment_tts.keep_audio_by_id(project.get('audio_segments', []), project['segments'])  # structural edit: keep unchanged clips
     persist_project(project_id)
     return {'status': 'ok', 'deleted': segment_id}
+
+@app.post('/api/projects/{project_id}/segments/{segment_id}/tts')
+async def generate_segment_audio(project_id: str, segment_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Generate audio for one subtitle segment from its current dubbed text.
+
+    Uses the same synthesis path as the full dub. The segment's previous audio is kept
+    until the new clip is written successfully.
+    """
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail='Project not found')
+    index = _segment_index(project, segment_id)
+    if index < 0:
+        raise HTTPException(status_code=404, detail='Segment not found')
+    segment = project['segments'][index]
+    gender = 'Female' if str(payload.get('gender') or '').strip().lower() == 'female' else 'Male'
+    voice = segment_tts.voice_for_gender(gender)
+    # Remember the speaker's voice on the line itself, so it survives a reload before audio exists.
+    segment['gender'] = gender
+    target_language = str(payload.get('target_language') or project.get('target_language') or 'Khmer')
+    provider = str(payload.get('provider') or 'edge')
+    speed = float(payload.get('speed') or 1.0)
+    previous = next((item for item in project.get('audio_segments', []) if str(item.get('id')) == str(segment_id)), None)
+    try:
+        entry = await run_in_threadpool(
+            segment_tts.synthesize_segment,
+            project_id=project_id,
+            data_root=DATA_ROOT,
+            segment=segment,
+            previous=previous,
+            voice=voice,
+            provider=provider,
+            language_name=target_language,
+            lang_code=_resolve_lang_code(target_language),
+            speed=speed,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=f'Audio not replaced: {error}') from error
+
+    clip_seconds = None
+    ffprobe = find_media_tool('ffprobe')
+    if ffprobe:
+        try:
+            clip_seconds = await run_in_threadpool(_probe_duration, ffprobe, entry['path'])
+        except (subprocess.CalledProcessError, ValueError, KeyError, OSError):
+            clip_seconds = None
+    slot_seconds = float(segment['end']) - float(segment['start'])
+    entry['fit'] = segment_tts.fit_report(clip_seconds, slot_seconds)
+    audio = [item for item in project.get('audio_segments', []) if str(item.get('id')) != str(segment_id)]
+    audio.append({key: value for key, value in entry.items() if key != 'previous_path'})
+    audio.sort(key=lambda item: float(item.get('start') or 0))
+    project['audio_segments'] = audio
+    persist_project(project_id)
+    previous_path = entry.get('previous_path')
+    if previous_path and previous_path != entry['path'] and Path(str(previous_path)).is_file():
+        Path(str(previous_path)).unlink(missing_ok=True)
+    return {'status': 'ok', 'audio': entry}
+
+
+@app.post('/api/projects/{project_id}/segments')
+async def add_segment(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Insert a new empty subtitle segment between the given times."""
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail='Project not found')
+    start = round(max(0.0, float(payload.get('start') or 0)), 3)
+    end = round(float(payload.get('end') or start + 1.0), 3)
+    if end - start < 0.2:
+        raise HTTPException(status_code=400, detail='A new segment must be at least 0.2s long')
+    segment = {
+        'id': f'seg-{uuid.uuid4().hex[:10]}',
+        'start': start,
+        'end': end,
+        'speaker': str(payload.get('speaker') or 'Speaker 1'),
+        'text': '',
+        'translation': '',
+    }
+    segments = project.setdefault('segments', [])
+    segments.append(segment)
+    segments.sort(key=lambda item: float(item.get('start') or 0))
+    persist_project(project_id)
+    return {'status': 'ok', 'segment': segment}
+
+
+@app.get('/api/projects/{project_id}/segments/{segment_id}/audio')
+async def get_segment_audio(project_id: str, segment_id: str, request: Request):
+    """Serve one segment's dubbed clip by id (stable across split, merge, and reorder)."""
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail='Project not found')
+    clip = next((item for item in project.get('audio_segments', []) if str(item.get('id')) == str(segment_id)), None)
+    if clip is None or not clip.get('path') or not Path(str(clip['path'])).is_file():
+        raise HTTPException(status_code=404, detail='This line has no generated audio yet')
+    media_type = 'audio/wav' if str(clip['path']).lower().endswith('.wav') else 'audio/mpeg'
+    return _file_response_with_range(request, Path(str(clip['path'])), media_type)
+
+@app.get('/api/projects/{project_id}/segment-timing')
+async def get_segment_timing(project_id: str) -> dict[str, Any]:
+    """Overlaps, invalid timecodes, and segments that run past the video."""
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail='Project not found')
+    problems = segment_tts.timing_problems(project.get('segments', []), _media_duration_seconds(project))
+    return {'status': 'ok', 'problems': problems}
 
 
 @app.get('/api/projects')
@@ -2857,7 +2887,7 @@ async def fix_overlaps(project_id: str) -> dict[str, Any]:
                 await run_in_threadpool(
                     tts_service.synthesize_line,
                     text, temp_path,
-                    provider_pref='auto',
+                    provider_pref=segment_tts.engine_of_clip(seg),
                     language_name=project.get('target_language', 'Khmer'),
                     lang_code=_resolve_lang_code(project.get('target_language', 'Khmer')),
                     voice_pref=profile.get('voice') or seg.get('voice'),
