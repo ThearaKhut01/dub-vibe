@@ -2063,6 +2063,15 @@ async def process_export(payload: ProcessingRequest) -> dict[str, Any]:
         )
         project['audio_segments'] = audio_segments
         persist_project(payload.project_id)
+    # Skip any clip that cannot be read (for example a header-only file), so one bad line
+    # does not fail the whole export. The skipped lines are reported, not silently dropped.
+    ffprobe_for_export = find_media_tool('ffprobe')
+    if ffprobe_for_export and audio_segments:
+        readable = [item for item in audio_segments if item.get('path') and Path(str(item['path'])).is_file() and _is_readable_audio(ffprobe_for_export, str(item['path']))]
+        skipped = len(audio_segments) - len(readable)
+        if skipped:
+            await emit_progress(payload.project_id, 'Exporting', 88, f'Skipped {skipped} unreadable dubbed line(s); exporting the rest.')
+        audio_segments = readable
     dub_by_id = {str(item.get('id')): item for item in audio_segments}
 
     export_segments = []
@@ -2676,6 +2685,19 @@ DUB_SPEECH_GAP = 0.08
 _MAX_DUB_TEMPO = 1.35
 
 
+def _is_readable_audio(ffprobe: str, path: str) -> bool:
+    """True only when ffprobe reads a clip that has audio in it.
+
+    A silence trim can leave a header-only MP3 (about 226 bytes, no audio frames) that is
+    not zero bytes, so a size check alone misses it and the export later fails on that file.
+    """
+    try:
+        return _probe_audio_duration(ffprobe, path) > 0.0
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return False
+
+
+
 def _probe_audio_duration(ffprobe: str, path: str) -> float:
     result = subprocess.run(
         [ffprobe, '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', path],
@@ -2723,7 +2745,7 @@ def _preferred_start(seg: dict[str, Any]) -> float:
     return float(seg.get('start') or 0)
 
 
-def _strip_clip_silence(ffmpeg: str, path: str) -> str:
+def _strip_clip_silence(ffmpeg: str, ffprobe: str, path: str) -> str:
     """Trim leading and trailing dead silence from dub speech with subtle ~40ms margin.
 
     Returns the path to the trimmed audio file (idempotent, stored in parent/'clean').
@@ -2743,6 +2765,10 @@ def _strip_clip_silence(ffmpeg: str, path: str) -> str:
             ]
             res = subprocess.run(cmd, capture_output=True, text=True)
             if res.returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+                return path
+            # A fully-silent clip trims to a header-only file that is not zero bytes; keep the original.
+            if not _is_readable_audio(ffprobe, str(target)):
+                target.unlink(missing_ok=True)
                 return path
         return str(target)
     except Exception:
@@ -2767,7 +2793,7 @@ def _resolve_speech_overlaps(audio_segments: list[dict[str, Any]],
         for seg in audio_segments:
             path = str(seg.get('path') or '')
             if path and Path(path).is_file():
-                cleaned = _strip_clip_silence(ffmpeg, path)
+                cleaned = _strip_clip_silence(ffmpeg, ffprobe, path)
                 if cleaned != path:
                     if not seg.get('source_path'):
                         seg['source_path'] = path
