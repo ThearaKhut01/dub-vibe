@@ -14,6 +14,7 @@ Khmer-only models used when Edge TTS is unavailable. Paid API results are cached
 """
 from __future__ import annotations
 
+import subprocess
 import hashlib
 import shutil
 from pathlib import Path
@@ -192,12 +193,33 @@ def strip_audio_silence(path: str) -> None:
             '-c:a', 'libmp3lame', '-q:a', '4', str(temp_out),
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode == 0 and temp_out.is_file() and temp_out.stat().st_size > 0:
+        # A fully silent clip trims to a header-only MP3 that is not zero bytes. Accept the
+        # trim only when ffprobe reads audio in it; otherwise keep the untrimmed clip.
+        if res.returncode == 0 and temp_out.is_file() and temp_out.stat().st_size > 0 and _has_audio(path=temp_out):
             temp_out.replace(path)
         else:
             temp_out.unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def _has_audio(path: Path) -> bool:
+    """True when ffprobe reads a positive duration from the file."""
+    try:
+        from .main import find_media_tool
+        ffprobe = find_media_tool('ffprobe')
+    except Exception:
+        ffprobe = None
+    if not ffprobe:
+        return True  # cannot verify without ffprobe; keep the existing behaviour
+    try:
+        probe = subprocess.run(
+            [ffprobe, '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', str(path)],
+            capture_output=True, text=True, check=True,
+        )
+        return float(probe.stdout.strip() or '0') > 0.0
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return False
 
 
 def preview_line(text: str, *, provider: str, language_name: str, lang_code: str,

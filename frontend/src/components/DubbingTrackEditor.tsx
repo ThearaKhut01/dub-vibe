@@ -45,8 +45,6 @@ export function DubbingTrackEditor({
 }: DubbingTrackEditorProps) {
   const generateSegmentAudio = useStudioStore((state) => state.generateSegmentAudio);
   const updateSegment = useStudioStore((state) => state.updateSegment);
-  const splitSegment = useStudioStore((state) => state.splitSegment);
-  const mergeSegmentWithNext = useStudioStore((state) => state.mergeSegmentWithNext);
   const deleteSegment = useStudioStore((state) => state.deleteSegment);
 
   const [height, setHeight] = useState(420);
@@ -91,14 +89,6 @@ export function DubbingTrackEditor({
   useEffect(() => () => {
     audioRef.current?.pause();
   }, []);
-
-  const problemsBySegment = useMemo(() => {
-    const map = new Map<string, TimingProblem[]>();
-    for (const problem of problems) {
-      map.set(problem.segment, [...(map.get(problem.segment) ?? []), problem]);
-    }
-    return map;
-  }, [problems]);
 
   const genderFor = (segment: TimelineSegment): Gender => genders[segment.id] ?? (segment.gender ?? 'Male');
 
@@ -270,8 +260,6 @@ export function DubbingTrackEditor({
                 <tbody className="divide-y divide-white/[0.05]">
                 {ordered.map((segment) => {
                   const status = rowStatus(segment);
-                  const clip = audioById.get(segment.id);
-                  const rowProblems = problemsBySegment.get(segment.id) ?? [];
                   const busy = busyId === segment.id || busyId === 'structure';
                   const draft = drafts[segment.id] ?? segment.translation;
                   return (
@@ -301,7 +289,7 @@ export function DubbingTrackEditor({
                               {(['Male', 'Female'] as Gender[]).map((gender) => (
                                 <button
                                   key={gender}
-                                  onClick={() => setGenders((current) => ({ ...current, [segment.id]: gender }))}
+                                  onClick={() => { setGenders((current) => ({ ...current, [segment.id]: gender })); void updateSegment(projectId, segment.id, { gender }).catch((error) => onNotice(error instanceof Error ? error.message : 'Could not save the voice choice.')); }}
                                   className={`px-2 py-1 text-[11px] ${genderFor(segment) === gender ? 'bg-sky-500 text-slate-950' : 'bg-slate-900 text-slate-400 hover:text-slate-200'}`}
                                   aria-pressed={genderFor(segment) === gender}
                                 >

@@ -554,6 +554,29 @@ async def delete_nllb_model() -> dict[str, str]:
     return {'status': 'ok', 'deleted': model_manager.NLLB_JOB_ID}
 
 
+@app.get('/api/models/voxcpm')
+async def voxcpm_model_status() -> dict[str, Any]:
+    return model_manager.voxcpm_status()
+
+
+@app.post('/api/models/voxcpm/download')
+async def download_voxcpm_model() -> dict[str, Any]:
+    try:
+        job = model_manager.start_download_voxcpm()
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {'status': 'ok', 'model': 'voxcpm2', 'job': job}
+
+
+@app.delete('/api/models/voxcpm')
+async def delete_voxcpm_model() -> dict[str, str]:
+    try:
+        model_manager.delete_voxcpm()
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {'status': 'ok', 'deleted': 'voxcpm2'}
+
+
 # --- Online provider keys (stored in Windows Credential Manager, never sent
 # back to the browser) --------------------------------------------------------
 
@@ -775,6 +798,8 @@ async def update_segment(project_id: str, segment_id: str, payload: SegmentUpdat
     if payload.translation is not None:
         segment['translation'] = payload.translation.strip()
         audio_stale = True
+    if payload.gender is not None:
+        segment['gender'] = payload.gender
     new_start = float(payload.start) if payload.start is not None else None
     new_end = float(payload.end) if payload.end is not None else None
     if new_start is not None:
@@ -875,7 +900,8 @@ async def generate_segment_audio(project_id: str, segment_id: str, payload: dict
     """Generate audio for one subtitle segment from its current dubbed text.
 
     Uses the same synthesis path as the full dub. The segment's previous audio is kept
-    until the new clip is written successfully.
+    until the new clip is written successfully. The chosen voice is saved on the line
+    even if generation fails, so the choice survives a reload.
     """
     project = projects.get(project_id)
     if project is None:
@@ -915,7 +941,7 @@ async def generate_segment_audio(project_id: str, segment_id: str, payload: dict
     if ffprobe:
         try:
             clip_seconds = await run_in_threadpool(_probe_duration, ffprobe, entry['path'])
-        except (subprocess.CalledProcessError, ValueError, KeyError, OSError):
+        except (subprocess.CalledProcessError, ValueError, KeyError, TypeError, OSError):
             clip_seconds = None
     slot_seconds = float(segment['end']) - float(segment['start'])
     entry['fit'] = segment_tts.fit_report(clip_seconds, slot_seconds)
@@ -2002,7 +2028,8 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
         for segment in segments
     ]
     result = {
-        'provider': 'Edge TTS',
+        # Report the engine(s) that actually produced the audio, not a fixed label.
+        'provider': _engines_used(audio_segments),
         'voice': audio_segments[0]['voice'] if audio_segments else payload.voice,
         'segments': audio_segments,
         'subtitle_vtt': chunk_engine.build_vtt(vtt_segments),
@@ -2698,6 +2725,14 @@ def _is_readable_audio(ffprobe: str, path: str) -> bool:
 
 
 
+def _engines_used(audio_segments: list[dict[str, Any]]) -> str:
+    """The engine that produced the dub clips, read from each clip's recorded voice."""
+    engines = sorted({str(item.get('voice') or '').split(':', 1)[0] for item in audio_segments if item.get('voice')} - {''})
+    if not engines:
+        return 'none'
+    return engines[0] if len(engines) == 1 else 'mixed: ' + ', '.join(engines)
+
+
 def _probe_audio_duration(ffprobe: str, path: str) -> float:
     result = subprocess.run(
         [ffprobe, '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', path],
@@ -2926,6 +2961,10 @@ async def fix_overlaps(project_id: str) -> dict[str, Any]:
                               'style': 'Natural', 'pacing': 'Natural',
                               'pause_before': False, 'analyzer': 'none'},
                 )
+                # A header-only re-synthesis reads as zero length and would pass the fit test,
+                # then overwrite a good clip when applied. Require readable audio first.
+                if not _is_readable_audio(ffprobe, temp_path):
+                    raise RuntimeError('re-synthesis produced no readable audio')
                 new_dur = await run_in_threadpool(_probe_audio_duration, ffprobe, temp_path)
                 if new_dur <= slot_dur + 0.05:
                     proposals.append({
@@ -2983,6 +3022,18 @@ async def fix_overlaps(project_id: str) -> dict[str, Any]:
     return {'overlaps_found': len(proposals), 'proposals': proposals}
 
 
+def _inside_project_dir(project_id: str, candidate: str | None) -> bool:
+    """True only when `candidate` resolves to a path inside this project's data folder."""
+    if not candidate:
+        return False
+    try:
+        base = (DATA_ROOT / project_id).resolve()
+        target = Path(str(candidate)).resolve()
+    except (OSError, ValueError):
+        return False
+    return target == base or base in target.parents
+
+
 @app.post('/api/projects/{project_id}/fix-overlaps/apply')
 async def apply_fix_overlaps(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Apply approved overlap fix proposals to the project's audio segments."""
@@ -3004,6 +3055,10 @@ async def apply_fix_overlaps(project_id: str, payload: dict[str, Any]) -> dict[s
         if p_type == 'speed_adjust':
             new_path = proposal.get('new_audio_path', '')
             real_path = seg.get('path', '')
+            # The client supplies these paths, so only move files that live inside this
+            # project's own folder. Anything else would let a request overwrite arbitrary files.
+            if not (_inside_project_dir(project_id, new_path) and _inside_project_dir(project_id, real_path)):
+                continue
             if new_path and Path(new_path).is_file() and real_path:
                 shutil.move(new_path, real_path)
                 if ffprobe:

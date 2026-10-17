@@ -77,7 +77,7 @@ interface StudioState {
   detectSpeakers: () => Promise<{ speakers: string[]; message: string }>;
   cutRange: (start: number, end: number, mode: 'remove' | 'keep') => Promise<{ message: string }>;
   patchSegmentLocal: (segmentId: string, patch: { text?: string; translation?: string; start?: number; end?: number }) => void;
-  updateSegment: (projectId: string, segmentId: string, patch: { text?: string; translation?: string; start?: number; end?: number }) => Promise<void>;
+  updateSegment: (projectId: string, segmentId: string, patch: { text?: string; translation?: string; start?: number; end?: number; gender?: 'Male' | 'Female' }) => Promise<void>;
   splitSegment: (projectId: string, segmentId: string, at: number) => Promise<void>;
   mergeSegmentWithNext: (projectId: string, segmentId: string) => Promise<void>;
   deleteSegment: (projectId: string, segmentId: string) => Promise<void>;
@@ -610,13 +610,24 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       }),
     })),
   updateSegment: async (projectId, segmentId, patch) => {
+    // Keep the previous values so a rejected save can be rolled back and the UI does not show
+    // text the server never stored.
+    const before = get().transcript.find((segment) => segment.id === segmentId);
+    const previous = before ? { translation: before.translation, text: before.text, start: before.start, end: before.end } : null;
     get().patchSegmentLocal(segmentId, patch);
-    const response = await fetch(`${apiBase}/api/projects/${projectId}/segments/${segmentId}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${apiBase}/api/projects/${projectId}/segments/${segmentId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+    } catch (error) {
+      if (previous) get().patchSegmentLocal(segmentId, previous);
+      throw error;
+    }
     if (!response.ok) {
+      if (previous) get().patchSegmentLocal(segmentId, previous);
       const problem = await response.json().catch(() => ({}));
       throw new Error(problem.detail ?? `Unable to save the segment (HTTP ${response.status})`);
     }

@@ -110,6 +110,7 @@ class SegmentUpdate(BaseModel):
     translation: str | None = None
     start: float | None = Field(default=None, ge=0)
     end: float | None = Field(default=None, ge=0)
+    gender: Literal['Male', 'Female'] | None = None
 
 
 class SegmentSplit(BaseModel):
