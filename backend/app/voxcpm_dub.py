@@ -14,13 +14,15 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .providers import models_root
+from .providers import get_storage_dir
 
 REFERENCE_MIN_SECONDS = 4.0
 REFERENCE_MAX_SECONDS = 12.0
 
 def dub_dir(project_id: str) -> Path:
-    directory = models_root().parent / 'data' / project_id / 'voxcpm-dub'
+    # Project work files live with the rest of the project data (same root as
+    # main.DATA_ROOT), so deleting a project removes them and DUBVIBE_DATA_DIR applies.
+    directory = get_storage_dir('data') / project_id / 'voxcpm-dub'
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 

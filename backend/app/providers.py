@@ -242,23 +242,45 @@ class ArgosTranslationProvider(TranslationProvider):
         return get_storage_dir('models') / 'argos'
 
     @staticmethod
+    def _configure_settings() -> None:
+        """Point Argos Translate at the app's model folder.
+
+        Argos resolves installed packages through ``package_dirs`` and extracts
+        downloads into ``package_data_dir``, so all three settings must move
+        together: setting only ``data_dir`` leaves the default package folder in
+        place, which hides packages that are actually installed (and breaks the
+        offline engine check). The language list is lru_cached, so it is cleared
+        when the paths change.
+        """
+        import argostranslate.settings as argos_settings
+        from argostranslate import translate as argos_translate
+
+        data_dir = ArgosTranslationProvider._data_dir()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        packages_dir = data_dir / 'packages'
+        packages_dir.mkdir(parents=True, exist_ok=True)
+        unchanged = (
+            Path(argos_settings.data_dir) == data_dir
+            and [Path(entry) for entry in argos_settings.package_dirs] == [packages_dir]
+            and Path(argos_settings.package_data_dir) == packages_dir
+        )
+        if unchanged:
+            return
+        argos_settings.data_dir = data_dir
+        argos_settings.package_dirs = [packages_dir]
+        argos_settings.package_data_dir = packages_dir
+        argos_translate.get_installed_languages.cache_clear()
+
+    @staticmethod
     def _ensure_package(source: str, target: str) -> bool:
         """Download the language package if it is not already installed.
 
         Returns True when the requested pair is available, False otherwise.
         """
         try:
-            import argostranslate.settings
             from argostranslate import package as argos_package, translate as argos_translate
 
-            data_dir = ArgosTranslationProvider._data_dir()
-            data_dir.mkdir(parents=True, exist_ok=True)
-            packages_dir = data_dir / 'packages'
-            packages_dir.mkdir(parents=True, exist_ok=True)
-
-            argostranslate.settings.data_dir = data_dir
-            argostranslate.settings.package_dirs = [packages_dir]
-            argostranslate.settings.package_data_dir = packages_dir
+            ArgosTranslationProvider._configure_settings()
 
             # Check if the pair is already installed.
             installed = argos_translate.get_installed_languages()
@@ -284,8 +306,6 @@ class ArgosTranslationProvider(TranslationProvider):
             return False
 
     def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
-        from argostranslate import translate as argos_translate
-
         source = _resolve_lang_code(source_language)
         target = _resolve_lang_code(target_language)
         if source == target:
@@ -319,12 +339,9 @@ class ArgosTranslationProvider(TranslationProvider):
             return True
         try:
             from argostranslate import package as argos_package, translate as argos_translate
-            from argostranslate import settings as argos_settings
-        except Exception:
-            return False
 
-        try:
-            argos_settings.data_dir = ArgosTranslationProvider._data_dir()
+            ArgosTranslationProvider._configure_settings()
+
             installed = argos_translate.get_installed_languages()
             if ArgosTranslationProvider._find_installed_translation(installed, source, target) is not None:
                 return True
@@ -356,6 +373,7 @@ class ArgosTranslationProvider(TranslationProvider):
     def _translate_with_pair(text: str, source: str, target: str) -> str:
         from argostranslate import translate as argos_translate
 
+        ArgosTranslationProvider._configure_settings()
         installed = argos_translate.get_installed_languages()
         translation_obj = ArgosTranslationProvider._find_installed_translation(installed, source, target)
         if translation_obj is None:

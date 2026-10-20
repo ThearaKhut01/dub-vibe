@@ -68,6 +68,21 @@ const trackLabels = ['Video', 'Original Speech', 'Translation', 'Dubbed Voice', 
 
 const apiBaseUrl = import.meta.env.DEV ? '' : 'http://127.0.0.1:8001';
 
+/** Map the backend's audio_segments rows to the timeline's dub segments. */
+const toDubSegments = (rows: Array<Record<string, unknown>>): import('./types').TimelineSegment[] =>
+  rows.map((row, index) => ({
+    id: String(row.id ?? `dub-${index + 1}`),
+    speaker: String(row.voice ?? 'Dubbed Voice'),
+    start: Number(row.start ?? 0),
+    end: Number(row.end ?? 0),
+    text: String(row.text ?? ''),
+    translation: String(row.text ?? ''),
+    voice: String(row.voice ?? 'Dubbed Voice'),
+    color: '#34d399',
+    path: row.path ? String(row.path) : '',
+    ...(row.gender === 'Male' || row.gender === 'Female' ? { gender: row.gender } : {}),
+  }));
+
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -82,6 +97,7 @@ function App() {
     chunkSeconds,
     dubbedVideoReady,
     mediaVersion,
+    dubAudioVersion,
     exportedParts,
     defaultExportFolder,
     exportFolder,
@@ -152,6 +168,8 @@ function App() {
     refreshCharacters,
     saveCharacters,
     updateDubAudioSegments,
+    canUndoOverlaps,
+    setCanUndoOverlaps,
   } = useStudioStore();
   const [importedFile, setImportedFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState('');
@@ -225,8 +243,7 @@ function App() {
   const [fixOverlapsState, setFixOverlapsState] = useState<'idle' | 'analyzing' | 'preview' | 'applying'>('idle');
   const [fixProposals, setFixProposals] = useState<OverlapProposal[]>([]);
   const [fixError, setFixError] = useState<string | null>(null);
-  const [fixUndoSnapshot, setFixUndoSnapshot] = useState<import('./types').TimelineSegment[] | null>(null);
-  const [fixOverlapsFound, setFixOverlapsFound] = useState(0);
+    const [fixOverlapsFound, setFixOverlapsFound] = useState(0);
 
   const beginSegmentDrag = (event: React.PointerEvent, segment: { id: string; start: number; end: number }, kind: 'move' | 'trim-l' | 'trim-r') => {
     if (mode !== 'EDIT' || busy) return;
@@ -391,7 +408,7 @@ function App() {
     setIsRefreshing(true);
     setNotice('Refreshing studio state, tools, and timeline...');
     try {
-      const healthRes = await fetch('http://127.0.0.1:8001/health').catch(() => null);
+      const healthRes = await fetch(`${apiBaseUrl}/health`).catch(() => null);
       setApiAvailable(healthRes?.ok ?? false);
       await hydrateStudio();
       setNotice('Studio, AI engines, and timeline refreshed successfully.');
@@ -530,20 +547,26 @@ function App() {
     const key = activeKey;
     let audio = dubAudioRefs.current.get(key);
     if (!audio) {
-      audio = new Audio(`${apiBaseUrl}/api/projects/${project.id}/dub-audio/${activeIndex + 1}`);
+      // The version query busts the cached clip after a line is regenerated,
+      // an overlap fix is applied/undone, or an export re-fits the audio.
+      audio = new Audio(`${apiBaseUrl}/api/projects/${project.id}/dub-audio/${activeIndex + 1}?v=${dubAudioVersion}`);
       audio.preload = 'auto';
       dubAudioRefs.current.set(key, audio);
     }
+    const offset = Math.max(0, time - dubAudioSegments[activeIndex].start);
     if (audio.paused) {
-      audio.currentTime = Math.max(0, time - dubAudioSegments[activeIndex].start);
+      audio.currentTime = offset;
       void audio.play().catch(() => { });
+    } else if (Math.abs(audio.currentTime - offset) > 0.25) {
+      // Seeking inside the same line leaves the clip running from its old position.
+      audio.currentTime = offset;
     }
   };
 
   // Drop cached dub audio elements when the project or its dub track changes.
   useEffect(() => {
     clearDubAudio();
-  }, [project.id, dubAudioSegments.length]);
+  }, [project.id, dubAudioSegments.length, dubAudioVersion]);
 
   const handleRulerMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -624,7 +647,6 @@ function App() {
         throw new Error(err.detail ?? `Fix-overlaps failed (HTTP ${response.status})`);
       }
       const data = await response.json() as FixOverlapsResponse;
-      setFixOverlapsFound(data.overlaps_found);
       setFixProposals(data.proposals);
       setFixOverlapsState('preview');
     } catch (e) {
@@ -635,7 +657,6 @@ function App() {
 
   const handleApplyFix = async () => {
     if (!project.id) return;
-    setFixUndoSnapshot([...dubAudioSegments]);
     setFixOverlapsState('applying');
     try {
       const response = await fetch(`${apiBaseUrl}/api/projects/${project.id}/fix-overlaps/apply`, {
@@ -647,24 +668,44 @@ function App() {
         const err = await response.json().catch(() => ({})) as { detail?: string };
         throw new Error(err.detail ?? `Apply fix failed (HTTP ${response.status})`);
       }
-      const data = await response.json() as { audio_segments: Array<Record<string, unknown>> };
-      const updated = data.audio_segments.map((s, i) => ({
-        id: String(s.id ?? `dub-${i + 1}`),
-        speaker: String(s.voice ?? 'Dubbed Voice'),
-        start: Number(s.start ?? 0),
-        end: Number(s.end ?? 0),
-        text: String(s.text ?? ''),
-        translation: String(s.text ?? ''),
-        voice: String(s.voice ?? 'Dubbed Voice'),
-        color: '#34d399',
-        path: s.path ? String(s.path) : '',
-      }));
-      updateDubAudioSegments(updated);
+      const data = await response.json() as {
+        applied?: number;
+        can_undo?: boolean;
+        audio_segments: Array<Record<string, unknown>>;
+      };
+      updateDubAudioSegments(toDubSegments(data.audio_segments));
       setFixProposals([]);
+      // Only the proposals that were actually applied count as fixed.
+      setFixOverlapsFound(Number(data.applied ?? 0));
+      setCanUndoOverlaps(Boolean(data.can_undo));
       setFixOverlapsState('idle');
     } catch (e) {
       setFixError(e instanceof Error ? e.message : 'Unknown error');
       setFixOverlapsState('idle');
+    }
+  };
+
+  const handleUndoFix = async () => {
+    if (!project.id) return;
+    try {
+      // The backend kept a copy of the clips it overwrote; restoring them is the
+      // only way back, because applying a fix replaces the audio in place.
+      const response = await fetch(`${apiBaseUrl}/api/projects/${project.id}/fix-overlaps/undo`, {
+        method: 'POST',
+      });
+      const data = await response.json().catch(() => ({})) as {
+        detail?: string;
+        audio_segments?: Array<Record<string, unknown>>;
+      };
+      if (!response.ok) {
+        throw new Error(data.detail ?? `Undo failed (HTTP ${response.status})`);
+      }
+      updateDubAudioSegments(toDubSegments(data.audio_segments ?? []));
+      setCanUndoOverlaps(false);
+      setFixOverlapsFound(0);
+      setNotice('Overlap fixes undone.');
+    } catch (e) {
+      setFixError(e instanceof Error ? e.message : 'Unknown error');
     }
   };
 
@@ -3763,20 +3804,20 @@ function App() {
       )}
 
       {/* Auto-Fix Overlaps: Undo Banner */}
-      {fixUndoSnapshot !== null && fixOverlapsState === 'idle' && fixOverlapsFound > 0 && (
+      {canUndoOverlaps && fixOverlapsState === 'idle' && (
         <div className="fixed bottom-6 left-1/2 z-40 -translate-x-1/2 flex items-center gap-3 rounded-xl border border-emerald-500/30 bg-slate-900 px-4 py-2.5 shadow-2xl text-sm text-emerald-100">
-          <span>{fixOverlapsFound} overlap{fixOverlapsFound !== 1 ? 's' : ''} fixed</span>
+          <span>
+            {fixOverlapsFound > 0
+              ? `${fixOverlapsFound} overlap${fixOverlapsFound !== 1 ? 's' : ''} fixed`
+              : 'Overlap fixes applied'}
+          </span>
           <button
-            onClick={() => {
-              if (fixUndoSnapshot) updateDubAudioSegments(fixUndoSnapshot);
-              setFixUndoSnapshot(null);
-              setFixOverlapsFound(0);
-            }}
+            onClick={() => void handleUndoFix()}
             className="text-sky-400 hover:text-sky-300 font-medium"
           >
             Undo
           </button>
-          <button onClick={() => setFixUndoSnapshot(null)} className="text-slate-500 hover:text-slate-400">✕</button>
+          <button onClick={() => setCanUndoOverlaps(false)} className="text-slate-500 hover:text-slate-400">✕</button>
         </div>
       )}
 

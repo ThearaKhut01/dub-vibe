@@ -22,7 +22,6 @@ import os
 import shutil
 import sys
 import threading
-import time
 from pathlib import Path
 
 from . import cuda_pack
@@ -545,7 +544,7 @@ def demucs_status() -> dict:
         'downloaded_mb': round(job.get('downloaded', 0), 1) if job else 0,
         'total_mb': demucs_local.DEMUCS_SIZE_MB,
         'size_mb': demucs_local.installed_size_mb(),
-        'path': str(demucs_local._snapshot_dir()) if installed else None,
+        'path': str(demucs_local.demucs_dir()) if installed else None,
         'error': job.get('error') if job else None,
     }
 
@@ -596,7 +595,10 @@ def delete_demucs() -> None:
         job = _DOWNLOADS.get('demucs-htdemucs-6s')
         if job and job.get('status') == 'downloading':
             raise ValueError('Cannot delete a model while it is downloading.')
-    shutil.rmtree(demucs_local._snapshot_dir().parent, ignore_errors=True)
+    shutil.rmtree(demucs_local.demucs_dir(), ignore_errors=True)
+    # Also remove a copy installed by an older version into the Hub cache.
+    shutil.rmtree(demucs_local.hf_cache_dir() / f'models--{demucs_local.DEMUCS_REPO_ID.replace("/", "--")}',
+                  ignore_errors=True)
 
 
 def whisper_models_status() -> list[dict]:
@@ -665,61 +667,22 @@ def storage_info() -> dict:
 # Download + validation
 # ---------------------------------------------------------------------------
 
-def _make_progress_tqdm(on_fraction) -> type:
-    """Build a tqdm subclass that reports the aggregate download fraction
-    across all file bars of a snapshot download."""
-    from tqdm import tqdm as base_tqdm
-
-    bars: dict[int, dict] = {}
-    lock = threading.Lock()
-
-    class ReportingTqdm(base_tqdm):
-        def update(self, n=1):
-            result = super().update(n)
-            try:
-                with lock:
-                    bars[id(self)] = {'n': float(self.n or 0), 'total': float(self.total or 0)}
-                    done = sum(entry['n'] for entry in bars.values())
-                    total = sum(entry['total'] for entry in bars.values())
-                if total > 0:
-                    on_fraction(min(99.0, 100.0 * done / total))
-            except Exception:
-                pass
-            return result
-
-        def close(self):
-            try:
-                with lock:
-                    entry = bars.get(id(self))
-                    if entry is not None:
-                        entry['n'] = entry['total']
-                        done = sum(entry_['n'] for entry_ in bars.values())
-                        total = sum(entry_['total'] for entry_ in bars.values())
-                if total > 0:
-                    on_fraction(min(99.0, 100.0 * done / total))
-            except Exception:
-                pass
-            super().close()
-
-    return ReportingTqdm
-
-
 def _download_sync(model_id: str, progress_cb=None) -> None:
     """Blocking download of one model into its own folder. Raises on failure."""
-    from huggingface_hub import snapshot_download
+    from .hf_progress import download_snapshot
 
     meta = WHISPER_CATALOG[model_id]
     target = whisper_model_dir(model_id)
     target.mkdir(parents=True, exist_ok=True)
 
-    def on_fraction(fraction: float) -> None:
+    def on_fraction(percent: int) -> None:
         if progress_cb:
-            progress_cb(int(fraction))
+            progress_cb(int(percent))
 
-    snapshot_download(
-        repo_id=meta['repo'],
-        local_dir=str(target),
-        tqdm_class=_make_progress_tqdm(on_fraction),
+    download_snapshot(
+        meta['repo'],
+        local_dir=target,
+        progress_cb=on_fraction,
     )
     if progress_cb:
         progress_cb(100)

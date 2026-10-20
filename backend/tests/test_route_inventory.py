@@ -38,6 +38,7 @@ REQUIRED = {
     ('GET', '/api/projects/{project_id}/segment-timing'),
     ('POST', '/api/projects/{project_id}/fix-overlaps'),
     ('POST', '/api/projects/{project_id}/fix-overlaps/apply'),
+    ('POST', '/api/projects/{project_id}/fix-overlaps/undo'),
 }
 
 

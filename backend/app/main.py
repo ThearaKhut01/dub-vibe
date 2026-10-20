@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import math
 import re
-import threading
 import uuid
 import json
 import os
@@ -52,7 +51,7 @@ _register_nvidia_dll_dirs()
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from urllib.parse import quote
 
 from backend.app.chunking import SmartChunkEngine, format_timestamp, split_subtitle_cues
@@ -61,9 +60,7 @@ from backend.app import segment_tts
 from backend.app.models import ProjectRequest, ProjectSummary, ProviderSettings, ProcessingRequest, SegmentSplit, SegmentUpdate, WorkflowProgress
 from backend.app.providers import (
     FasterWhisperProvider,
-    HybridTTSProvider,
     HybridTranslationProvider,
-    SpeakerDetector,
     _resolve_lang_code,
     edge_gender_voice,
     get_app_root,
@@ -912,8 +909,11 @@ async def generate_segment_audio(project_id: str, segment_id: str, payload: dict
     segment = project['segments'][index]
     gender = 'Female' if str(payload.get('gender') or '').strip().lower() == 'female' else 'Male'
     voice = segment_tts.voice_for_gender(gender)
-    # Remember the speaker's voice on the line itself, so it survives a reload before audio exists.
-    segment['gender'] = gender
+    # Remember the speaker's voice on the line itself, so it survives a reload before audio
+    # exists — including when synthesis below fails and no clip is written.
+    if segment.get('gender') != gender:
+        segment['gender'] = gender
+        persist_project(project_id)
     target_language = str(payload.get('target_language') or project.get('target_language') or 'Khmer')
     provider = str(payload.get('provider') or 'edge')
     speed = float(payload.get('speed') or 1.0)
@@ -1056,6 +1056,8 @@ async def get_project_workspace(project_id: str) -> dict[str, Any]:
             if project.get('parts_dir') and Path(str(project['parts_dir'])).is_dir() else 0
         ),
         'export_folder': project.get('export_folder'),
+        # The Undo banner survives a reload because the backup lives on disk.
+        'can_undo_overlaps': (_overlap_backup_dir(project_id) / 'audio_segments.json').is_file(),
         'separated': bool(
             (project.get('stems') or {}).get('sfx')
             and Path(str((project.get('stems') or {})['sfx'])).is_file()
@@ -2389,7 +2391,8 @@ async def process_export(payload: ProcessingRequest) -> dict[str, Any]:
                                 bed_graph = (
                                     f'{bed_sources}amix=inputs={len(part_bed_layers)}:duration=longest:normalize=0,{bed_gain}anull[bed]'
                                     if len(part_bed_layers) > 1
-                                    else f'[{len(part_bed_layers) + 1}:a]{bed_gain}anull[bed]'
+                                    # Input 0 is the chunk video, so the first bed layer is input 1.
+                                    else f'[1:a]{bed_gain}anull[bed]'
                                 )
                                 part_command.extend([
                                     '-filter_complex', bed_graph,
@@ -3005,7 +3008,6 @@ async def fix_overlaps(project_id: str) -> dict[str, Any]:
                 continue
 
         # c) Last resort: flag for re-translation
-        target_chars = int(len(str(seg.get('text') or '')) * (slot_dur / max(actual_dur, 0.1)))
         proposals.append({
             'segment_id': seg['id'],
             'type': 'needs_retranslation',
@@ -3034,6 +3036,38 @@ def _inside_project_dir(project_id: str, candidate: str | None) -> bool:
     return target == base or base in target.parents
 
 
+def _overlap_backup_dir(project_id: str) -> Path:
+    return DATA_ROOT / project_id / 'overlap-backup'
+
+
+def _snapshot_dub_audio(project_id: str, project: dict[str, Any]) -> int:
+    """Copy the current dub clips and their timing so the next fix can be undone.
+
+    Applying a speed fix overwrites a clip in place, so the original bytes are gone
+    unless they are saved first. The snapshot stores every entry's original timing
+    plus a copy of its audio file; the number of copied clips is returned.
+    """
+    backup_dir = _overlap_backup_dir(project_id)
+    shutil.rmtree(backup_dir, ignore_errors=True)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, Any]] = []
+    copied = 0
+    for index, audio in enumerate(project.get('audio_segments', [])):
+        entry = dict(audio)
+        path = str(entry.get('path') or '')
+        if path and _inside_project_dir(project_id, path) and Path(path).is_file():
+            target = backup_dir / f'{index:04d}{Path(path).suffix}'
+            shutil.copy2(path, target)
+            entry['path'] = str(target)
+            entry['restore_to'] = path
+            copied += 1
+        entries.append(entry)
+    (backup_dir / 'audio_segments.json').write_text(
+        json.dumps(entries, ensure_ascii=False), encoding='utf-8',
+    )
+    return copied
+
+
 @app.post('/api/projects/{project_id}/fix-overlaps/apply')
 async def apply_fix_overlaps(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Apply approved overlap fix proposals to the project's audio segments."""
@@ -3045,6 +3079,16 @@ async def apply_fix_overlaps(project_id: str, payload: dict[str, Any]) -> dict[s
     audio_segs = project.get('audio_segments', [])
     seg_by_id = {str(s.get('id')): s for s in audio_segs}
 
+    # Snapshot before touching any file, so Undo can restore the previous mix.
+    actionable = any(proposal.get('type') in ('speed_adjust', 'silence_absorb') for proposal in proposals)
+    if actionable:
+        await run_in_threadpool(_snapshot_dub_audio, project_id, project)
+    else:
+        # Nothing will change: drop an older snapshot so Undo cannot revert a
+        # different fix than the one the user just made.
+        shutil.rmtree(_overlap_backup_dir(project_id), ignore_errors=True)
+
+    applied = 0
     for proposal in proposals:
         p_type = proposal.get('type')
         seg_id = str(proposal.get('segment_id') or '')
@@ -3067,16 +3111,59 @@ async def apply_fix_overlaps(project_id: str, payload: dict[str, Any]) -> dict[s
                         seg['end'] = round(float(seg.get('start') or 0) + new_dur, 3)
                     except Exception:
                         pass
+                applied += 1
 
         elif p_type == 'silence_absorb':
             new_start = proposal.get('new_start')
             if new_start is not None:
                 seg['start'] = round(float(new_start), 3)
+                applied += 1
 
         # 'needs_retranslation': skip — no automatic action.
 
     persist_project(project_id)
-    return {'status': 'ok', 'audio_segments': project.get('audio_segments', [])}
+    return {
+        'status': 'ok',
+        'applied': applied,
+        'can_undo': (_overlap_backup_dir(project_id) / 'audio_segments.json').is_file(),
+        'audio_segments': project.get('audio_segments', []),
+    }
+
+
+@app.post('/api/projects/{project_id}/fix-overlaps/undo')
+async def undo_fix_overlaps(project_id: str) -> dict[str, Any]:
+    """Restore the dub clips and timings saved by the last overlap fix.
+
+    The backup is consumed by the undo so it cannot be replayed over newer edits.
+    """
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail='Project not found')
+    backup_dir = _overlap_backup_dir(project_id)
+    snapshot_file = backup_dir / 'audio_segments.json'
+    if not snapshot_file.is_file():
+        raise HTTPException(status_code=409, detail='There is no overlap fix to undo')
+    try:
+        entries = json.loads(snapshot_file.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=409, detail=f'The undo snapshot is unreadable: {error}') from error
+
+    restored: list[dict[str, Any]] = []
+    for entry in entries:
+        entry = dict(entry)
+        backup_path = str(entry.get('path') or '')
+        restore_to = str(entry.pop('restore_to', '') or '')
+        if restore_to and backup_path and Path(backup_path).is_file() and _inside_project_dir(project_id, restore_to):
+            Path(restore_to).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup_path, restore_to)
+            entry['path'] = restore_to
+        restored.append(entry)
+
+    project['audio_segments'] = restored
+    persist_project(project_id)
+    shutil.rmtree(backup_dir, ignore_errors=True)
+    return {'status': 'ok', 'audio_segments': restored}
+
 
 
 @app.websocket('/ws')

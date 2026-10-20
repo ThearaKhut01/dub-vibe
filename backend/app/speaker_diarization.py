@@ -18,6 +18,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from .providers import get_storage_dir
 
 logger = logging.getLogger(__name__)
@@ -60,10 +62,7 @@ def assign_speakers(media_path: str, segments: list[dict[str, Any]], ffmpeg: str
     Returns (labels, genders) where genders maps each final speaker name to
     {'gender': 'Female' | 'Male' | None, 'median_f0_hz': float | None}.
     """
-    import numpy as np
     from resemblyzer import VoiceEncoder
-
-    from .providers import get_storage_dir
 
     if not segments:
         return [], {}
@@ -163,7 +162,6 @@ def _pitch_track(samples: Any, sample_rate: int) -> np.ndarray | None:
     """Fundamental-frequency frames (Hz) of a voiced clip, unvoiced frames dropped."""
     try:
         import librosa
-        import numpy as np
 
         f0, _, _ = librosa.pyin(
             np.asarray(samples, dtype=np.float32),
@@ -178,8 +176,6 @@ def _pitch_track(samples: Any, sample_rate: int) -> np.ndarray | None:
 
 
 def _classify_gender(pitches: list[Any]) -> dict[str, Any]:
-    import numpy as np
-
     if len(pitches) < _MIN_PITCH_FRAMES:
         return {'gender': None, 'median_f0_hz': None}
     median_f0 = float(np.median(np.asarray(pitches, dtype=np.float64)))

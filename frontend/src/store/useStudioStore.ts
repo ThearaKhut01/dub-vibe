@@ -43,6 +43,14 @@ interface StudioState {
   demucsModel: WhisperModelInfo | null;
   voxcpmModel: WhisperModelInfo | null;
   cudaPack: CudaPackInfo | null;
+  /** True when the last Auto-Fix Overlaps run can still be undone (backup on disk). */
+  canUndoOverlaps: boolean;
+  setCanUndoOverlaps: (value: boolean) => void;
+  /**
+   * Bumped whenever the dub-audio files behind `/dub-audio/{index}` change, so the
+   * preview discards audio elements holding the previous clip.
+   */
+  dubAudioVersion: number;
   providerKeys: { gemini: { has_key: boolean }; openai: { has_key: boolean } };
   voiceCapabilities: Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean }> & { emotions?: string[] };
   characters: { speakers: string[]; characters: Record<string, Record<string, unknown>> };
@@ -76,7 +84,7 @@ interface StudioState {
   deleteCudaPack: () => Promise<void>;
   detectSpeakers: () => Promise<{ speakers: string[]; message: string }>;
   cutRange: (start: number, end: number, mode: 'remove' | 'keep') => Promise<{ message: string }>;
-  patchSegmentLocal: (segmentId: string, patch: { text?: string; translation?: string; start?: number; end?: number }) => void;
+  patchSegmentLocal: (segmentId: string, patch: { text?: string; translation?: string; start?: number; end?: number; gender?: 'Male' | 'Female' }) => void;
   updateSegment: (projectId: string, segmentId: string, patch: { text?: string; translation?: string; start?: number; end?: number; gender?: 'Male' | 'Female' }) => Promise<void>;
   splitSegment: (projectId: string, segmentId: string, at: number) => Promise<void>;
   mergeSegmentWithNext: (projectId: string, segmentId: string) => Promise<void>;
@@ -139,6 +147,7 @@ interface WorkspacePayload {
   parts_count?: number;
   export_folder?: string | null;
   separated?: boolean;
+  can_undo_overlaps?: boolean;
   workflow: { imported: boolean; chunked?: boolean; transcribed: boolean; translated: boolean; dubbed: boolean; subtitles_exported: boolean; video_ready?: boolean };
 }
 
@@ -259,6 +268,9 @@ const workspaceToPatch = (workspace: WorkspacePayload, state: StudioState) => ({
   defaultExportFolder: null,
   exportFolder: workspace.export_folder ?? null,
   separated: Boolean(workspace.separated),
+  canUndoOverlaps: Boolean(workspace.can_undo_overlaps),
+  // The workspace reload can point every index at freshly written clips.
+  dubAudioVersion: state.dubAudioVersion + 1,
 });
 
 // --- Live workflow progress over WebSocket ---------------------------------
@@ -342,6 +354,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   defaultExportFolder: null,
   exportFolder: null,
   separated: false,
+  canUndoOverlaps: false,
+  dubAudioVersion: 0,
   processingLog: [],
   models: [],
   hardware: null,
@@ -362,6 +376,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   mode: 'DUB',
   setMode: (mode) => set((state) => ({ ...state, mode, project: { ...state.project, mode } })),
   setActiveTool: (tool) => set({ activeTool: tool }),
+  setCanUndoOverlaps: (value) => set({ canUndoOverlaps: value }),
   setProjectName: (name) => set((state) => ({ project: { ...state.project, name } })),
   appendLog: (message, level = 'info') =>
     set((state) => ({
@@ -613,7 +628,9 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     // Keep the previous values so a rejected save can be rolled back and the UI does not show
     // text the server never stored.
     const before = get().transcript.find((segment) => segment.id === segmentId);
-    const previous = before ? { translation: before.translation, text: before.text, start: before.start, end: before.end } : null;
+    const previous = before
+      ? { translation: before.translation, text: before.text, start: before.start, end: before.end, gender: before.gender }
+      : null;
     get().patchSegmentLocal(segmentId, patch);
     let response: Response;
     try {
@@ -654,6 +671,9 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     const { audio } = await response.json();
     // Replace this line's audio only now that the backend has written the new clip.
     set((state) => ({
+      // The clip is served by index, so its URL does not change: bump the version
+      // to drop the audio element that still holds the previous recording.
+      dubAudioVersion: state.dubAudioVersion + 1,
       dubAudioSegments: [
         ...state.dubAudioSegments.filter((item) => item.id !== segmentId),
         {
@@ -973,6 +993,9 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       transcript: [],
       dubAudioSegments: [],
       mediaLibrary: [],
+      // A new project has no overlap backup and no cached dub clips.
+      canUndoOverlaps: false,
+      dubAudioVersion: 0,
       workflowSteps: initialWorkflowSteps.map((step) => ({ ...step })),
     });
     void get().refreshProjects();
@@ -1205,6 +1228,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     set((state) => ({
       project: { ...state.project, progress: 100, status: 'Ready' },
       dubbedVideoReady: Boolean(payload.export?.video_url),
+      // Export re-fits the clips (trim/speed), so any cached element holds stale audio.
+      dubAudioVersion: fitted ? state.dubAudioVersion + 1 : state.dubAudioVersion,
       dubAudioSegments: fitted
         ? fitted.map((segment: Record<string, unknown>, index: number) => ({
           id: String(segment.id ?? `dub-${index + 1}`),
@@ -1248,6 +1273,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       defaultExportFolder: null,
       exportFolder: null,
       separated: false,
+      canUndoOverlaps: false,
+      dubAudioVersion: 0,
       mediaLibrary: initialMedia,
       models: [],
       hardware: null,
@@ -1265,5 +1292,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       workflowSteps: initialWorkflowSteps.map((step) => ({ ...step })),
     });
   },
-  updateDubAudioSegments: (segments) => set({ dubAudioSegments: segments }),
+  updateDubAudioSegments: (segments) => set((state) => ({
+    dubAudioSegments: segments,
+    dubAudioVersion: state.dubAudioVersion + 1,
+  })),
 }));

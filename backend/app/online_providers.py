@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import base64
 import json
-import struct
 import urllib.error
 import urllib.request
 import wave
@@ -59,11 +58,24 @@ EMOTIONS = [
 ]
 
 
+def _auth_headers(url: str, key: str) -> dict[str, str]:
+    """Request headers with the provider's auth in the place it expects it.
+
+    Gemini takes its key in the query string (the callers append it), while every
+    OpenAI endpoint requires an `Authorization: Bearer <key>` header. Without it
+    every OpenAI call fails with 401.
+    """
+    headers = {'Content-Type': 'application/json'}
+    if url.startswith(OPENAI_BASE):
+        headers['Authorization'] = f'Bearer {key}'
+    return headers
+
+
 def _request_json(url: str, key: str, body: dict | None = None, timeout: int = 60) -> dict:
     request = urllib.request.Request(
         url,
         data=json.dumps(body).encode('utf-8') if body is not None else None,
-        headers={'Content-Type': 'application/json'},
+        headers=_auth_headers(url, key),
         method='POST' if body is not None else 'GET',
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -161,10 +173,11 @@ def openai_synthesize(key: str, text: str, out_path: str, model: str = OPENAI_DE
     body: dict = {'model': model, 'voice': voice, 'input': text, 'response_format': 'mp3', 'speed': speed}
     if instructions and 'gpt-4o' in model:
         body['instructions'] = instructions
+    speech_url = f'{OPENAI_BASE}/audio/speech'
     request = urllib.request.Request(
-        f'{OPENAI_BASE}/audio/speech',
+        speech_url,
         data=json.dumps(body).encode('utf-8'),
-        headers={'Content-Type': 'application/json'},
+        headers=_auth_headers(speech_url, key),
         method='POST',
     )
     try:

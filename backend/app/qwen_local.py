@@ -42,61 +42,21 @@ def is_installed() -> bool:
 
 def download_with_progress(progress_cb=None) -> None:
     """Blocking download of the Qwen3 4B GGUF file."""
-    from huggingface_hub import hf_hub_download
-    from tqdm import tqdm as base_tqdm
+    from .hf_progress import download_file
 
-    qwen_model_dir().mkdir(parents=True, exist_ok=True)
-    done = threading.Event()
+    target = qwen_model_dir()
+    target.mkdir(parents=True, exist_ok=True)
 
-    def on_fraction(fraction: float) -> None:
+    def on_progress(percent: int) -> None:
         if progress_cb:
-            progress_cb(min(99, int(fraction)))
+            progress_cb(min(99, percent))
 
-    bars: dict[int, dict] = {}
-    lock = threading.Lock()
-
-    class ReportingTqdm(base_tqdm):
-        def update(self, n=1):
-            result = super().update(n)
-            try:
-                with lock:
-                    bars[id(self)] = {'n': float(self.n or 0), 'total': float(self.total or 0)}
-                    done_sum = sum(entry['n'] for entry in bars.values())
-                    total = sum(entry['total'] for entry in bars.values())
-                if total > 0:
-                    on_fraction(100.0 * done_sum / total)
-            except Exception:
-                pass
-            return result
-
-        def close(self):
-            try:
-                with lock:
-                    entry = bars.get(id(self))
-                    if entry is not None:
-                        entry['n'] = entry['total']
-                        done_sum = sum(entry_['n'] for entry_ in bars.values())
-                        total = sum(entry_['total'] for entry_ in bars.values())
-                if total > 0:
-                    on_fraction(100.0 * done_sum / total)
-            except Exception:
-                pass
-            super().close()
-
-    def monitor() -> None:
-        while not done.is_set():
-            if progress_cb and qwen_model_file().exists():
-                progress_cb(99)
-            import time
-            time.sleep(1.0)
-
-    monitor_thread = threading.Thread(target=monitor, daemon=True)
-    monitor_thread.start()
-    try:
-        hf_hub_download(repo_id=QWEN_REPO, filename=QWEN_FILENAME, local_dir=str(qwen_model_dir()), tqdm_class=ReportingTqdm)
-    finally:
-        done.set()
-        monitor_thread.join(timeout=2)
+    download_file(
+        QWEN_REPO,
+        QWEN_FILENAME,
+        local_dir=target,
+        progress_cb=on_progress,
+    )
     if progress_cb:
         progress_cb(100)
 

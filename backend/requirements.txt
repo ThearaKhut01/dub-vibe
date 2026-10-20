@@ -2,6 +2,9 @@ fastapi==0.115.0
 uvicorn[standard]==0.32.0
 pydantic==2.9.2
 python-multipart==0.0.9
+# Direct dependency: model downloads are streamed with requests so progress comes
+# from the bytes actually received (see hf_progress.py).
+requests>=2.31
 faster-whisper==1.2.1
 edge-tts==7.2.7
 argostranslate>=1.9,<2
