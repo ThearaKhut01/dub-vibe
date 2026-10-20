@@ -73,7 +73,7 @@ class ProcessingRequest(BaseModel):
     beam_size: int = Field(default=5, ge=1, le=10)
     word_timestamps: bool = False
     # Translation engine: which provider goes first (the chain still falls back).
-    translation_provider: str = 'auto'   # auto | qwen | argos | google
+    translation_provider: str = 'auto'   # auto | qwen | nllb | argos | google | gemini | openai
     # Platform style: convert the export to a platform aspect ratio.
     # vertical = 9:16 (TikTok/Reels/Shorts), standard = 16:9 (YouTube/FB),
     # square = 1:1 (Instagram/FB feed). 'blur' fills the frame with a blurred

@@ -59,10 +59,12 @@ from backend.app import acting, api_keys, cuda_pack, model_manager, online_provi
 from backend.app import segment_tts
 from backend.app.models import ProjectRequest, ProjectSummary, ProviderSettings, ProcessingRequest, SegmentSplit, SegmentUpdate, WorkflowProgress
 from backend.app.providers import (
+    EDGE_LANGUAGE_VOICES,
     FasterWhisperProvider,
     HybridTranslationProvider,
     _resolve_lang_code,
     edge_gender_voice,
+    edge_voice_options,
     get_app_root,
     get_provider_status,
     get_storage_dir,
@@ -602,7 +604,7 @@ async def remove_provider_key(provider: str) -> dict[str, Any]:
 
 @app.post('/api/providers/{provider}/test')
 async def test_provider(provider: str) -> dict[str, Any]:
-    """Live connection test: lists the provider's real TTS models."""
+    """Live connection test: lists the provider's real TTS and translation models."""
     if provider not in api_keys.PROVIDERS:
         raise HTTPException(status_code=404, detail=f'Unknown provider: {provider}')
     key = api_keys.get_key(provider)
@@ -610,16 +612,25 @@ async def test_provider(provider: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=f'No API key stored for {provider}. Save a key first.')
     try:
         if provider == 'gemini':
-            from backend.app.online_providers import gemini_test
+            from backend.app.online_providers import gemini_test, gemini_text_test
 
             result = await run_in_threadpool(gemini_test, key)
+            text = await run_in_threadpool(gemini_text_test, key)
         else:
-            from backend.app.online_providers import openai_test
+            from backend.app.online_providers import openai_test, openai_text_test
 
             result = await run_in_threadpool(openai_test, key)
+            text = await run_in_threadpool(openai_text_test, key)
     except Exception as error:
         raise HTTPException(status_code=502, detail=f'{provider} connection failed: {error}') from error
-    return {'status': 'ok', 'connected': True, 'provider': provider, 'tts_models': result.get('models', [])}
+    return {
+        'status': 'ok',
+        'connected': True,
+        'provider': provider,
+        'tts_models': result.get('models', []),
+        # The same key drives translation, so report the text models too.
+        'translation_models': text.get('models', []),
+    }
 
 
 @app.get('/api/tts/capabilities')
@@ -642,6 +653,12 @@ async def tts_capabilities(model: str | None = None) -> dict[str, Any]:
         },
         'edge': {
             'voices': [],  # served by Edge TTS' own language voice table
+            # The UI offers exactly the voices Edge TTS has for the chosen
+            # language (Khmer: male + female), so a pick never changes voice.
+            'voices_by_language': {
+                language: edge_voice_options(language)
+                for language in dict.fromkeys(language for language, _ in EDGE_LANGUAGE_VOICES)
+            },
             'emotions': [],  # no real acting control
             'style_control': False,
             'languages': ['en', 'km', 'fr', 'es', 'zh', 'ja', 'ko', 'th', 'vi', 'de', 'pt', 'ru', 'ar', 'hi', 'id'],

@@ -52,7 +52,7 @@ interface StudioState {
    */
   dubAudioVersion: number;
   providerKeys: { gemini: { has_key: boolean }; openai: { has_key: boolean } };
-  voiceCapabilities: Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean }> & { emotions?: string[] };
+  voiceCapabilities: Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean; voices_by_language?: Record<string, Array<{ id: string; label: string; voice: string; gender: string }>> }> & { emotions?: string[] };
   characters: { speakers: string[]; characters: Record<string, Record<string, unknown>> };
   workflowSteps: WorkflowStep[];
   mediaLibrary: MediaAsset[];
@@ -93,7 +93,7 @@ interface StudioState {
   refreshVoiceConfig: () => Promise<void>;
   setProviderKey: (provider: string, key: string) => Promise<void>;
   removeProviderKey: (provider: string) => Promise<void>;
-  testProvider: (provider: string) => Promise<{ models: string[] }>;
+  testProvider: (provider: string) => Promise<{ models: string[]; translationModels: string[] }>;
   previewLine: (payload: { text: string; provider: string; voice?: string; model?: string; emotion: string; intensity: number; speed?: number; language: string }) => Promise<string>;
   refreshCharacters: () => Promise<void>;
   saveCharacters: (characters: Record<string, Record<string, unknown>>) => Promise<void>;
@@ -797,7 +797,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     try {
       const [keys, capabilities] = await Promise.all([
         readJson<{ gemini: { has_key: boolean }; openai: { has_key: boolean } }>('/api/providers/keys').catch(() => null),
-        readJson<Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean }> & { emotions?: string[] }>('/api/tts/capabilities').catch(() => null),
+        readJson<Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean; voices_by_language?: Record<string, Array<{ id: string; label: string; voice: string; gender: string }>> }> & { emotions?: string[] }>('/api/tts/capabilities').catch(() => null),
       ]);
       set({
         providerKeys: keys ?? get().providerKeys,
@@ -832,7 +832,10 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       throw new Error(payload.detail ?? `Connection test failed (HTTP ${response.status})`);
     }
     await get().refreshVoiceConfig();
-    return { models: payload.tts_models ?? [] };
+    return {
+      models: payload.tts_models ?? [],
+      translationModels: payload.translation_models ?? [],
+    };
   },
   previewLine: async (payload) => {
     const response = await fetch(`${apiBase}/api/tts/preview`, {

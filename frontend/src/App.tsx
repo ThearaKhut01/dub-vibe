@@ -68,6 +68,37 @@ const trackLabels = ['Video', 'Original Speech', 'Translation', 'Dubbed Voice', 
 
 const apiBaseUrl = import.meta.env.DEV ? '' : 'http://127.0.0.1:8001';
 
+/** Target languages with their ISO code (the code the capability tables use). */
+const TARGET_LANGUAGES: Array<{ name: string; code: string }> = [
+  { name: 'Khmer', code: 'km' },
+  { name: 'English', code: 'en' },
+  { name: 'French', code: 'fr' },
+  { name: 'Spanish', code: 'es' },
+  { name: 'Chinese', code: 'zh' },
+  { name: 'Japanese', code: 'ja' },
+  { name: 'Korean', code: 'ko' },
+  { name: 'Thai', code: 'th' },
+  { name: 'Vietnamese', code: 'vi' },
+  { name: 'German', code: 'de' },
+  { name: 'Portuguese', code: 'pt' },
+  { name: 'Russian', code: 'ru' },
+  { name: 'Arabic', code: 'ar' },
+  { name: 'Hindi', code: 'hi' },
+  { name: 'Indonesian', code: 'id' },
+];
+
+/** Engine order used when the engine is "Auto" (mirrors tts_service.QUALITY_ORDER). */
+const VOICE_ENGINE_ORDER = ['gemini', 'openai', 'edge', 'voxcpm2', 'sapi5'] as const;
+
+const VOICE_ENGINE_LABELS: Record<string, string> = {
+  gemini: 'Google Gemini TTS',
+  openai: 'OpenAI TTS',
+  edge: 'Edge TTS',
+  voxcpm2: 'VoxCPM2',
+  voxcpm_clone: 'VoxCPM2 Voice Clone',
+  sapi5: 'System TTS',
+};
+
 /** Map the backend's audio_segments rows to the timeline's dub segments. */
 const toDubSegments = (rows: Array<Record<string, unknown>>): import('./types').TimelineSegment[] =>
   rows.map((row, index) => ({
@@ -175,7 +206,7 @@ function App() {
   const [videoUrl, setVideoUrl] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
-  const [targetLanguage, setTargetLanguage] = useState('Khmer');
+  const [targetLanguage, setTargetLanguage] = useState(() => localStorage.getItem('dubvibe-target-language') ?? 'Khmer');
   const [selectedVoice, setSelectedVoice] = useState(() => localStorage.getItem('dubvibe-voice') ?? 'Male Voice A');
   const [chunkSelection, setChunkSelection] = useState('2');
   const [apiAvailable, setApiAvailable] = useState<boolean | null>(null);
@@ -990,6 +1021,8 @@ function App() {
         qwen: 'qwen',
         argos: 'argos_translate',
         google: 'google_translate',
+        gemini: 'gemini',
+        openai: 'openai',
       };
       if (activeTranslateEngine && engineRows[activeTranslateEngine]) {
         return new Set([engineRows[activeTranslateEngine]]);
@@ -1083,7 +1116,12 @@ function App() {
     setKeyTestMessage('');
     try {
       const result = await testProvider(provider);
-      setKeyTestMessage(`${provider}: connected — ${result.models.length} TTS models available`);
+      const voiceCount = result.models.length;
+      const translationCount = result.translationModels.length;
+      setKeyTestMessage(
+        `${provider}: connected — ${voiceCount} TTS model${voiceCount === 1 ? '' : 's'} and `
+        + `${translationCount} translation model${translationCount === 1 ? '' : 's'} available`,
+      );
       if (provider === 'gemini') {
         setGeminiModels(result.models);
         localStorage.setItem('dubvibe-gemini-models', JSON.stringify(result.models));
@@ -1113,13 +1151,13 @@ function App() {
     const fallbackLine = transcript.find((segment) => segment.translation)?.translation ?? transcript[0]?.text ?? '';
     const text = previewText.trim() || fallbackLine;
     if (!text) { setNotice('Enter a line to preview (or transcribe a video first).'); return; }
-    const provider = ttsProvider === 'auto' ? 'edge' : ttsProvider;
     setPreviewBusy(true);
     try {
       const audio = await previewLine({
         text,
-        provider,
-        voice: ttsProvider === 'gemini' || ttsProvider === 'openai' || selectedVoice === 'mixed' ? undefined : selectedVoice,
+        // Preview the engine that will actually run, with the voice picked for it.
+        provider: effectiveVoiceEngine,
+        voice: selectedVoice === 'mixed' || selectedVoice === 'auto' ? undefined : selectedVoice,
         model: ttsModel || undefined,
         emotion: voiceEmotion,
         intensity: voiceIntensity,
@@ -1134,23 +1172,77 @@ function App() {
     }
   };
 
-  const voiceOptionsFor = (provider: string): Array<{ id: string; label: string }> => {
-    if (provider === 'gemini') return (voiceCapabilities.gemini?.voices ?? []).map((v) => ({ id: v.id, label: `${v.id} (${v.style})` }));
-    if (provider === 'openai') return (voiceCapabilities.openai?.voices ?? []).map((v) => ({ id: v.id, label: `${v.id} (${v.style})` }));
-    if (provider === 'edge' || provider === 'auto') {
-      const generic = [
-        { id: 'Male Voice A', label: 'Male Voice A' },
-        { id: 'Female Voice B', label: 'Female Voice B' },
-        { id: 'Narrator Voice', label: 'Narrator Voice' },
-      ];
-      if (targetLanguage === 'Khmer') {
-        generic.push({ id: 'km-KH-SreymomNeural', label: 'Sreymom — Khmer female' });
-        generic.push({ id: 'km-KH-PisethNeural', label: 'Piseth — Khmer male' });
-      }
-      return generic;
-    }
-    return [{ id: 'auto', label: 'System voice' }];
+  const languageCodeOf = (language: string): string =>
+    TARGET_LANGUAGES.find((entry) => entry.name === language)?.code ?? language.toLowerCase().slice(0, 2);
+
+  const engineHasCredentials = (engine: string): boolean => {
+    if (engine === 'gemini') return providerKeys.gemini.has_key;
+    if (engine === 'openai') return providerKeys.openai.has_key;
+    return true;
   };
+
+  const engineSupportsLanguage = (engine: string, language: string): boolean => {
+    const caps = voiceCapabilities[engine];
+    if (!caps) return engine === 'edge' || engine === 'sapi5';
+    return caps.languages.includes(languageCodeOf(language));
+  };
+
+  // The engine that will actually synthesize this project: the explicit pick, or
+  // the first usable engine in quality order (keys + model + language support).
+  const effectiveVoiceEngine = useMemo(() => {
+    if (ttsProvider !== 'auto') return ttsProvider;
+    const usable = VOICE_ENGINE_ORDER.find((engine) => engineHasCredentials(engine)
+      && engineSupportsLanguage(engine, targetLanguage)
+      && !(engine === 'voxcpm2' && voiceCapabilities.voxcpm2?.installed === false));
+    return usable ?? 'edge';
+  }, [ttsProvider, targetLanguage, providerKeys, voiceCapabilities]);
+
+  /** Voices the engine really has for this language — never a hardcoded list. */
+  const voiceOptionsFor = (engine: string, language: string): Array<{ id: string; label: string }> => {
+    const resolved = engine === 'auto' ? effectiveVoiceEngine : engine;
+    if (resolved === 'gemini' || resolved === 'openai') {
+      return (voiceCapabilities[resolved]?.voices ?? []).map((voice) => ({ id: voice.id, label: `${voice.id} (${voice.style})` }));
+    }
+    if (resolved === 'edge') {
+      const byLanguage = voiceCapabilities.edge?.voices_by_language ?? {};
+      const voices = byLanguage[language] ?? [];
+      if (voices.length > 0) return voices.map((voice) => ({ id: voice.id, label: voice.label }));
+      return [{ id: 'auto', label: 'Default voice for this language' }];
+    }
+    if (resolved === 'sapi5') return [{ id: 'auto', label: 'System voice (offline)' }];
+    return [{ id: 'auto', label: "The model's own voice (no choice)" }];
+  };
+
+  const selectableVoices = voiceOptionsFor(ttsProvider, targetLanguage);
+  const canMixVoices = selectableVoices.length > 1;
+  const voiceChoiceIsValid = selectedVoice === 'mixed'
+    ? canMixVoices
+    : selectableVoices.some((voice) => voice.id === selectedVoice);
+
+  // Keep the saved voice valid when the engine or target language changes
+  // (e.g. Edge + Khmer has no "Narrator" voice).
+  useEffect(() => {
+    if (Object.keys(voiceCapabilities).length === 0) return; // capabilities not loaded yet
+    if (voiceChoiceIsValid) return;
+    const fallback = selectableVoices[0]?.id ?? 'auto';
+    setSelectedVoice(fallback);
+    localStorage.setItem('dubvibe-voice', fallback);
+  }, [voiceChoiceIsValid, selectableVoices, voiceCapabilities]);
+
+  const voiceHint = useMemo(() => {
+    const engine = VOICE_ENGINE_LABELS[effectiveVoiceEngine] ?? effectiveVoiceEngine;
+    // Name the model that will actually run, so the voice list is explainable.
+    const engineWithModel = ttsModel && (effectiveVoiceEngine === 'gemini' || effectiveVoiceEngine === 'openai')
+      ? `${engine} · ${ttsModel}`
+      : engine;
+    if (selectableVoices.length === 0) {
+      return `${engineWithModel} has no voices listed for ${targetLanguage}. Test the connection in API Settings.`;
+    }
+    if (selectableVoices.length === 1) {
+      return `${engineWithModel} · ${targetLanguage} — this engine has no voice choice.`;
+    }
+    return `${selectableVoices.length} voice${selectableVoices.length === 1 ? '' : 's'} available · ${engineWithModel} · ${targetLanguage}`;
+  }, [effectiveVoiceEngine, selectableVoices, targetLanguage, ttsModel]);
 
   const providerCaps = ttsProvider && ttsProvider !== 'auto' ? voiceCapabilities[ttsProvider] : null;
   // VoxCPM2 is verified for English only; picking it for another target would silently use Edge.
@@ -2371,153 +2463,6 @@ function App() {
             </div>
             <div className="space-y-4">
               <div>
-                <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Voice</label>
-                <select value={selectedVoice} onChange={(event) => { setSelectedVoice(event.target.value); localStorage.setItem('dubvibe-voice', event.target.value); }} className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200">
-                  <option value="mixed">Mixed — male &amp; female</option>
-                  <option>Male Voice A</option>
-                  <option>Female Voice B</option>
-                  <option>Narrator Voice</option>
-                </select>
-                {selectedVoice === 'mixed' && (
-                  <p className="mt-1 text-[10px] text-slate-500">Alternates male and female voices at conversation pauses. For exact per-person voices, run Detect speakers.</p>
-                )}
-              </div>
-              <div>
-                <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Target language</label>
-                <select value={targetLanguage} onChange={(event) => setTargetLanguage(event.target.value)} className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200">
-                  <option>Khmer</option>
-                  <option>English</option>
-                  <option>French</option>
-                  <option>Spanish</option>
-                  <option>Chinese</option>
-                  <option>Japanese</option>
-                  <option>Korean</option>
-                  <option>Thai</option>
-                  <option>Vietnamese</option>
-                  <option>German</option>
-                  <option>Portuguese</option>
-                  <option>Russian</option>
-                  <option>Arabic</option>
-                  <option>Hindi</option>
-                  <option>Indonesian</option>
-                </select>
-              </div>
-              <div>
-                <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Translation engine</label>
-                <select
-                  value={translationProvider}
-                  onChange={(event) => { setTranslationProvider(event.target.value); localStorage.setItem('dubvibe-translation-provider', event.target.value); }}
-                  className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200"
-                >
-                  <option value="auto">Qwen3 4B (local) — default</option>
-                  <option value="nllb" disabled={!nllbModel?.installed}>
-                    {nllbModel?.installed ? 'NLLB-200 (offline)' : 'NLLB-200 (offline) — download in AI Models'}
-                  </option>
-                  <option value="argos">Argos Translate (offline)</option>
-                  <option value="google">Google Translate (online)</option>
-                </select>
-                <p className="mt-1 text-[10px] text-slate-500">If the selected engine fails on a line, the next best engine takes over automatically.</p>
-              </div>
-              <div className="border-t border-white/10 pt-3">
-                <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Video chunking</label>
-                <select value={chunkSelection} onChange={(event) => setChunkSelection(event.target.value)} className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200">
-                  <option value="">Off — dub the whole video</option>
-                  <option value="1">Auto-cut into 1-minute parts</option>
-                  <option value="2">Auto-cut into 2-minute parts</option>
-                  <option value="3">Auto-cut into 3-minute parts</option>
-                  <option value="4">Auto-cut into 4-minute parts</option>
-                  <option value="5">Auto-cut into 5-minute parts</option>
-                  <option value="10">Auto-cut into 10-minute parts</option>
-                  <option value="15">Auto-cut into 15-minute parts</option>
-                </select>
-                {videoChunks.length > 0 && (
-                  <p className="mt-1 text-[10px] text-slate-400">
-                    {videoChunks.length} parts · {Math.round((chunkSeconds ?? 0) / 60)} min each · timeline shows the part markers
-                  </p>
-                )}
-                {videoChunks.length > 0 && (
-                  <div className="mt-2 flex flex-wrap gap-1">
-                    {videoChunks.map((chunk) => {
-                      const dubbed = dubAudioSegments.some((segment) => segment.start >= chunk.start && segment.start < chunk.start + chunk.duration);
-                      return (
-                        <span
-                          key={`chip-${chunk.index}`}
-                          title={`Part ${chunk.index} · ${formatTimecode(chunk.start)}${dubbed ? ' · dubbed' : ' · not dubbed yet'}`}
-                          className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${dubbed
-                            ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200'
-                            : 'border-white/10 bg-slate-900 text-slate-400'
-                            }`}
-                        >
-                          P{chunk.index}{dubbed ? ' ✓' : ''}
-                        </span>
-                      );
-                    })}
-                  </div>
-                )}
-                <button
-                  onClick={() => void handleChunk()}
-                  disabled={busy || apiAvailable !== true || !hasMedia}
-                  className="mt-2 w-full rounded-lg border border-white/10 bg-slate-800 px-3 py-2 text-xs font-medium text-slate-200 hover:border-sky-500/50 hover:bg-slate-700 transition disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  {busy ? 'Working...' : videoChunks.length === 0
-                    ? chunkSelection ? 'Split video now' : 'No split needed'
-                    : chunkSelection ? 'Re-split with new length' : 'Remove split'}
-                </button>
-                <p className="mt-1 text-[10px] leading-4 text-slate-500">
-                  Long videos are cut into parts before dubbing, so transcription and dubbing run chunk by chunk with the original timeline preserved. START DUBBING splits automatically when a length is selected.
-                </p>
-              </div>
-              <div className="border-t border-white/10 pt-3">
-                <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Audio separation</label>
-                {separated ? (
-                  <p className="text-xs leading-4 text-emerald-300">
-                    ✓ Original dialogue is replaced by the dub. Choose which layers stay in the mix — they duck automatically during dialogue and recover after.
-                  </p>
-                ) : (
-                  <p className="text-[10px] leading-4 text-slate-500">
-                    Split the original audio into voice vs. music vs. sound effects/ambience (runs locally with Demucs). First run downloads the model; separation takes a while on CPU.
-                  </p>
-                )}
-                {separated && (
-                  <div className="mt-2 space-y-1.5">
-                    <label className="flex items-center gap-2 text-xs text-slate-300">
-                      <input
-                        type="checkbox"
-                        checked={keepSfx}
-                        onChange={(event) => {
-                          setKeepSfx(event.target.checked);
-                          localStorage.setItem('dubvibe-keep-sfx', String(event.target.checked));
-                          setExportFiles(null);
-                        }}
-                        className="h-4 w-4 accent-sky-500"
-                      />
-                      Original sound effects &amp; ambience
-                    </label>
-                    <label className="flex items-center gap-2 text-xs text-slate-300">
-                      <input
-                        type="checkbox"
-                        checked={keepMusic}
-                        onChange={(event) => {
-                          setKeepMusic(event.target.checked);
-                          localStorage.setItem('dubvibe-keep-music', String(event.target.checked));
-                          setExportFiles(null);
-                        }}
-                        className="h-4 w-4 accent-sky-500"
-                      />
-                      Original music
-                    </label>
-                    <p className="text-[10px] text-slate-500">Original dialogue: OFF — replaced by the AI dubbed voice.</p>
-                  </div>
-                )}
-                <button
-                  onClick={() => void handleSeparate()}
-                  disabled={busy || apiAvailable !== true || !hasMedia}
-                  className="mt-2 w-full rounded-lg border border-white/10 bg-slate-800 px-3 py-2 text-xs font-medium text-slate-200 hover:border-sky-500/50 hover:bg-slate-700 transition disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  {busy ? 'Working...' : separated ? 'Re-extract voice & effects' : 'Extract voice & effects'}
-                </button>
-              </div>
-              <div className="border-t border-white/10 pt-3">
                 <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Voice engine &amp; acting</label>
                 <select
                   value={ttsProvider}
@@ -2540,6 +2485,13 @@ function App() {
                   </option>
                   <option value="sapi5">System TTS (offline)</option>
                 </select>
+                <p className="mt-1 text-[10px] leading-4 text-slate-500">
+                  {ttsProvider === 'auto'
+                    ? `Auto runs ${VOICE_ENGINE_LABELS[effectiveVoiceEngine] ?? effectiveVoiceEngine} for ${targetLanguage}.`
+                    : engineSupportsLanguage(ttsProvider, targetLanguage)
+                      ? `Dubs ${targetLanguage} with ${VOICE_ENGINE_LABELS[ttsProvider] ?? ttsProvider}${ttsModel ? ` · ${ttsModel}` : ''}.`
+                      : `${VOICE_ENGINE_LABELS[ttsProvider] ?? ttsProvider} does not list ${targetLanguage}; the dub falls back to another engine.`}
+                </p>
                 {ttsProvider === 'gemini' && (
                   geminiModels.length ? (
                     <select
@@ -2652,6 +2604,164 @@ function App() {
                   </div>
                 </div>
               </div>
+              <div>
+                <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Target language</label>
+                <select
+                  value={targetLanguage}
+                  onChange={(event) => {
+                    setTargetLanguage(event.target.value);
+                    localStorage.setItem('dubvibe-target-language', event.target.value);
+                  }}
+                  className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200"
+                >
+                  {TARGET_LANGUAGES.map((language) => (
+                    <option key={language.code} value={language.name}>{language.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Voice</label>
+                <select
+                  value={voiceChoiceIsValid ? selectedVoice : selectableVoices[0]?.id ?? ''}
+                  onChange={(event) => { setSelectedVoice(event.target.value); localStorage.setItem('dubvibe-voice', event.target.value); }}
+                  className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200"
+                >
+                  {canMixVoices && <option value="mixed">Mixed — male &amp; female</option>}
+                  {selectableVoices.map((voice) => (
+                    <option key={voice.id} value={voice.id}>{voice.label}</option>
+                  ))}
+                </select>
+                <p className="mt-1 text-[10px] leading-4 text-slate-500">{voiceHint}</p>
+                {selectedVoice === 'mixed' && (
+                  <p className="mt-1 text-[10px] text-slate-500">Alternates male and female voices at conversation pauses. For exact per-person voices, run Detect speakers.</p>
+                )}
+              </div>
+              <div>
+                <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Translation engine</label>
+                <select
+                  value={translationProvider}
+                  onChange={(event) => { setTranslationProvider(event.target.value); localStorage.setItem('dubvibe-translation-provider', event.target.value); }}
+                  className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200"
+                >
+                  <option value="auto">Qwen3 4B (local) — default</option>
+                  <option value="nllb" disabled={!nllbModel?.installed}>
+                    {nllbModel?.installed ? 'NLLB-200 (offline)' : 'NLLB-200 (offline) — download in AI Models'}
+                  </option>
+                  <option value="argos">Argos Translate (offline)</option>
+                  <option value="google">Google Translate (online)</option>
+                  <option value="gemini" disabled={!providerKeys.gemini.has_key}>
+                    Google Gemini (online){providerKeys.gemini.has_key ? ' — key configured' : ' — add a key in API Settings'}
+                  </option>
+                  <option value="openai" disabled={!providerKeys.openai.has_key}>
+                    OpenAI (online){providerKeys.openai.has_key ? ' — key configured' : ' — add a key in API Settings'}
+                  </option>
+                </select>
+                <p className="mt-1 text-[10px] leading-4 text-slate-500">
+                  {translationProvider === 'gemini' || translationProvider === 'openai'
+                    ? 'Paid engine: every translated line is a billed API request. Uses the same key as the voice engine.'
+                    : 'Local engines are free. Paid API keys are only used when you pick that engine — Auto never spends money.'}
+                  {' '}If the selected engine fails on a line, the next best engine takes over automatically.
+                </p>
+              </div>
+              <div className="border-t border-white/10 pt-3">
+                <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Video chunking</label>
+                <select value={chunkSelection} onChange={(event) => setChunkSelection(event.target.value)} className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200">
+                  <option value="">Off — dub the whole video</option>
+                  <option value="1">Auto-cut into 1-minute parts</option>
+                  <option value="2">Auto-cut into 2-minute parts</option>
+                  <option value="3">Auto-cut into 3-minute parts</option>
+                  <option value="4">Auto-cut into 4-minute parts</option>
+                  <option value="5">Auto-cut into 5-minute parts</option>
+                  <option value="10">Auto-cut into 10-minute parts</option>
+                  <option value="15">Auto-cut into 15-minute parts</option>
+                </select>
+                {videoChunks.length > 0 && (
+                  <p className="mt-1 text-[10px] text-slate-400">
+                    {videoChunks.length} parts · {Math.round((chunkSeconds ?? 0) / 60)} min each · timeline shows the part markers
+                  </p>
+                )}
+                {videoChunks.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {videoChunks.map((chunk) => {
+                      const dubbed = dubAudioSegments.some((segment) => segment.start >= chunk.start && segment.start < chunk.start + chunk.duration);
+                      return (
+                        <span
+                          key={`chip-${chunk.index}`}
+                          title={`Part ${chunk.index} · ${formatTimecode(chunk.start)}${dubbed ? ' · dubbed' : ' · not dubbed yet'}`}
+                          className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${dubbed
+                            ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200'
+                            : 'border-white/10 bg-slate-900 text-slate-400'
+                            }`}
+                        >
+                          P{chunk.index}{dubbed ? ' ✓' : ''}
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+                <button
+                  onClick={() => void handleChunk()}
+                  disabled={busy || apiAvailable !== true || !hasMedia}
+                  className="mt-2 w-full rounded-lg border border-white/10 bg-slate-800 px-3 py-2 text-xs font-medium text-slate-200 hover:border-sky-500/50 hover:bg-slate-700 transition disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {busy ? 'Working...' : videoChunks.length === 0
+                    ? chunkSelection ? 'Split video now' : 'No split needed'
+                    : chunkSelection ? 'Re-split with new length' : 'Remove split'}
+                </button>
+                <p className="mt-1 text-[10px] leading-4 text-slate-500">
+                  Long videos are cut into parts before dubbing, so transcription and dubbing run chunk by chunk with the original timeline preserved. START DUBBING splits automatically when a length is selected.
+                </p>
+              </div>
+              <div className="border-t border-white/10 pt-3">
+                <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Audio separation</label>
+                {separated ? (
+                  <p className="text-xs leading-4 text-emerald-300">
+                    ✓ Original dialogue is replaced by the dub. Choose which layers stay in the mix — they duck automatically during dialogue and recover after.
+                  </p>
+                ) : (
+                  <p className="text-[10px] leading-4 text-slate-500">
+                    Split the original audio into voice vs. music vs. sound effects/ambience (runs locally with Demucs). First run downloads the model; separation takes a while on CPU.
+                  </p>
+                )}
+                {separated && (
+                  <div className="mt-2 space-y-1.5">
+                    <label className="flex items-center gap-2 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={keepSfx}
+                        onChange={(event) => {
+                          setKeepSfx(event.target.checked);
+                          localStorage.setItem('dubvibe-keep-sfx', String(event.target.checked));
+                          setExportFiles(null);
+                        }}
+                        className="h-4 w-4 accent-sky-500"
+                      />
+                      Original sound effects &amp; ambience
+                    </label>
+                    <label className="flex items-center gap-2 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={keepMusic}
+                        onChange={(event) => {
+                          setKeepMusic(event.target.checked);
+                          localStorage.setItem('dubvibe-keep-music', String(event.target.checked));
+                          setExportFiles(null);
+                        }}
+                        className="h-4 w-4 accent-sky-500"
+                      />
+                      Original music
+                    </label>
+                    <p className="text-[10px] text-slate-500">Original dialogue: OFF — replaced by the AI dubbed voice.</p>
+                  </div>
+                )}
+                <button
+                  onClick={() => void handleSeparate()}
+                  disabled={busy || apiAvailable !== true || !hasMedia}
+                  className="mt-2 w-full rounded-lg border border-white/10 bg-slate-800 px-3 py-2 text-xs font-medium text-slate-200 hover:border-sky-500/50 hover:bg-slate-700 transition disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {busy ? 'Working...' : separated ? 'Re-extract voice & effects' : 'Extract voice & effects'}
+                </button>
+              </div>
               <div className="border-t border-white/10 pt-3">
                 <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Characters</label>
                 {characters.speakers.length === 0 ? (
@@ -2663,7 +2773,7 @@ function App() {
                       const edit = charEdits[name] ?? {};
                       const charProvider = edit.provider ?? saved.provider ?? 'auto';
                       const currentVoice = edit.voice ?? saved.voice ?? '';
-                      const options = voiceOptionsFor(charProvider);
+                      const options = voiceOptionsFor(charProvider, targetLanguage);
                       // Gender auto-assign stores neural ids; always show the
                       // saved voice even when it is not in the standard list.
                       if (currentVoice && !options.some((voice) => voice.id === currentVoice)) {
@@ -3059,7 +3169,11 @@ function App() {
             <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
               <div>
                 <h2 className="text-lg font-semibold">Online AI Providers</h2>
-                <p className="text-xs text-slate-500">Keys are stored in Windows Credential Manager — never in the browser.</p>
+                <p className="text-xs text-slate-500">
+                  Keys are stored in Windows Credential Manager — never in the browser. Each key enables both
+                  <span className="text-slate-300"> dubbing (TTS)</span> and
+                  <span className="text-slate-300"> translation</span> with that provider.
+                </p>
               </div>
               <button onClick={() => setShowApiKeys(false)} className="rounded p-1 text-slate-500 hover:text-white transition">✕</button>
             </div>
@@ -3109,14 +3223,17 @@ function App() {
                         </button>
                       )}
                     </div>
-                    {provider === 'gemini' && configured && (
-                      <p className="mt-1.5 text-[10px] text-slate-500">
-                        Get a key at aistudio.google.com/apikey. Gemini TTS does not officially list Khmer — Khmer dubbing falls back to Edge TTS.
+                    {provider === 'gemini' && (
+                      <p className="mt-1.5 text-[10px] leading-4 text-slate-500">
+                        Get a key at aistudio.google.com/apikey. Translation into any app language (Khmer included)
+                        works; Gemini <span className="text-slate-400">TTS</span> does not officially list Khmer, so Khmer
+                        dubbing falls back to Edge TTS.
                       </p>
                     )}
                     {provider === 'openai' && (
-                      <p className="mt-1.5 text-[10px] text-slate-500">
+                      <p className="mt-1.5 text-[10px] leading-4 text-slate-500">
                         This is the OpenAI <span className="text-slate-400">API</span> key from platform.openai.com — your ChatGPT subscription is not used here.
+                        It powers OpenAI voice dubbing, translation, acting analysis, and the translation review pass.
                       </p>
                     )}
                   </div>

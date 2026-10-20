@@ -423,12 +423,107 @@ class GoogleTranslateProvider(TranslationProvider):
         ) from last_error
 
 
+class OnlineLLMTranslationProvider(TranslationProvider):
+    """Base for the paid online engines: one line in, one translation out.
+
+    Both hosted LLMs support every language this app offers (Khmer included), which
+    is why they are not gated on the TTS language tables. The prompt mirrors the
+    local Qwen engine so switching engines keeps the same dubbing style.
+    """
+
+    ENGINE = ''
+    DEFAULT_MODEL = ''
+
+    def __init__(self, style_hint: str | None = None) -> None:
+        self.style_hint = style_hint
+
+    def _provider_label(self) -> str:
+        return self.ENGINE.capitalize()
+
+    def _key(self) -> str:
+        from . import api_keys
+
+        key = api_keys.get_key(self.ENGINE)
+        if not key:
+            raise RuntimeError(
+                f'{self._provider_label()} API key is not configured '
+                '(add it in API Settings to translate with this engine).'
+            )
+        return key
+
+    def _messages(self, text: str, target_language: str, source_language: str) -> list[dict]:
+        system = (
+            'You are a professional subtitle translator for movie dubbing. '
+            f"Translate the user's line from {source_language} to {target_language}. "
+            'Keep it natural, spoken, and concise — like real movie dialogue. '
+            'Preserve tone and emotion. Respond ONLY with the translation, no notes.'
+        )
+        if self.style_hint:
+            system += f' Character/style direction: {self.style_hint}'
+        return [
+            {'role': 'system', 'content': system},
+            {'role': 'user', 'content': text},
+        ]
+
+    def _complete(self, messages: list[dict], key: str) -> str:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
+        if not str(text or '').strip():
+            return ''
+        result = self._complete(self._messages(text, target_language, source_language), self._key())
+        cleaned = str(result or '').strip().strip('"“”').strip()
+        if not cleaned:
+            raise RuntimeError(f'{self._provider_label()} returned an empty translation')
+        return cleaned
+
+
+class GeminiTranslationProvider(OnlineLLMTranslationProvider):
+    """Google Gemini text translation through the stored Gemini API key."""
+
+    ENGINE = 'gemini'
+
+    def _complete(self, messages: list[dict], key: str) -> str:
+        from .online_providers import GEMINI_DEFAULT_CHAT_MODEL, gemini_chat
+
+        return gemini_chat(key, messages, model=GEMINI_DEFAULT_CHAT_MODEL)
+
+    @staticmethod
+    def is_available() -> bool:
+        from . import api_keys
+
+        return api_keys.has_key('gemini')
+
+
+class OpenAITranslationProvider(OnlineLLMTranslationProvider):
+    """OpenAI text translation through the stored OpenAI API key."""
+
+    ENGINE = 'openai'
+
+    def _complete(self, messages: list[dict], key: str) -> str:
+        from .online_providers import OPENAI_DEFAULT_CHAT_MODEL, openai_chat
+
+        return openai_chat(key, messages, model=OPENAI_DEFAULT_CHAT_MODEL)
+
+    @staticmethod
+    def is_available() -> bool:
+        from . import api_keys
+
+        return api_keys.has_key('openai')
+
+
+# Every language the app offers is supported by the hosted LLMs (unlike their TTS
+# voices, which do not officially list Khmer).
+ONLINE_TRANSLATION_ENGINES = ('gemini', 'openai')
+
+
 class HybridTranslationProvider(TranslationProvider):
     """Translation chain with a user-selectable first choice.
 
-    Default order: Qwen3 4B (local LLM) -> Argos (offline) -> Google (online).
-    ``preference`` moves one engine to the front; the rest keep the order as
-    fallbacks so a failed request never leaves a line untranslated.
+    Default (``auto``) order stays local/free: Qwen3 4B -> Argos -> Google, plus
+    Gemini -> OpenAI when their keys exist but only if explicitly chosen, so
+    configuring a key never silently bills the user for translation.
+    ``preference`` moves one engine to the front; the rest stay as fallbacks.
     """
 
     def __init__(self, style_hint: str | None = None, preference: str = 'auto') -> None:
@@ -436,8 +531,26 @@ class HybridTranslationProvider(TranslationProvider):
         self._nllb: TranslationProvider | None = None
         self._offline: TranslationProvider | None = None
         self._online = GoogleTranslateProvider()
+        # Paid engines are instantiated only when a key exists; the key is read
+        # again per call, so adding a key takes effect without a restart.
+        self._gemini: TranslationProvider | None = None
+        self._openai: TranslationProvider | None = None
         self._mode: str = 'online'
-        self._preference = preference if preference in ('qwen', 'nllb', 'argos', 'google') else 'auto'
+        self._preference = preference if preference in (
+            'qwen', 'nllb', 'argos', 'google', *ONLINE_TRANSLATION_ENGINES,
+        ) else 'auto'
+
+        try:
+            if GeminiTranslationProvider.is_available():
+                self._gemini = GeminiTranslationProvider(style_hint)
+        except Exception as error:
+            logger.info('Gemini translation unavailable: %s', error)
+
+        try:
+            if OpenAITranslationProvider.is_available():
+                self._openai = OpenAITranslationProvider(style_hint)
+        except Exception as error:
+            logger.info('OpenAI translation unavailable: %s', error)
 
         try:
             from . import qwen_local
@@ -470,9 +583,18 @@ class HybridTranslationProvider(TranslationProvider):
 
     def _chain(self) -> list[tuple[str, TranslationProvider]]:
         """Available providers, preference first, each entry at most once."""
-        # NLLB is opt-in: it is not in the Auto order, so Auto behaves as before.
+        # Auto stays local/free: a configured key is used only when the user picks
+        # that engine, so translation never costs money by surprise. NLLB is opt-in
+        # for the same reason (it is not in the Auto order).
         order = ([self._preference] if self._preference != 'auto' else []) + ['qwen', 'argos', 'google']
-        available = {'qwen': self._qwen, 'nllb': self._nllb, 'argos': self._offline, 'google': self._online}
+        available = {
+            'qwen': self._qwen,
+            'nllb': self._nllb,
+            'argos': self._offline,
+            'google': self._online,
+            'gemini': self._gemini,
+            'openai': self._openai,
+        }
         chain: list[tuple[str, TranslationProvider]] = []
         for key in order:
             provider = available.get(key)
@@ -481,7 +603,7 @@ class HybridTranslationProvider(TranslationProvider):
         return chain
 
     def first_engine(self) -> str | None:
-        """Key of the engine that will be tried first ('qwen', 'nllb', 'argos', 'google') or None."""
+        """Key of the first engine tried ('qwen', 'nllb', 'argos', 'google', 'gemini', 'openai')."""
         chain = self._chain()
         return chain[0][0] if chain else None
 
@@ -492,6 +614,14 @@ class HybridTranslationProvider(TranslationProvider):
         Google is never checked here because it is the online last resort.
         """
         if self._preference == 'auto' or self._preference == 'google':
+            return
+        if self._preference in ONLINE_TRANSLATION_ENGINES:
+            provider = self._gemini if self._preference == 'gemini' else self._openai
+            if provider is None:
+                label = 'Gemini' if self._preference == 'gemini' else 'OpenAI'
+                raise RuntimeError(
+                    f'{label} API key is not configured. Add it in API Settings or choose another engine.'
+                )
             return
         if self._preference == 'argos':
             if self._offline is None:
@@ -515,7 +645,10 @@ class HybridTranslationProvider(TranslationProvider):
                     raise RuntimeError(f'{error}. Choose Google Translate or another engine.') from error
 
     def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
-        modes = {'qwen': 'qwen', 'nllb': 'nllb', 'argos': 'offline', 'google': 'online'}
+        modes = {
+            'qwen': 'qwen', 'nllb': 'nllb', 'argos': 'offline', 'google': 'online',
+            'gemini': 'gemini', 'openai': 'openai',
+        }
         last_error: Exception | None = None
         for key, provider in self._chain():
             try:
@@ -698,6 +831,23 @@ def edge_gender_voice(language: str, gender: str) -> str | None:
     return EDGE_LANGUAGE_VOICES.get((language, label))
 
 
+def edge_voice_options(language: str) -> list[dict[str, str]]:
+    """Every Edge voice that really speaks `language`, in display order.
+
+    The list is derived from EDGE_LANGUAGE_VOICES (the table the synthesizer
+    resolves against), so the UI can only offer voices that will actually speak
+    the target language — Khmer has a male and a female voice, never "Narrator".
+    """
+    options: list[dict[str, str]] = []
+    for (lang, label), neural in EDGE_LANGUAGE_VOICES.items():
+        if lang != language:
+            continue
+        lowered = label.lower()
+        gender = 'Female' if 'female' in lowered else 'Male' if 'male' in lowered else 'Any'
+        options.append({'id': label, 'label': label, 'voice': neural, 'gender': gender})
+    return options
+
+
 class EdgeTTSProvider(TextToSpeechProvider):
     async def synthesize(self, text: str, voice: str, output_path: str, language: str) -> dict:
         import edge_tts
@@ -875,6 +1025,22 @@ def get_provider_status() -> list[dict]:
             'connected': True,
             'primary': not argos_ok,
             'fallback': argos_ok,
+        },
+        {
+            'id': 'gemini',
+            'name': 'Google Gemini (translation, TTS)',
+            'mode': 'PAID API',
+            'connected': GeminiTranslationProvider.is_available(),
+            'primary': False,
+            'fallback': GeminiTranslationProvider.is_available(),
+        },
+        {
+            'id': 'openai',
+            'name': 'OpenAI (translation, TTS)',
+            'mode': 'PAID API',
+            'connected': OpenAITranslationProvider.is_available(),
+            'primary': False,
+            'fallback': OpenAITranslationProvider.is_available(),
         },
         {
             'id': 'speaker-diarization',
