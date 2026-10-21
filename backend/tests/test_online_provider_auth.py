@@ -6,6 +6,7 @@ fake transport so a regression fails here instead of at the provider.
 """
 from __future__ import annotations
 
+import io
 import json
 import ssl
 import urllib.error
@@ -14,6 +15,16 @@ import urllib.request
 import pytest
 
 from backend.app import online_providers
+
+
+@pytest.fixture(autouse=True)
+def _fresh_online_state(monkeypatch):
+    """Process-wide caches must not leak between tests (or write to the real data dir)."""
+    monkeypatch.setattr(online_providers, '_billing_blocked_until', {})
+    monkeypatch.setattr(online_providers, '_codecraft_dead_models', {})
+    monkeypatch.setattr(online_providers, '_codecraft_model_cache', {})
+    monkeypatch.setattr(online_providers, '_codecraft_catalog_cache', {})
+    monkeypatch.setattr(online_providers, '_save_model_cache', lambda *args, **kwargs: None)
 
 
 class _FakeResponse:
@@ -212,13 +223,14 @@ def _quota_402(url: str) -> urllib.error.HTTPError:
 
 
 def test_codecraft_402_parks_the_engine_after_one_request(monkeypatch):
-    """A dead allowance must cost one request, not one per subtitle line."""
-    calls: list[int] = []
-    monkeypatch.setattr(online_providers, '_billing_blocked_until', {})
+    """A dead allowance must cost one chat request, not one per subtitle line."""
+    chat_calls: list[str] = []
 
-    def fake_request(*args, **kwargs):
-        calls.append(1)
-        raise _quota_402('https://codecraftapi.com/v1/chat/completions')
+    def fake_request(url, key, body=None, timeout=60):
+        if url.endswith('/models'):
+            return {'data': [{'id': 'deepseek-v4-flash-0731', 'type': 'chat'}]}
+        chat_calls.append(str((body or {}).get('model')))
+        raise _quota_402(url)
 
     monkeypatch.setattr(online_providers, '_request_json', fake_request)
     messages = [{'role': 'user', 'content': 'hi'}]
@@ -226,7 +238,76 @@ def test_codecraft_402_parks_the_engine_after_one_request(monkeypatch):
         online_providers.codecraft_chat('cc-123', messages)
     with pytest.raises(RuntimeError, match='no remaining allowance'):
         online_providers.codecraft_chat('cc-123', messages)
-    assert len(calls) == 1
+    assert len(chat_calls) == 1
+
+
+def test_codecraft_walks_the_catalog_when_a_model_is_retired(monkeypatch):
+    """A 404 on the default model must not fail the line; the winner is remembered."""
+    used: list[str] = []
+
+    def fake_request(url, key, body=None, timeout=60):
+        if url.endswith('/models'):
+            return {'data': [
+                {'id': 'dead-model', 'type': 'chat', 'pricing': {'input_per_1k': 0.0001}},
+                {'id': 'live-model', 'type': 'chat', 'pricing': {'input_per_1k': 0.0002}},
+            ]}
+        used.append(str(body['model']))
+        if body['model'] == 'dead-model':
+            raise urllib.error.HTTPError(url, 404, 'model not found', {}, io.BytesIO(b'{}'))
+        return {'choices': [{'message': {'content': 'Bonjour'}}]}
+
+    monkeypatch.setattr(online_providers, '_request_json', fake_request)
+    messages = [{'role': 'user', 'content': 'hi'}]
+    assert online_providers.codecraft_chat('cc-123', messages, model='dead-model') == 'Bonjour'
+    assert used == ['dead-model', 'live-model']
+    # Second line goes straight to the winner; the dead name is never asked again.
+    assert online_providers.codecraft_chat('cc-123', messages, model='dead-model') == 'Bonjour'
+    assert used == ['dead-model', 'live-model', 'live-model']
+
+
+def test_codecraft_fallback_order_prefers_cheap_families(monkeypatch):
+    """The catalog has no prices, so the fallback must not lead with Opus-class models."""
+    payload = {'data': [
+        {'id': 'claude-opus-5'},
+        {'id': 'gemini-3.1-pro'},
+        {'id': 'gemini-3.6-flash'},
+        {'id': 'qwen3.8-max'},
+        {'id': 'gemma-2-2b'},
+        {'id': 'seed-2.1-turbo'},
+    ]}
+    assert online_providers._codecraft_ranked_models(payload) == [
+        'gemini-3.6-flash', 'gemma-2-2b', 'seed-2.1-turbo',
+        'claude-opus-5', 'gemini-3.1-pro', 'qwen3.8-max',
+    ]
+
+
+def test_codecraft_default_model_is_tried_first_and_the_walk_is_bounded(monkeypatch):
+    def fake_request(url, key, body=None, timeout=60):
+        return {'data': [{'id': 'claude-opus-5'}, *({'id': 'm%d' % i} for i in range(20))]}
+
+    monkeypatch.setattr(online_providers, '_request_json', fake_request)
+    candidates = online_providers.codecraft_text_model_candidates(
+        'cc-123', online_providers.CODECRAFT_DEFAULT_CHAT_MODEL
+    )
+    assert candidates[0] == online_providers.CODECRAFT_DEFAULT_CHAT_MODEL
+    assert len(candidates) == online_providers._CODECRAFT_MAX_MODEL_ATTEMPTS
+
+
+def test_codecraft_429_stops_the_walk(monkeypatch):
+    """The rate limit applies to the key, so trying other models just adds load."""
+    used: list[str] = []
+
+    def fake_request(url, key, body=None, timeout=60):
+        if url.endswith('/models'):
+            return {'data': [{'id': 'a-model', 'type': 'chat'}, {'id': 'b-model', 'type': 'chat'}]}
+        used.append(str(body['model']))
+        raise urllib.error.HTTPError(url, 429, 'Too Many Requests', {},
+                                     io.BytesIO(b'{"error":{"message":"Rate limit exceeded"}}'))
+
+    monkeypatch.setattr(online_providers, '_request_json', fake_request)
+    with pytest.raises(RuntimeError, match='CodeCraft translation failed'):
+        online_providers.codecraft_chat('cc-123', [{'role': 'user', 'content': 'hi'}])
+    assert len(used) == 1
 
 
 def test_successful_codecraft_call_clears_a_parked_engine(monkeypatch):

@@ -77,6 +77,23 @@ _gemini_text_model_cache: dict[str, str] = {}
 # key -> models that timed out or 404'd, skipped once measured.
 _gemini_dead_models: dict[str, set[str]] = {}
 
+# CodeCraft (OpenAI-compatible) keeps the same three facts, per key fingerprint:
+# the model that last worked, the models this key rejected, and a short-lived
+# copy of the catalog so a subtitle line does not re-fetch /models every time.
+_codecraft_model_cache: dict[str, str] = {}
+_codecraft_dead_models: dict[str, set[str]] = {}
+_codecraft_catalog_cache: dict[str, tuple[float, list[str]]] = {}
+_CODECRAFT_CATALOG_TTL_SECONDS = 600.0
+# Model names retire without notice, so a line walks a few alternatives. Bounded
+# on purpose: a fully broken catalog must not turn one line into 30 requests.
+_CODECRAFT_MAX_MODEL_ATTEMPTS = 5
+# The catalog publishes no prices, so fallbacks prefer these name families: they
+# are the cheap/fast variants, and a fallback must not pick an Opus-class model.
+# Matched as whole hyphen/dot-separated tokens: "gemini-3.1-pro" must not count as
+# "mini", which substring matching got wrong.
+_CODECRAFT_CHEAP_MARKERS = frozenset({'flash', 'mini', 'turbo', 'lite', 'small', 'nano', '2b'})
+_CODECRAFT_EXPENSIVE_MARKERS = frozenset({'opus', 'pro', 'max', 'ultra'})
+
 
 def _model_cache_path():
     """Where the working translation model is remembered between app starts.
@@ -109,7 +126,12 @@ def _load_model_cache() -> None:
     if not isinstance(raw, dict):
         return
     for cache_key, model in raw.items():
-        if isinstance(cache_key, str) and isinstance(model, str) and model:
+        if not (isinstance(cache_key, str) and isinstance(model, str) and model):
+            continue
+        if cache_key.startswith('codecraft:'):
+            # Namespaced so a CodeCraft model name is never handed to Gemini.
+            _codecraft_model_cache.setdefault(cache_key.split(':', 1)[1], model)
+        else:
             _gemini_text_model_cache.setdefault(cache_key, model)
 
 
@@ -667,70 +689,137 @@ def codecraft_list_models(key: str) -> list[str]:
     return sorted(str(entry['id']) for entry in _codecraft_chat_entries(payload))
 
 
-def _codecraft_fallback_model(key: str) -> str | None:
-    """The cheapest listed chat model, used when the preferred name is retired."""
-    try:
-        payload = _request_json(f'{CODECRAFT_BASE}/models', key)
-    except Exception:
-        return None
-    entries = _codecraft_chat_entries(payload)
-    if not entries:
-        return None
+def _codecraft_ranked_models(payload: dict) -> list[str]:
+    """Fallback order for the key's chat models.
 
-    def rank(entry: dict) -> tuple[float, str]:
+    The live /v1/models payload carries no pricing (only id/object/owned_by), so
+    price cannot decide the order. Cheap/fast model families go first instead of
+    alphabetically first, because a retired default must not silently fall back
+    to the most expensive model in the catalog. If the API ever exposes pricing,
+    it takes priority over the name heuristics.
+    """
+
+    def rank(entry: dict) -> tuple[float, int, int, str]:
         pricing = entry.get('pricing') or {}
         try:
             price = float(pricing.get('input_per_1k') or 0.0)
         except (TypeError, ValueError):
             price = 0.0
-        return price, str(entry.get('id'))
+        name = str(entry.get('id') or '')
+        tokens = set(re.split(r'[^a-z0-9]+', name.lower()))
+        cheap = 0 if tokens & _CODECRAFT_CHEAP_MARKERS else 1
+        expensive = 1 if tokens & _CODECRAFT_EXPENSIVE_MARKERS else 0
+        return (price, cheap, expensive, name.lower())
 
-    return str(sorted(entries, key=rank)[0]['id'])
+    return [str(entry['id']) for entry in sorted(_codecraft_chat_entries(payload), key=rank)]
+
+
+def _codecraft_catalog(key: str) -> list[str]:
+    """The key's chat models, cheapest first, cached briefly per key.
+
+    Without the cache every subtitle line would pay an extra GET /models just to
+    learn that nothing changed, doubling the request count against a 60/min limit.
+    """
+    cache_key = _model_cache_key(key)
+    cached = _codecraft_catalog_cache.get(cache_key)
+    if cached is not None and cached[0] > time.monotonic():
+        return cached[1]
+    try:
+        payload = _request_json(f'{CODECRAFT_BASE}/models', key)
+    except Exception:
+        return []
+    names = _codecraft_ranked_models(payload if isinstance(payload, dict) else {})
+    if names:
+        _codecraft_catalog_cache[cache_key] = (
+            time.monotonic() + _CODECRAFT_CATALOG_TTL_SECONDS, names
+        )
+    return names
+
+
+def codecraft_text_model_candidates(key: str, preferred: str | None = None) -> list[str]:
+    """Models to try for one line: the last winner, then the default, then cheap."""
+
+    cache_key = _model_cache_key(key)
+    dead = _codecraft_dead_models.setdefault(cache_key, set())
+    ordered = [_codecraft_model_cache.get(cache_key), preferred, *_codecraft_catalog(key)]
+    candidates: list[str] = []
+    for name in ordered:
+        if not name or name in dead or name in candidates:
+            continue
+        candidates.append(name)
+        if len(candidates) >= _CODECRAFT_MAX_MODEL_ATTEMPTS:
+            break
+    return candidates
 
 
 def codecraft_chat(key: str, messages: list[dict], model: str = CODECRAFT_DEFAULT_CHAT_MODEL,
                    timeout: int = 90) -> str:
     """One-shot chat completion on the CodeCraft API (OpenAI-compatible shape).
 
-    A retired model name returns 404; that case retries once with the cheapest
-    chat model the key can actually use, so a catalog change never fails a run.
+    Model names retire without notice, so a line walks the key's catalog instead
+    of trusting one name: the last model that worked, then the default, then the
+    cheapest listed models. The walk is bounded, and two failures stop it early
+    because another model cannot help:
+
+    - 402: the account has no allowance, so every model answers the same; the
+      engine is parked and the fallback engine takes the line.
+    - 429: the limit applies to the key, not one model, so switching models only
+      adds load.
     """
-    url = f'{CODECRAFT_BASE}/chat/completions'
-    body: dict = {'model': model, 'messages': messages}
     parked = _billing_parked('codecraft', 'CodeCraft')
     if parked is not None:
         raise parked
-    try:
-        payload = _request_json(url, key, body, timeout=timeout)
-    except urllib.error.HTTPError as error:
-        if error.code == 402:
-            # No allowance on the account: one request is enough to learn that.
-            raise _park_billing_error('codecraft', error, 'CodeCraft') from error
-        if error.code != 404:
-            raise RuntimeError(f'CodeCraft translation failed ({_http_error_detail(error)})') from error
-        fallback = _codecraft_fallback_model(key)
-        if not fallback or fallback == model:
-            raise RuntimeError(
-                f'CodeCraft model "{model}" is unavailable ({_http_error_detail(error)})'
-            ) from error
-        body['model'] = fallback
+    url = f'{CODECRAFT_BASE}/chat/completions'
+    cache_key = _model_cache_key(key)
+    dead = _codecraft_dead_models.setdefault(cache_key, set())
+    last_error: Exception | None = None
+    for candidate in codecraft_text_model_candidates(key, model):
+        body = {'model': candidate, 'messages': messages}
         try:
             payload = _request_json(url, key, body, timeout=timeout)
-        except urllib.error.HTTPError as retry_error:
-            if retry_error.code == 402:
-                raise _park_billing_error('codecraft', retry_error, 'CodeCraft') from retry_error
-            raise RuntimeError(
-                f'CodeCraft translation failed ({_http_error_detail(retry_error)})'
-            ) from retry_error
-    _clear_billing_block('codecraft')
-    try:
-        content = payload['choices'][0]['message']['content']
-    except (KeyError, IndexError, TypeError) as error:
-        raise RuntimeError(f'CodeCraft returned no completion: {json.dumps(payload)[:200]}') from error
-    text = str(content or '').strip()
-    if not text:
-        raise RuntimeError('CodeCraft returned an empty completion')
-    return text
+        except urllib.error.HTTPError as error:
+            if error.code == 402:
+                # No allowance on the account: one request is enough to learn that.
+                raise _park_billing_error('codecraft', error, 'CodeCraft') from error
+            last_error = RuntimeError(
+                f'CodeCraft translation failed ({_http_error_detail(error)})'
+            )
+            if error.code == 429:
+                raise last_error from error
+            if error.code in (400, 403, 404):
+                # This model is not usable with this key: never ask for it again.
+                dead.add(candidate)
+                _codecraft_model_cache.pop(cache_key, None)
+            # 5xx: a server-side problem with this model; keep it for next time.
+            continue
+        except (TimeoutError, OSError) as error:
+            # Unresponsive model: skip it for the rest of the process.
+            last_error = error
+            dead.add(candidate)
+            _codecraft_model_cache.pop(cache_key, None)
+            continue
+        try:
+            content = payload['choices'][0]['message']['content']
+        except (KeyError, IndexError, TypeError):
+            last_error = RuntimeError(
+                f'CodeCraft returned no completion: {json.dumps(payload)[:200]}'
+            )
+            continue
+        text = str(content or '').strip()
+        if not text:
+            last_error = RuntimeError(f'CodeCraft model "{candidate}" returned an empty completion')
+            continue
+        _codecraft_model_cache[cache_key] = candidate
+        dead.discard(candidate)
+        _save_model_cache(f'codecraft:{cache_key}', candidate)
+        _clear_billing_block('codecraft')
+        return text
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(
+        'No CodeCraft chat model could be used with this key. Restart the app to '
+        're-probe the catalog, or choose another translation engine.'
+    )
 
 
 def codecraft_text_test(key: str) -> dict:
