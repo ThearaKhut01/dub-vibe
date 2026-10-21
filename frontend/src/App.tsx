@@ -20,25 +20,15 @@ import {
   FolderOpen,
   Save,
   RefreshCw,
-  ZoomIn,
-  ZoomOut,
-  Maximize2,
-  Volume2,
-  VolumeX,
-  Eye,
-  EyeOff,
-  Lock,
-  Unlock,
   SkipBack,
   SkipForward,
-  Film,
-  Layers,
   FilePlus,
   Trash2,
   Wand2,
 } from 'lucide-react';
 import { useStudioStore } from './store/useStudioStore';
 import { DubbingTrackEditor } from './components/DubbingTrackEditor';
+import { TimelineEditor } from './components/TimelineEditor';
 import type { ProjectSummary, OverlapProposal, FixOverlapsResponse } from './types';
 
 const toolActions = [
@@ -261,14 +251,6 @@ function App() {
   // EDIT MODE: timeline segment editing
   const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<{ text: string; translation: string; start: number; end: number } | null>(null);
-  const segmentDragRef = useRef<{ id: string; kind: 'move' | 'trim-l' | 'trim-r'; startX: number; origStart: number; origEnd: number } | null>(null);
-  const [segmentDragging, setSegmentDragging] = useState(false);
-
-  // EDIT MODE: cut-range selection on the ruler (drag a span, then remove it
-  // or keep only it — the backend rewrites the media and shifts the timeline).
-  const [rangeSelectMode, setRangeSelectMode] = useState(false);
-  const [selectedRange, setSelectedRange] = useState<{ start: number; end: number } | null>(null);
-  const isDraggingRangeRef = useRef(false);
   const [cutBusy, setCutBusy] = useState(false);
 
   // Auto-Fix Speech Overlaps state
@@ -277,55 +259,10 @@ function App() {
   const [fixError, setFixError] = useState<string | null>(null);
     const [fixOverlapsFound, setFixOverlapsFound] = useState(0);
 
-  const beginSegmentDrag = (event: React.PointerEvent, segment: { id: string; start: number; end: number }, kind: 'move' | 'trim-l' | 'trim-r') => {
-    if (mode !== 'EDIT' || busy) return;
-    event.stopPropagation();
-    event.preventDefault();
-    segmentDragRef.current = { id: segment.id, kind, startX: event.clientX, origStart: segment.start, origEnd: segment.end };
-    setSegmentDragging(true);
-
-    const onMove = (moveEvent: PointerEvent) => {
-      const info = segmentDragRef.current;
-      if (!info) return;
-      const deltaSec = (moveEvent.clientX - info.startX) / pixelsPerSecond;
-      const live = useStudioStore.getState().transcript.find((item) => item.id === info.id);
-      if (!live) return;
-      const minLen = 0.2;
-      const maxEnd = videoDuration || projectDurationSeconds;
-      if (kind === 'move') {
-        const duration = info.origEnd - info.origStart;
-        const newStart = Math.max(0, Math.min(maxEnd - duration, info.origStart + deltaSec));
-        patchSegmentLocal(info.id, { start: Number(newStart.toFixed(2)), end: Number((newStart + duration).toFixed(2)) });
-      } else if (kind === 'trim-l') {
-        const newStart = Math.max(0, Math.min(info.origEnd - minLen, info.origStart + deltaSec));
-        patchSegmentLocal(info.id, { start: Number(newStart.toFixed(2)) });
-      } else {
-        const newEnd = Math.max(info.origStart + minLen, Math.min(maxEnd, info.origEnd + deltaSec));
-        patchSegmentLocal(info.id, { end: Number(newEnd.toFixed(2)) });
-      }
-    };
-
-    const onUp = (upEvent: PointerEvent) => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      setSegmentDragging(false);
-      const info = segmentDragRef.current;
-      segmentDragRef.current = null;
-      if (!info) return;
-      const moved = Math.abs(upEvent.clientX - info.startX) > 4;
-      const fresh = useStudioStore.getState().transcript.find((item) => item.id === info.id);
-      if (moved && fresh) {
-        void updateSegment(project.id, info.id, { start: fresh.start, end: fresh.end }).catch((error) =>
-          setNotice(error instanceof Error ? error.message : 'Could not save the new timing.'),
-        );
-      } else if (!moved && kind === 'move') {
-        setEditingSegmentId(info.id);
-        if (fresh) setEditDraft({ text: fresh.text, translation: fresh.translation, start: fresh.start, end: fresh.end });
-      }
-    };
-
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
+  const openSegmentEditor = (segmentId: string) => {
+    const fresh = useStudioStore.getState().transcript.find((item) => item.id === segmentId);
+    setEditingSegmentId(segmentId);
+    if (fresh) setEditDraft({ text: fresh.text, translation: fresh.translation, start: fresh.start, end: fresh.end });
   };
 
   const handleSaveSegmentEdit = async () => {
@@ -384,12 +321,8 @@ function App() {
   const [dubbedTime, setDubbedTime] = useState(0);
   const [dubbedDuration, setDubbedDuration] = useState(0);
   const [dubbedPlaying, setDubbedPlaying] = useState(false);
-  const [timelineZoom, setTimelineZoom] = useState(1.5);
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
-  const timelineRulerRef = useRef<HTMLDivElement>(null);
-  const timelineScrollContainerRef = useRef<HTMLDivElement>(null);
   const dubAudioRefs = useRef<Map<string, HTMLAudioElement>>(new Map());
   const logScrollRef = useRef<HTMLDivElement>(null);
   const [trackStates, setTrackStates] = useState<Record<string, { muted: boolean; hidden: boolean; locked: boolean }>>({
@@ -407,34 +340,6 @@ function App() {
     const maxEnd = Math.max(0, ...transcript.map((s) => s.end), ...dubAudioSegments.map((s) => s.end));
     return Math.max(1, parsed, maxEnd);
   }, [videoDuration, project.duration, transcript, dubAudioSegments]);
-
-  const pixelsPerSecond = useMemo(() => {
-    return Math.max(25, 45 * timelineZoom);
-  }, [timelineZoom]);
-
-  const timelineContentWidth = useMemo(() => {
-    return Math.max(1200, projectDurationSeconds * pixelsPerSecond);
-  }, [projectDurationSeconds, pixelsPerSecond]);
-
-  const playheadPosition = useMemo(() => {
-    return (currentTime / projectDurationSeconds) * timelineContentWidth;
-  }, [currentTime, projectDurationSeconds, timelineContentWidth]);
-
-  const rulerTicks = useMemo(() => {
-    const step = timelineZoom >= 3 ? 1 : timelineZoom >= 1.5 ? 2 : timelineZoom >= 1 ? 5 : 10;
-    const majorStep = timelineZoom >= 3 ? 5 : timelineZoom >= 1.5 ? 10 : 30;
-    const ticks: Array<{ time: number; position: number; isMajor: boolean; label: string }> = [];
-    const totalSecs = Math.ceil(projectDurationSeconds);
-    for (let t = 0; t <= totalSecs; t += step) {
-      const position = (t / projectDurationSeconds) * timelineContentWidth;
-      const isMajor = t % majorStep === 0;
-      const m = Math.floor(t / 60);
-      const s = Math.floor(t % 60);
-      const label = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-      ticks.push({ time: t, position, isMajor, label });
-    }
-    return ticks;
-  }, [projectDurationSeconds, timelineContentWidth, timelineZoom]);
 
   const handleRefresh = async () => {
     setIsRefreshing(true);
@@ -600,67 +505,19 @@ function App() {
     clearDubAudio();
   }, [project.id, dubAudioSegments.length, dubAudioVersion]);
 
-  const handleRulerMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const clickX = e.clientX - rect.left;
-    const targetTime = (clickX / timelineContentWidth) * projectDurationSeconds;
-    if (mode === 'EDIT' && rangeSelectMode && !cutBusy) {
-      // Range selection: this drag draws a span instead of scrubbing.
-      isDraggingRangeRef.current = true;
-      setSelectedRange({ start: Math.max(0, Math.min(targetTime, projectDurationSeconds)), end: Math.max(0, Math.min(targetTime, projectDurationSeconds)) });
-      return;
-    }
-    setIsDraggingPlayhead(true);
-    seekTo(targetTime);
-  };
-
-  useEffect(() => {
-    if (!rangeSelectMode) return;
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!isDraggingRangeRef.current || !timelineRulerRef.current) return;
-      const rect = timelineRulerRef.current.getBoundingClientRect();
-      const clickX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
-      const targetTime = (clickX / timelineContentWidth) * projectDurationSeconds;
-      setSelectedRange((current) => (current ? { ...current, end: Math.max(0, Math.min(targetTime, projectDurationSeconds)) } : current));
-    };
-    const handleMouseUp = () => {
-      if (!isDraggingRangeRef.current) return;
-      isDraggingRangeRef.current = false;
-      setSelectedRange((current) => {
-        if (!current) return null;
-        const start = Math.min(current.start, current.end);
-        const end = Math.max(current.start, current.end);
-        // A click with no drag clears the selection.
-        return end - start < 0.15 ? null : { start, end };
-      });
-    };
-    window.addEventListener('mousemove', handleMouseMove);
-    window.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mouseup', handleMouseUp);
-    };
-  }, [rangeSelectMode, timelineContentWidth, projectDurationSeconds]);
-
-  useEffect(() => {
-    if (mode !== 'EDIT') {
-      setRangeSelectMode(false);
-      setSelectedRange(null);
-    }
-  }, [mode]);
-
-  const handleCutRange = async (cutMode: 'remove' | 'keep') => {
-    if (!selectedRange || !project.id) return;
+  const handleCutRange = async (range: { start: number; end: number }, cutMode: 'remove' | 'keep'): Promise<boolean> => {
+    if (!range || !project.id) return false;
     setCutBusy(true);
     setNotice(cutMode === 'remove' ? 'Cutting the selected range from the video…' : 'Trimming the video to the selected range…');
     try {
-      const result = await cutRange(selectedRange.start, selectedRange.end, cutMode);
-      setSelectedRange(null);
+      const result = await cutRange(range.start, range.end, cutMode);
       setImportedFile(null); // preview falls back to the re-written project media
       seekTo(0);
       setNotice(result.message ?? 'Cut applied.');
+      return true;
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Cutting failed.');
+      return false;
     } finally {
       setCutBusy(false);
     }
@@ -742,24 +599,15 @@ function App() {
   };
 
   useEffect(() => {
-    if (!isDraggingPlayhead) return;
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!timelineRulerRef.current) return;
-      const rect = timelineRulerRef.current.getBoundingClientRect();
-      const clickX = e.clientX - rect.left;
-      const targetTime = (clickX / timelineContentWidth) * projectDurationSeconds;
-      seekTo(targetTime);
-    };
-    const handleMouseUp = () => {
-      setIsDraggingPlayhead(false);
-    };
-    window.addEventListener('mousemove', handleMouseMove);
-    window.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mouseup', handleMouseUp);
-    };
-  }, [isDraggingPlayhead, timelineContentWidth, projectDurationSeconds]);
+    if (!isPlaying) return;
+    // Keep the displayed timecode responsive without re-rendering the studio
+    // at 60 fps: the timeline paints its own playhead from the video element.
+    const interval = window.setInterval(() => {
+      const video = videoRef.current;
+      if (video) setCurrentTime(video.currentTime);
+    }, 120);
+    return () => window.clearInterval(interval);
+  }, [isPlaying]);
 
   useEffect(() => {
     if (apiAvailable) void hydrateStudio();
@@ -1958,474 +1806,40 @@ function App() {
               />
             )}
 
-            {/* Dubbing track editor sits above the timeline */}
-            {/* CapCut Pro Timeline */}
-            <div className="timeline-container rounded-2xl border border-white/[0.08] bg-[#0c1220] p-0 shadow-2xl overflow-hidden">
-              {/* Timeline Header Controls */}
-              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] bg-[#0e1526] px-4 py-2.5">
-                <div className="flex items-center gap-3">
-                  <div className="flex items-center gap-2 text-sm font-semibold text-white">
-                    <Scissors size={16} className="text-sky-400" />
-                    <span>Timeline</span>
-                  </div>
-                  <span className="rounded-full bg-sky-500/10 px-2.5 py-0.5 text-[10px] font-medium text-sky-300 border border-sky-500/15">
-                    {transcript.length} clips
-                  </span>
-                  {videoChunks.length > 0 && (
-                    <span className="rounded-full bg-emerald-500/10 px-2.5 py-0.5 text-[10px] font-medium text-emerald-300 border border-emerald-500/15">
-                      {videoChunks.length} parts × {Math.round((chunkSeconds ?? 0) / 60)} min
-                    </span>
-                  )}
-
-                  {/* Playback Controls & Timecode */}
-                  <div className="ml-2 flex items-center gap-1.5 border-l border-white/[0.06] pl-3">
-                    <button
-                      onClick={() => seekTo(0)}
-                      title="Jump to Start"
-                      className="rounded p-1 text-slate-500 hover:bg-white/5 hover:text-white transition"
-                    >
-                      <SkipBack size={14} />
-                    </button>
-                    <button
-                      onClick={togglePlay}
-                      title={isPlaying ? 'Pause' : 'Play'}
-                      className="rounded-md bg-white/[0.06] p-1.5 text-white hover:bg-white/10 transition"
-                    >
-                      {isPlaying ? <Pause size={14} /> : <Play size={14} />}
-                    </button>
-                    <button
-                      onClick={() => seekTo(currentTime + 2)}
-                      title="Step forward"
-                      className="rounded p-1 text-slate-500 hover:bg-white/5 hover:text-white transition"
-                    >
-                      <SkipForward size={14} />
-                    </button>
-
-                    <div className="flex items-center gap-1 bg-black/30 px-2 py-1 rounded border border-white/[0.06] font-mono text-[11px]">
-                      <span className="font-semibold text-white">{formatTimecode(currentTime)}</span>
-                      <span className="text-slate-600">/</span>
-                      <span className="text-slate-500">{formatTimecode(projectDurationSeconds)}</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Timeline Zoom & Refresh Controls */}
-                <div className="flex items-center gap-2">
-                  <div className="flex items-center gap-1 rounded-md border border-white/[0.06] bg-black/20 px-2 py-1 text-xs text-slate-400">
-                    <button
-                      onClick={() => setTimelineZoom((z) => Math.max(0.5, z - 0.25))}
-                      title="Zoom Out"
-                      className="p-0.5 hover:text-white transition"
-                    >
-                      <ZoomOut size={12} />
-                    </button>
-                    <input
-                      type="range"
-                      min="0.5"
-                      max="5"
-                      step="0.25"
-                      value={timelineZoom}
-                      onChange={(e) => setTimelineZoom(Number(e.target.value))}
-                      className="timeline-zoom-slider h-1 w-16 cursor-pointer"
-                      title={`Zoom: ${timelineZoom.toFixed(2)}x`}
-                    />
-                    <button
-                      onClick={() => setTimelineZoom((z) => Math.min(5, z + 0.25))}
-                      title="Zoom In"
-                      className="p-0.5 hover:text-white transition"
-                    >
-                      <ZoomIn size={12} />
-                    </button>
-                    <button
-                      onClick={() => setTimelineZoom(1.0)}
-                      title="Fit to View"
-                      className="ml-0.5 p-0.5 text-slate-500 hover:text-white transition"
-                    >
-                      <Maximize2 size={11} />
-                    </button>
-                  </div>
-
-                  {/* Refresh Button */}
-                  <button
-                    onClick={() => void handleRefresh()}
-                    disabled={isRefreshing}
-                    title="Refresh studio state"
-                    className="flex items-center gap-1.5 rounded-md border border-white/[0.06] bg-white/[0.03] px-2.5 py-1.5 text-[11px] text-slate-400 hover:bg-white/[0.06] hover:text-white transition disabled:opacity-40"
-                  >
-                    <RefreshCw size={12} className={isRefreshing ? 'animate-spin-fast text-sky-400' : ''} />
-                    <span>{isRefreshing ? 'Refreshing...' : 'Refresh'}</span>
-                  </button>
-
-                  {/* Auto-Fix Speech Overlaps Button */}
-                  {mode === 'EDIT' && dubAudioSegments.length > 0 && (
-                    <button
-                      onClick={() => void handleFixOverlaps()}
-                      disabled={fixOverlapsState !== 'idle'}
-                      title="Detect and fix speech overlaps automatically"
-                      className="flex items-center gap-1.5 rounded-md border border-white/[0.06] bg-white/[0.03] px-2.5 py-1.5 text-[11px] text-slate-400 hover:bg-white/[0.06] hover:text-white transition disabled:opacity-40"
-                    >
-                      <Wand2 size={12} className={fixOverlapsState === 'analyzing' ? 'animate-spin-fast text-sky-400' : ''} />
-                      <span>{fixOverlapsState === 'analyzing' ? 'Analyzing…' : 'Auto-Fix Overlaps'}</span>
-                    </button>
-                  )}
-
-                  {mode === 'EDIT' && (
-                    <>
-                      <button
-                        onClick={() => { setRangeSelectMode((on) => !on); setSelectedRange(null); }}
-                        disabled={cutBusy}
-                        title="Drag on the ruler to select a time range, then cut it out or keep only it"
-                        className={`flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-[11px] transition disabled:opacity-40 ${rangeSelectMode
-                            ? 'border-amber-400/40 bg-amber-500/20 text-amber-200'
-                            : 'border-white/[0.06] bg-white/[0.03] text-slate-400 hover:bg-white/[0.06] hover:text-white'
-                          }`}
-                      >
-                        <Scissors size={12} />
-                        <span>{rangeSelectMode ? 'Selecting range…' : 'Cut range'}</span>
-                      </button>
-                      {selectedRange && (
-                        <div className="flex items-center gap-1.5 rounded-md border border-amber-400/30 bg-amber-500/10 px-2 py-1">
-                          <span className="font-mono text-[10px] text-amber-200">
-                            {formatTimecode(selectedRange.start)} → {formatTimecode(selectedRange.end)} ({(selectedRange.end - selectedRange.start).toFixed(1)}s)
-                          </span>
-                          <button
-                            onClick={() => void handleCutRange('remove')}
-                            disabled={cutBusy}
-                            title="Delete this range from the video; the rest shifts back"
-                            className="rounded bg-rose-500/80 px-2 py-1 text-[10px] font-semibold text-white hover:bg-rose-500 transition disabled:opacity-40"
-                          >
-                            {cutBusy ? 'Cutting…' : 'Cut out'}
-                          </button>
-                          <button
-                            onClick={() => void handleCutRange('keep')}
-                            disabled={cutBusy}
-                            title="Trim the video to only this range"
-                            className="rounded bg-sky-500/80 px-2 py-1 text-[10px] font-semibold text-white hover:bg-sky-500 transition disabled:opacity-40"
-                          >
-                            {cutBusy ? 'Trimming…' : 'Keep only'}
-                          </button>
-                          <button
-                            onClick={() => setSelectedRange(null)}
-                            disabled={cutBusy}
-                            className="rounded px-1.5 py-1 text-[10px] text-slate-400 hover:text-white transition disabled:opacity-40"
-                          >
-                            ✕
-                          </button>
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-              </div>
-
-              {/* CapCut Timeline Canvas */}
-              <div className="flex">
-                {/* Left Track Headers */}
-                <div className="w-40 shrink-0 border-r border-white/[0.06] bg-[#0b1018] z-20 select-none">
-                  {/* Ruler Corner */}
-                  <div className="flex h-7 items-center border-b border-white/[0.06] px-3 text-[9px] uppercase tracking-widest text-slate-600 font-semibold bg-black/20">
-                    <Layers size={10} className="mr-1.5 text-slate-600" /> Tracks
-                  </div>
-
-                  {/* Track Headers */}
-                  {[
-                    { name: 'Video', icon: Film, color: 'text-sky-400', num: 1 },
-                    { name: 'Original Speech', icon: Mic, color: 'text-indigo-400', num: 2 },
-                    { name: 'Translation', icon: Languages, color: 'text-emerald-400', num: 3 },
-                    { name: 'Dubbed Voice', icon: AudioLines, color: 'text-amber-400', num: 4 },
-                    { name: 'Subtitle', icon: SplitSquareVertical, color: 'text-rose-400', num: 5 },
-                  ].map((track) => (
-                    <div key={track.name} className="flex h-10 items-center justify-between border-b border-white/[0.04] px-2.5 text-[11px] hover:bg-white/[0.02] transition group">
-                      <div className="flex items-center gap-1.5 truncate">
-                        <track.icon size={13} className={`${track.color} shrink-0`} />
-                        <span className="truncate font-medium text-slate-300 group-hover:text-white transition">{track.name}</span>
-                      </div>
-                      <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                        {(track.name === 'Original Speech' || track.name === 'Dubbed Voice') ? (
-                          <button
-                            onClick={() => toggleTrackMute(track.name)}
-                            title={trackStates[track.name]?.muted ? 'Unmute' : 'Mute'}
-                            className={`p-0.5 rounded hover:bg-white/10 transition ${trackStates[track.name]?.muted ? 'text-rose-400 opacity-100' : 'text-slate-500'}`}
-                          >
-                            {trackStates[track.name]?.muted ? <VolumeX size={11} /> : <Volume2 size={11} />}
-                          </button>
-                        ) : (
-                          <button
-                            onClick={() => toggleTrackHide(track.name)}
-                            title={trackStates[track.name]?.hidden ? 'Show' : 'Hide'}
-                            className={`p-0.5 rounded hover:bg-white/10 transition ${trackStates[track.name]?.hidden ? 'text-amber-400 opacity-100' : 'text-slate-500'}`}
-                          >
-                            {trackStates[track.name]?.hidden ? <EyeOff size={11} /> : <Eye size={11} />}
-                          </button>
-                        )}
-                        <button
-                          onClick={() => toggleTrackLock(track.name)}
-                          title={trackStates[track.name]?.locked ? 'Unlock' : 'Lock'}
-                          className={`p-0.5 rounded hover:bg-white/10 transition ${trackStates[track.name]?.locked ? 'text-rose-400 opacity-100' : 'text-slate-600'}`}
-                        >
-                          {trackStates[track.name]?.locked ? <Lock size={10} /> : <Unlock size={10} />}
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                {/* Right Scrollable Canvas */}
-                <div
-                  ref={timelineScrollContainerRef}
-                  className="timeline-scrollbar overflow-x-auto relative flex-1 bg-[#080d17]"
-                >
-                  <div style={{ width: `${timelineContentWidth}px` }} className="relative select-none">
-                    {/* Time Ruler */}
-                    <div
-                      ref={timelineRulerRef}
-                      onMouseDown={handleRulerMouseDown}
-                      className={`relative h-7 border-b border-white/[0.06] overflow-hidden ${mode === 'EDIT' && rangeSelectMode ? 'bg-[#1a1408] cursor-crosshair' : 'bg-[#0a1020] cursor-pointer'}`}
-                      title={mode === 'EDIT' && rangeSelectMode ? 'Drag to select a range, then Cut out or Keep only' : 'Click or drag to scrub'}
-                    >
-                      {rulerTicks.map((tick) => (
-                        <div
-                          key={`tick-${tick.time}`}
-                          className="absolute top-0 flex flex-col items-center pointer-events-none"
-                          style={{ left: `${tick.position}px` }}
-                        >
-                          <div
-                            className={`w-px ${tick.isMajor ? 'h-3 bg-slate-500' : 'h-1.5 bg-slate-800'}`}
-                          />
-                          {tick.isMajor && (
-                            <span className="mt-0.5 font-mono text-[8px] text-slate-500 -translate-x-1/2">
-                              {tick.label}
-                            </span>
-                          )}
-                        </div>
-                      ))}
-                      {/* Selected cut range overlay */}
-                      {selectedRange && (
-                        <div
-                          className="absolute inset-y-0 z-10 pointer-events-none border-x-2 border-amber-400 bg-amber-400/25"
-                          style={{
-                            left: `${(Math.min(selectedRange.start, selectedRange.end) / projectDurationSeconds) * timelineContentWidth}px`,
-                            width: `${(Math.abs(selectedRange.end - selectedRange.start) / projectDurationSeconds) * timelineContentWidth}px`,
-                          }}
-                        />
-                      )}
-                    </div>
-
-                    {/* Playhead Scrubber */}
-                    <div
-                      className="absolute top-0 bottom-0 pointer-events-none z-30"
-                      style={{ left: `${playheadPosition}px`, transition: isDraggingPlayhead ? 'none' : 'left 0.08s ease-out' }}
-                    >
-                      {/* Scrubber Head (inverted triangle) */}
-                      <div className="absolute top-0 -translate-x-1/2 w-0 h-0" style={{ borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderTop: '7px solid #f43f5e' }} />
-                      {/* Vertical Line */}
-                      <div className="absolute top-1.5 bottom-0 -translate-x-[0.5px] w-px bg-rose-500/90" />
-                    </div>
-
-                    {/* Track 1: Video */}
-                    <div className="relative h-10 border-b border-white/[0.04]">
-                      {hasMedia && !trackStates['Video']?.hidden && (
-                        <div
-                          className="absolute inset-y-1 left-0.5 flex items-center gap-2 rounded-md bg-gradient-to-r from-sky-900/60 via-sky-800/40 to-sky-900/60 border border-sky-500/20 px-2.5 text-[11px] text-sky-200 overflow-hidden cursor-pointer hover:border-sky-400/40 transition"
-                          style={{ width: `${timelineContentWidth - 4}px` }}
-                          onClick={() => seekTo(0)}
-                          title={importedFile?.name ?? project.mediaName ?? 'Video'}
-                        >
-                          <Film size={12} className="text-sky-400 shrink-0" />
-                          <span className="font-medium truncate">{importedFile?.name ?? project.mediaName ?? 'Imported Video'}</span>
-                          {videoChunks.length > 0 && (
-                            <span className="ml-1 shrink-0 rounded bg-sky-500/20 px-1.5 py-0.5 text-[9px] text-sky-100 border border-sky-400/30">
-                              {videoChunks.length} parts
-                            </span>
-                          )}
-                        </div>
-                      )}
-                      {hasMedia && !trackStates['Video']?.hidden && videoChunks.map((chunk) => chunk.start > 0 ? (
-                        <div
-                          key={`chunkmark-${chunk.index}`}
-                          className="absolute inset-y-0 z-10 w-px bg-sky-300/70 pointer-events-none"
-                          style={{ left: `${(chunk.start / projectDurationSeconds) * timelineContentWidth}px` }}
-                          title={`Part ${chunk.index} starts at ${formatTimecode(chunk.start)}`}
-                        />
-                      ) : null)}
-                    </div>
-
-                    {/* Track 2: Original Speech */}
-                    <div className="relative h-10 border-b border-white/[0.04]">
-                      {!trackStates['Original Speech']?.hidden && transcript.map((segment) => {
-                        const left = (segment.start / projectDurationSeconds) * timelineContentWidth;
-                        const rawWidth = ((segment.end - segment.start) / projectDurationSeconds) * timelineContentWidth;
-                        const width = Math.max(6, rawWidth);
-                        const isSelected = selectedSegmentId === segment.id;
-                        const showText = width > 40;
-
-                        return (
-                          <div
-                            key={`orig-${segment.id}`}
-                            onPointerDown={(event) => beginSegmentDrag(event, segment, 'move')}
-                            onClick={() => { seekTo(segment.start); setSelectedSegmentId(segment.id); }}
-                            title={`${segment.start.toFixed(1)}s – ${segment.end.toFixed(1)}s\n${segment.text}${mode === 'EDIT' ? '\n(EDIT MODE: drag to move · edges to trim · click to edit text)' : ''}`}
-                            className={`absolute top-1 bottom-1 rounded-[4px] border overflow-hidden transition-all ${mode === 'EDIT'
-                              ? (segmentDragging ? 'cursor-grabbing ' : 'cursor-grab ')
-                              : 'cursor-pointer '
-                              }${isSelected
-                                ? 'border-indigo-400 bg-indigo-600/70 shadow-[0_0_8px_rgba(99,102,241,0.4)] z-10'
-                                : 'border-indigo-500/20 bg-indigo-800/50 hover:bg-indigo-700/50 hover:border-indigo-400/40'
-                              }`}
-                            style={{ left: `${left}px`, width: `${width}px` }}
-                          >
-                            {showText && (
-                              <div className="flex items-center h-full px-1.5 gap-1 overflow-hidden">
-                                <span className="truncate text-[10px] text-indigo-100 whitespace-nowrap leading-none">
-                                  {segment.text}
-                                </span>
-                              </div>
-                            )}
-                            {mode === 'EDIT' && (
-                              <>
-                                <div
-                                  onPointerDown={(event) => beginSegmentDrag(event, segment, 'trim-l')}
-                                  title="Trim start"
-                                  className="absolute inset-y-0 left-0 w-2 cursor-ew-resize bg-white/15 hover:bg-white/50"
-                                />
-                                <div
-                                  onPointerDown={(event) => beginSegmentDrag(event, segment, 'trim-r')}
-                                  title="Trim end"
-                                  className="absolute inset-y-0 right-0 w-2 cursor-ew-resize bg-white/15 hover:bg-white/50"
-                                />
-                              </>
-                            )}
-                            {/* Gradient edge accents */}
-                            <div className="absolute inset-y-0 left-0 w-[2px] bg-indigo-400/50 rounded-l" />
-                            <div className="absolute inset-y-0 right-0 w-[2px] bg-indigo-400/50 rounded-r" />
-                          </div>
-                        );
-                      })}
-                    </div>
-
-                    {/* Track 3: Translation */}
-                    <div className="relative h-10 border-b border-white/[0.04]">
-                      {!trackStates['Translation']?.hidden && transcript.map((segment) => {
-                        const dub = dubAudioSegments.find((item) => item.id === segment.id);
-                        const start = dub?.start ?? segment.start;
-                        const end = dub?.end ?? segment.end;
-                        const left = (start / projectDurationSeconds) * timelineContentWidth;
-                        const rawWidth = ((end - start) / projectDurationSeconds) * timelineContentWidth;
-                        const width = Math.max(6, rawWidth);
-                        const isSelected = selectedSegmentId === segment.id;
-                        const showText = width > 40;
-                        const translationText = segment.translation || segment.text;
-
-                        return (
-                          <div
-                            key={`trans-${segment.id}`}
-                            onClick={() => { seekTo(start); setSelectedSegmentId(segment.id); }}
-                            title={`${start.toFixed(1)}s – ${end.toFixed(1)}s\n[${targetLanguage}] ${translationText}`}
-                            className={`absolute top-1 bottom-1 rounded-[4px] border cursor-pointer overflow-hidden transition-all ${isSelected
-                              ? 'border-emerald-400 bg-emerald-600/70 shadow-[0_0_8px_rgba(16,185,129,0.4)] z-10'
-                              : 'border-emerald-500/20 bg-emerald-800/50 hover:bg-emerald-700/50 hover:border-emerald-400/40'
-                              }`}
-                            style={{ left: `${left}px`, width: `${width}px` }}
-                          >
-                            {showText && (
-                              <div className="flex items-center h-full px-1.5 gap-1 overflow-hidden">
-                                <span className="truncate text-[10px] text-emerald-100 whitespace-nowrap leading-none">
-                                  {translationText}
-                                </span>
-                              </div>
-                            )}
-                            <div className="absolute inset-y-0 left-0 w-[2px] bg-emerald-400/50 rounded-l" />
-                            <div className="absolute inset-y-0 right-0 w-[2px] bg-emerald-400/50 rounded-r" />
-                          </div>
-                        );
-                      })}
-                    </div>
-
-                    {/* Track 4: Dubbed Voice */}
-                    <div className="relative h-10 border-b border-white/[0.04]">
-                      {!trackStates['Dubbed Voice']?.hidden && dubAudioSegments.map((segment) => {
-                        const left = (segment.start / projectDurationSeconds) * timelineContentWidth;
-                        const rawWidth = ((segment.end - segment.start) / projectDurationSeconds) * timelineContentWidth;
-                        const width = Math.max(6, rawWidth);
-                        const isSelected = selectedSegmentId === segment.id;
-                        const showText = width > 40;
-
-                        return (
-                          <div
-                            key={`dub-${segment.id}`}
-                            onClick={() => { seekTo(segment.start); setSelectedSegmentId(segment.id); }}
-                            title={`${segment.start.toFixed(1)}s – ${segment.end.toFixed(1)}s\nVoice: ${segment.voice}`}
-                            className={`absolute top-1 bottom-1 rounded-[4px] border cursor-pointer overflow-hidden transition-all ${isSelected
-                              ? 'border-amber-400 bg-amber-600/70 shadow-[0_0_8px_rgba(245,158,11,0.4)] z-10'
-                              : 'border-amber-500/20 bg-amber-800/50 hover:bg-amber-700/50 hover:border-amber-400/40'
-                              }`}
-                            style={{ left: `${left}px`, width: `${width}px` }}
-                          >
-                            {showText && (
-                              <div className="flex items-center h-full px-1.5 gap-1 overflow-hidden">
-                                <span className="truncate text-[10px] text-amber-100 whitespace-nowrap leading-none">
-                                  {segment.voice}
-                                </span>
-                              </div>
-                            )}
-                            <div className="absolute inset-y-0 left-0 w-[2px] bg-amber-400/50 rounded-l" />
-                            <div className="absolute inset-y-0 right-0 w-[2px] bg-amber-400/50 rounded-r" />
-                          </div>
-                        );
-                      })}
-                    </div>
-
-                    {/* Track 5: Subtitle */}
-                    <div className="relative h-10">
-                      {!trackStates['Subtitle']?.hidden && transcript.map((segment) => {
-                        const dub = dubAudioSegments.find((item) => item.id === segment.id);
-                        const start = dub?.start ?? segment.start;
-                        const end = dub?.end ?? segment.end;
-                        const left = (start / projectDurationSeconds) * timelineContentWidth;
-                        const rawWidth = ((end - start) / projectDurationSeconds) * timelineContentWidth;
-                        const width = Math.max(6, rawWidth);
-                        const isSelected = selectedSegmentId === segment.id;
-                        const showText = width > 40;
-                        const subText = segment.translation || segment.text;
-
-                        return (
-                          <div
-                            key={`sub-${segment.id}`}
-                            onClick={() => { seekTo(start); setSelectedSegmentId(segment.id); }}
-                            title={`${start.toFixed(1)}s – ${end.toFixed(1)}s\n${subText}`}
-                            className={`absolute top-1 bottom-1 rounded-[4px] border cursor-pointer overflow-hidden transition-all ${isSelected
-                              ? 'border-rose-400 bg-rose-600/70 shadow-[0_0_8px_rgba(244,63,94,0.4)] z-10'
-                              : 'border-rose-500/20 bg-rose-800/50 hover:bg-rose-700/50 hover:border-rose-400/40'
-                              }`}
-                            style={{ left: `${left}px`, width: `${width}px` }}
-                          >
-                            {showText && (
-                              <div className="flex items-center h-full px-1.5 gap-1 overflow-hidden">
-                                <span className="truncate text-[10px] text-rose-100 whitespace-nowrap leading-none">
-                                  {subText}
-                                </span>
-                              </div>
-                            )}
-                            <div className="absolute inset-y-0 left-0 w-[2px] bg-rose-400/50 rounded-l" />
-                            <div className="absolute inset-y-0 right-0 w-[2px] bg-rose-400/50 rounded-r" />
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Timeline Footer */}
-              <div className="flex items-center justify-between border-t border-white/[0.06] bg-[#0e1526] px-4 py-1.5 text-[10px] text-slate-500">
-                <div className="flex items-center gap-4">
-                  <span>{timelineZoom.toFixed(1)}x zoom</span>
-                  <span className="font-mono text-slate-400">{formatTimecode(currentTime)}</span>
-                  <span>{transcript.length} speech · {dubAudioSegments.length} dubbed{videoChunks.length > 0 ? ` · ${videoChunks.length} parts` : ''}</span>
-                </div>
-                <span>{mode === 'EDIT' ? 'EDIT MODE: drag clips to move · edges to trim · click a clip to edit text' : 'Click ruler to scrub · Click clip to select'}</span>
-              </div>
-            </div>
+            {/* Timeline editor */}
+            <TimelineEditor
+              projectId={project.id}
+              mode={mode}
+              busy={busy}
+              segments={transcript}
+              dubSegments={dubAudioSegments}
+              dubAudioVersion={dubAudioVersion}
+              hasMedia={hasMedia}
+              mediaName={importedFile?.name ?? project.mediaName ?? 'Imported Video'}
+              duration={projectDurationSeconds}
+              currentTime={currentTime}
+              isPlaying={isPlaying}
+              videoRef={videoRef}
+              videoChunks={videoChunks}
+              chunkSeconds={chunkSeconds}
+              selectedId={selectedSegmentId}
+              onSelect={setSelectedSegmentId}
+              onSeek={seekTo}
+              onTogglePlay={togglePlay}
+              onOpenEditor={openSegmentEditor}
+              onNotice={setNotice}
+              trackStates={trackStates}
+              onToggleMute={toggleTrackMute}
+              onToggleHide={toggleTrackHide}
+              onToggleLock={toggleTrackLock}
+              onRefresh={handleRefresh}
+              isRefreshing={isRefreshing}
+              onFixOverlaps={handleFixOverlaps}
+              fixOverlapsState={fixOverlapsState}
+              onCutRange={handleCutRange}
+              cutBusy={cutBusy}
+              targetLanguage={targetLanguage}
+            />
 
             {/* Processing log */}
             <div className="shrink-0 rounded-2xl border border-white/10 bg-slate-900/80 p-4">

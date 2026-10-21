@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+import threading
 import uuid
 import json
 import os
@@ -10,6 +11,8 @@ import sqlite3
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +54,7 @@ _register_nvidia_dll_dirs()
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from urllib.parse import quote
 
 from backend.app.chunking import SmartChunkEngine, format_timestamp, split_subtitle_cues
@@ -1159,6 +1162,224 @@ async def get_project_media(project_id: str, request: Request):
     }
     media_type = media_types.get(Path(media_path).suffix.lower(), 'video/mp4')
     return _file_response_with_range(request, Path(media_path), media_type, project.get('media_name', 'source-video'))
+
+
+# --- Timeline visuals -------------------------------------------------------
+# Real editors draw an audio waveform inside every audio clip and a filmstrip
+# inside the video clip. Both are derived from the imported media and cached
+# next to it, so opening a project only pays the cost once.
+
+TIMELINE_PEAK_BUCKETS = 160
+TIMELINE_THUMB_COUNT = 24
+TIMELINE_THUMB_COLS = 6
+_timeline_thumb_lock = threading.Lock()
+
+
+def _timeline_duration(project: dict[str, Any], media_path: Path) -> float:
+    """Exact media duration, falling back to the stored HH:MM:SS string."""
+    ffprobe = find_media_tool('ffprobe')
+    if ffprobe:
+        try:
+            duration = _probe_duration(ffprobe, str(media_path))
+            if duration > 0:
+                return duration
+        except Exception:
+            pass
+    try:
+        hours, minutes, seconds = (float(part) for part in str(project.get('duration', '0:0:0')).split(':'))
+        return max(0.0, hours * 3600 + minutes * 60 + seconds)
+    except Exception:
+        return 0.0
+
+
+def _read_waveform_peaks(path: str, buckets: int) -> tuple[float, tuple[float, ...]]:
+    """Peak envelope and natural length of a short clip.
+
+    numpy/soundfile keep decoding off the event loop. Returns ``(0.0, ())``
+    when the file cannot be decoded; the timeline then draws a flat clip
+    instead of failing.
+    """
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        samples, rate = sf.read(path, dtype='float32', always_2d=True)
+        if samples.size == 0 or rate <= 0:
+            return 0.0, tuple()
+        mono = samples.mean(axis=1) if samples.shape[1] > 1 else samples[:, 0]
+        edges = np.linspace(0, mono.size, buckets + 1).astype(int)
+        peaks = tuple(
+            float(np.max(np.abs(mono[start:end]))) if end > start else 0.0
+            for start, end in zip(edges[:-1], edges[1:])
+        )
+        return mono.size / float(rate), peaks
+    except Exception:
+        return 0.0, tuple()
+
+
+@lru_cache(maxsize=2048)
+def _cached_waveform_peaks(path: str, mtime_ns: int, buckets: int) -> tuple[float, tuple[float, ...]]:
+    # mtime_ns is part of the key so regenerated takes invalidate the cache.
+    del mtime_ns
+    return _read_waveform_peaks(path, buckets)
+
+
+def _build_timeline_thumbnails(project_id: str, media_path: Path, duration: float) -> dict[str, Any] | None:
+    """Extract a grid of frames from the media and tile them into one JPEG.
+
+    Each frame is grabbed with its own fast seek instead of decoding the whole
+    movie, so a two-hour film still produces a filmstrip in a few seconds.
+    """
+    ffmpeg = find_media_tool('ffmpeg')
+    if not ffmpeg or duration <= 0:
+        return None
+    cache_dir = DATA_ROOT / project_id / 'timeline'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    stamp = media_path.stat().st_mtime_ns
+    count = TIMELINE_THUMB_COUNT
+    cols = TIMELINE_THUMB_COLS
+    rows = math.ceil(count / cols)
+    sprite = cache_dir / f'thumbs-{stamp}.jpg'
+    meta_path = cache_dir / f'thumbs-{stamp}.json'
+    if sprite.is_file() and meta_path.is_file():
+        try:
+            return json.loads(meta_path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError):
+            pass
+    with _timeline_thumb_lock:
+        if sprite.is_file() and meta_path.is_file():
+            try:
+                return json.loads(meta_path.read_text(encoding='utf-8'))
+            except (OSError, json.JSONDecodeError):
+                pass
+        frames_dir = cache_dir / f'frames-{stamp}'
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        frames = [frames_dir / f'{index:03d}.jpg' for index in range(count)]
+
+        def grab(index: int) -> None:
+            timestamp = duration * (index + 0.5) / count
+            subprocess.run(
+                [ffmpeg, '-y', '-loglevel', 'error', '-ss', f'{timestamp:.3f}', '-i', str(media_path),
+                 '-frames:v', '1', '-vf', 'scale=160:-2', '-q:v', '4', str(frames[index])],
+                capture_output=True,
+                timeout=60,
+            )
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(grab, range(count)))
+        existing = [frame for frame in frames if frame.is_file() and frame.stat().st_size > 0]
+        if not existing:
+            shutil.rmtree(frames_dir, ignore_errors=True)
+            return None
+        fallback = existing[0]
+        for frame in frames:
+            if not (frame.is_file() and frame.stat().st_size > 0):
+                shutil.copyfile(fallback, frame)
+        try:
+            subprocess.run(
+                [ffmpeg, '-y', '-loglevel', 'error', '-framerate', '1', '-start_number', '0',
+                 '-i', str(frames_dir / '%03d.jpg'), '-vf', f'tile={cols}x{rows}:padding=0:margin=0',
+                 '-frames:v', '1', '-q:v', '4', str(sprite)],
+                check=True,
+                capture_output=True,
+                timeout=120,
+            )
+        except Exception:
+            sprite.unlink(missing_ok=True)
+            shutil.rmtree(frames_dir, ignore_errors=True)
+            return None
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        meta = {
+            'url': f'/api/projects/{project_id}/timeline/thumbnails.jpg?v={stamp}',
+            'count': count,
+            'cols': cols,
+            'rows': rows,
+            'step': duration / count,
+            'duration': duration,
+        }
+        meta_path.write_text(json.dumps(meta), encoding='utf-8')
+        # Keep exactly one filmstrip per project.
+        for old in cache_dir.glob('thumbs-*.jpg'):
+            if old != sprite:
+                old.unlink(missing_ok=True)
+        for old in cache_dir.glob('thumbs-*.json'):
+            if old != meta_path:
+                old.unlink(missing_ok=True)
+        return meta
+
+
+@app.get('/api/projects/{project_id}/timeline/thumbnails')
+async def get_timeline_thumbnails(project_id: str) -> dict[str, Any]:
+    """Filmstrip metadata for the video track (generated once, then cached)."""
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail='Project not found')
+    media_path = project.get('media_path')
+    if not media_path or not Path(media_path).is_file():
+        raise HTTPException(status_code=409, detail='Import a video before loading timeline thumbnails')
+    duration = _timeline_duration(project, Path(media_path))
+    meta = await run_in_threadpool(_build_timeline_thumbnails, project_id, Path(media_path), duration)
+    if meta is None:
+        raise HTTPException(status_code=503, detail='Timeline thumbnails need FFmpeg, which is not available')
+    return meta
+
+
+@app.get('/api/projects/{project_id}/timeline/thumbnails.jpg')
+async def get_timeline_thumbnails_image(project_id: str):
+    """Serve the cached filmstrip. The URL carries the media mtime for cache busting."""
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail='Project not found')
+    media_path = project.get('media_path')
+    if not media_path or not Path(media_path).is_file():
+        raise HTTPException(status_code=404, detail='Imported video is not available')
+    stamp = Path(media_path).stat().st_mtime_ns
+    sprite = DATA_ROOT / project_id / 'timeline' / f'thumbs-{stamp}.jpg'
+    if not sprite.is_file():
+        raise HTTPException(status_code=404, detail='Timeline thumbnails have not been generated yet')
+    return FileResponse(
+        str(sprite),
+        media_type='image/jpeg',
+        headers={'cache-control': 'public, max-age=31536000, immutable'},
+    )
+
+
+@app.get('/api/projects/{project_id}/timeline/peaks')
+async def get_timeline_peaks(project_id: str) -> dict[str, Any]:
+    """Waveform envelopes for the dubbed clips, normalized across the project."""
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail='Project not found')
+    rows = project.get('audio_segments', [])
+
+    def compute() -> list[tuple[int, dict[str, Any], float, tuple[float, ...]]]:
+        measured: list[tuple[int, dict[str, Any], float, tuple[float, ...]]] = []
+        for index, row in enumerate(rows):
+            path = str(row.get('path') or '')
+            if not path or not Path(path).is_file():
+                continue
+            try:
+                mtime_ns = Path(path).stat().st_mtime_ns
+            except OSError:
+                continue
+            seconds, peaks = _cached_waveform_peaks(path, mtime_ns, TIMELINE_PEAK_BUCKETS)
+            if peaks:
+                measured.append((index, row, seconds, peaks))
+        return measured
+
+    measured = await run_in_threadpool(compute)
+    loudest = max((max(peaks) for _, _, _, peaks in measured), default=0.0) or 1.0
+    clips = [
+        {
+            'index': index + 1,
+            'id': str(row.get('id') or ''),
+            'seconds': round(seconds, 3),
+            'peaks': [round(min(1.0, value / loudest), 3) for value in peaks],
+        }
+        for index, row, seconds, peaks in measured
+    ]
+    return {'buckets': TIMELINE_PEAK_BUCKETS, 'clips': clips}
 
 
 @app.post('/api/projects')
