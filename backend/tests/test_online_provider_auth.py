@@ -168,3 +168,36 @@ def test_tls_context_never_disables_verification(monkeypatch, tmp_path):
         online_providers._ssl_context.cache_clear()
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.check_hostname is True
+
+
+def test_online_calls_do_not_use_the_stdlib_user_agent(monkeypatch):
+    """Cloudflare answers the default `Python-urllib` signature with a 403 (error 1010)."""
+    seen = _capture(monkeypatch, json.dumps({'data': [{'id': 'chat-model'}]}).encode('utf-8'))
+    online_providers.codecraft_list_models('cc-123')
+    agent = seen['request'].headers.get('User-agent') or ''
+    assert agent == online_providers.ONLINE_USER_AGENT
+    assert 'urllib' not in agent.lower()
+
+
+def test_codecraft_test_reports_the_api_message_instead_of_a_bare_403(monkeypatch):
+    import io
+
+    body = b'{"error":{"code":"invalid_api_key","message":"Invalid or revoked API key."}}'
+
+    def fake_request(*args, **kwargs):
+        raise urllib.error.HTTPError('https://codecraftapi.com/v1/models', 401, 'Unauthorized',
+                                     {}, io.BytesIO(body))
+
+    monkeypatch.setattr(online_providers, '_request_json', fake_request)
+    with pytest.raises(RuntimeError, match='Invalid or revoked API key'):
+        online_providers.codecraft_text_test('cc-bad')
+
+
+def test_http_error_detail_explains_a_cloudflare_block():
+    import io
+
+    body = b'{"type":"https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1010/"}'
+    error = urllib.error.HTTPError('https://codecraftapi.com/v1/models', 403, 'Forbidden', {}, io.BytesIO(body))
+    detail = online_providers._http_error_detail(error)
+    assert 'Cloudflare' in detail
+    assert 'developers.cloudflare.com' not in detail

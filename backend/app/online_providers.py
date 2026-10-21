@@ -33,6 +33,12 @@ OPENAI_BASE = 'https://api.openai.com/v1'
 # (1M tokens/month, no card). Translation only: it exposes no speech endpoint.
 CODECRAFT_BASE = 'https://codecraftapi.com/v1'
 
+# Cloudflare fronts some providers and rejects the stdlib's default
+# `Python-urllib/3.x` signature with "error code: 1010" (HTTP 403) before the
+# request is ever authenticated, so every online call identifies the app. An
+# honest product name is enough; no need to impersonate a browser.
+ONLINE_USER_AGENT = 'DubVibe/0.1.0'
+
 GEMINI_DEFAULT_MODEL = 'gemini-2.5-flash-preview-tts'
 OPENAI_DEFAULT_MODEL = 'gpt-4o-mini-tts'
 # Text model used for translation. `gemini-flash-latest` is Google's rolling alias
@@ -207,7 +213,7 @@ def _auth_headers(url: str, key: str) -> dict[str, str]:
     OpenAI and CodeCraft endpoint requires an `Authorization: Bearer <key>` header.
     Without it those calls fail with 401.
     """
-    headers = {'Content-Type': 'application/json'}
+    headers = {'Content-Type': 'application/json', 'User-Agent': ONLINE_USER_AGENT}
     if url.startswith((OPENAI_BASE, CODECRAFT_BASE)):
         headers['Authorization'] = f'Bearer {key}'
     return headers
@@ -376,10 +382,22 @@ def _http_error_detail(error: urllib.error.HTTPError) -> str:
         return f'HTTP {error.code}'
     try:
         payload = json.loads(raw)
-        message = str(payload.get('error', {}).get('message') or '').strip()
     except ValueError:
+        payload = None
+    message = ''
+    if isinstance(payload, dict):
+        error_field = payload.get('error')
+        if isinstance(error_field, dict):
+            message = str(error_field.get('message') or '').strip()
+    if not message:
+        # Edge proxies (Cloudflare) answer with a bare `type` URL or plain text
+        # instead of an API error object, so keep the raw text as a fallback.
         message = raw.strip()
     message = ' '.join(message.split())
+    if 'cloudflare' in message.lower():
+        # Cloudflare bot rules answer with an error-1xxx documentation link
+        # instead of an API error; say what it means rather than dumping the URL.
+        return f'HTTP {error.code}: blocked by Cloudflare before the API saw the request'
     return f'HTTP {error.code}: {message[:200]}' if message else f'HTTP {error.code}'
 
 
@@ -663,7 +681,12 @@ def codecraft_chat(key: str, messages: list[dict], model: str = CODECRAFT_DEFAUL
 
 def codecraft_text_test(key: str) -> dict:
     """Live connection test for translation: list the key's chat models."""
-    models = codecraft_list_models(key)
+    try:
+        models = codecraft_list_models(key)
+    except urllib.error.HTTPError as error:
+        # A rejected key or a blocked client must read as an explanation, not as
+        # "HTTP Error 403: Forbidden" with no clue which of the two it was.
+        raise RuntimeError(f'CodeCraft rejected the request ({_http_error_detail(error)})') from error
     if not models:
         raise RuntimeError('No chat models are available for this CodeCraft key')
     return {'ok': True, 'models': models}
