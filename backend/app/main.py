@@ -935,6 +935,8 @@ async def generate_segment_audio(project_id: str, segment_id: str, payload: dict
     provider = str(payload.get('provider') or 'edge')
     speed = float(payload.get('speed') or 1.0)
     previous = next((item for item in project.get('audio_segments', []) if str(item.get('id')) == str(segment_id)), None)
+    # The user clicked Generate for this line: retry engines that were skipped.
+    tts_service.reset_unavailable()
     try:
         entry = await run_in_threadpool(
             segment_tts.synthesize_segment,
@@ -1857,6 +1859,9 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
 
     await emit_progress(payload.project_id, 'Generating Voice', 70, 'Assigning voices and synthesizing dubbed audio...')
     update_project(payload.project_id, status='Processing', progress=70)
+    # An explicit Dub run re-probes every engine, so a recovered voice service is
+    # used immediately instead of inheriting an earlier run's short-circuit.
+    tts_service.reset_unavailable()
 
     audio_dir = DATA_ROOT / payload.project_id / 'dub'
     audio_dir.mkdir(parents=True, exist_ok=True)

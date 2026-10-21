@@ -17,9 +17,11 @@ from __future__ import annotations
 import subprocess
 import hashlib
 import shutil
+import time
 from pathlib import Path
 
 from . import acting, api_keys
+from .providers import SpeechUnavailableError
 from .online_providers import (
     GEMINI_DEFAULT_MODEL,
     GEMINI_VOICES,
@@ -33,6 +35,19 @@ from .online_providers import (
 
 QUALITY_ORDER = ['gemini', 'openai', 'edge', 'voxcpm2', 'sapi5']
 OFFLINE_MULTILINGUAL_PROVIDERS = ('voxcpm2',)
+# After an engine reports "no audio" for a language, skip it for that language for
+# this long. Without this a 300-line project retries a dead voice 3x per line.
+_UNAVAILABLE_SECONDS = 600.0
+_unavailable_until: dict[tuple[str, str], float] = {}
+
+
+def reset_unavailable() -> None:
+    """Clear the 'this engine has no audio for this language' short-circuit.
+
+    Called when the user explicitly asks for audio again (a full Dub run or a
+    single-line regenerate), so a recovered engine is retried immediately.
+    """
+    _unavailable_until.clear()
 
 
 def tts_cache_dir(provider: str) -> Path:
@@ -113,8 +128,17 @@ def synthesize_line(text: str, out_path: str, *, provider_pref: str, language_na
     profile = character_profile or {}
     candidates = candidate_providers(provider_pref, lang_code, profile)
     attempts: list[str] = []
+    unavailable: list[str] = []
 
     for provider in candidates:
+        # Skip an engine already known to have no audio for this language, so a
+        # long project does not retry a broken voice 3x on every single line.
+        blocked_until = _unavailable_until.get((provider, lang_code), 0.0)
+        if time.monotonic() < blocked_until:
+            attempts.append(f'{provider}: skipped (no audio for {language_name} just now)')
+            unavailable.append(provider)
+            continue
+
         model = _model_for(provider, model_pref)
         voice = _default_voice(provider, profile.get('voice') or voice_pref)
         style = acting.style_instruction(provider, analysis)
@@ -156,7 +180,16 @@ def synthesize_line(text: str, out_path: str, *, provider_pref: str, language_na
                 attempts.append(f'{provider}: unknown provider')
                 continue
 
+            # A provider can "succeed" yet produce no audible audio — SAPI5 given
+            # Khmer text on an English-only Windows voice writes a header-only MP3.
+            # Accepting that silently is what made exports come out with no voice.
+            if not _has_audio(Path(out_path)):
+                attempts.append(f'{provider}: produced no audible audio')
+                Path(out_path).unlink(missing_ok=True)
+                continue
+
             strip_audio_silence(out_path)
+            _unavailable_until.pop((provider, lang_code), None)
             _store_cache(provider, key, Path(out_path)) if provider in ('gemini', 'openai') else None
             return {
                 'provider': provider,
@@ -166,10 +199,22 @@ def synthesize_line(text: str, out_path: str, *, provider_pref: str, language_na
                 'cached': False,
                 'attempts': attempts,
             }
+        except SpeechUnavailableError as error:
+            attempts.append(f'{provider}: {error}')
+            unavailable.append(provider)
+            _unavailable_until[(provider, lang_code)] = time.monotonic() + _UNAVAILABLE_SECONDS
+            continue
         except Exception as error:  # noqa: BLE001 - try the next provider
             attempts.append(f'{provider}: {error}')
             continue
 
+    if unavailable and len(unavailable) == len(candidates):
+        # Every engine that could run had no audio for this language: say so
+        # plainly instead of burying it in the provider log.
+        raise SpeechUnavailableError(
+            f'No voice engine can produce {language_name} audio right now. '
+            + ' '.join(attempts)
+        )
     raise RuntimeError('All TTS providers failed: ' + '; '.join(attempts))
 
 

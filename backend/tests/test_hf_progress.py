@@ -21,6 +21,52 @@ import pytest
 from backend.app import hf_progress
 
 
+_LOOPBACK_OK: list[bool] = []
+
+
+def _loopback_http_works() -> bool:
+    """True when this machine can talk HTTP to 127.0.0.1.
+
+    Some sandboxes/CI runners block loopback HTTP (the server accepts the
+    connection but the body never arrives). Probing once, with a short timeout,
+    keeps the suite honest: the download logic is still covered when loopback
+    works, and these tests skip instead of each burning a 90 s timeout when it
+    does not.
+    """
+    if _LOOPBACK_OK:
+        return _LOOPBACK_OK[0]
+    import http.client
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _PingHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection('127.0.0.1', server.server_address[1], timeout=2)
+        connection.request('GET', '/ping')
+        works = connection.getresponse().read() == b'ok'
+    except Exception:
+        works = False
+    finally:
+        server.shutdown()
+        server.server_close()
+    _LOOPBACK_OK.append(works)
+    return works
+
+
+class _PingHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def do_GET(self):  # noqa: N802 - stdlib naming
+        body = b'ok'
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        return
+
+
 class _FileServer:
     """Local HTTP server serving one payload, with optional Range support."""
 
@@ -59,6 +105,8 @@ class _FileServer:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
     def __enter__(self) -> '_FileServer':
+        if not _loopback_http_works():
+            pytest.skip('loopback HTTP is unavailable in this environment')
         self._thread.start()
         return self
 

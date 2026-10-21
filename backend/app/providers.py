@@ -23,6 +23,16 @@ logger = logging.getLogger(__name__)
 # Abstract base providers
 # ---------------------------------------------------------------------------
 
+class SpeechUnavailableError(RuntimeError):
+    """The voice engine answered but produced no audio for this voice/language.
+
+    Distinct from a generic failure: it usually means the engine is having a
+    server-side problem with that language (Edge TTS returning no audio) or has no
+    installed voice for it (SAPI5). Callers use it to stop retrying the same engine
+    for every line and to explain the problem to the user.
+    """
+
+
 class SpeechToTextProvider(ABC):
     @abstractmethod
     def transcribe(self, file_path: str) -> dict:
@@ -749,31 +759,46 @@ class Pyttsx3Provider(TextToSpeechProvider):
             engine.setProperty('voice', selected_voice_id)
         engine.setProperty('rate', 160)
 
-        # pyttsx3 saves to WAV; convert the output path to .wav.
+        # pyttsx3 can only save WAV, so render there first, then place the audio at
+        # the caller's exact out_path. Writing to a different extension (the old
+        # behaviour) left the caller pointing at a file that did not exist.
         wav_path = str(Path(output_path).with_suffix('.wav'))
         Path(wav_path).parent.mkdir(parents=True, exist_ok=True)
         engine.save_to_file(text, wav_path)
         engine.runAndWait()
         engine.stop()
 
-        # Convert WAV to MP3 with ffmpeg if available, otherwise keep WAV.
         final_path = output_path
+        rendered = Path(wav_path)
+        if not rendered.is_file():
+            raise RuntimeError('The Windows voice produced no audio file.')
         try:
             import shutil
             ffmpeg = shutil.which('ffmpeg')
-            if ffmpeg and Path(wav_path).is_file():
-                mp3_path = str(Path(output_path).with_suffix('.mp3'))
+            if ffmpeg and Path(output_path).suffix.lower() == '.mp3':
                 subprocess.run(
-                    [ffmpeg, '-y', '-i', wav_path, '-codec:a', 'libmp3lame', '-q:a', '4', mp3_path],
+                    [ffmpeg, '-y', '-i', wav_path, '-codec:a', 'libmp3lame', '-q:a', '4', output_path],
                     check=True,
                     capture_output=True,
                 )
-                Path(wav_path).unlink(missing_ok=True)
-                final_path = mp3_path
-            else:
-                final_path = wav_path
+                rendered.unlink(missing_ok=True)
+            elif str(rendered) != str(output_path):
+                shutil.move(str(rendered), output_path)
         except Exception:
-            final_path = wav_path
+            # Keep the WAV, but still place it where the caller expects it.
+            import shutil
+            if str(rendered) != str(output_path) and rendered.is_file():
+                shutil.move(str(rendered), output_path)
+
+        # A Windows voice with no matching language still "saves" — as a header-only
+        # file with no audio frames. Report that as a failure so the chain can move on
+        # instead of shipping a silent dub.
+        if not _audio_has_sound(final_path):
+            Path(final_path).unlink(missing_ok=True)
+            raise SpeechUnavailableError(
+                f'The Windows voice cannot speak {language} '
+                '(no matching SAPI5 voice is installed).'
+            )
 
         voice_name = selected_voice_id.split('\\')[-1] if selected_voice_id and '\\' in selected_voice_id else (selected_voice_id or voice)
         return {
@@ -783,6 +808,42 @@ class Pyttsx3Provider(TextToSpeechProvider):
             'output': final_path,
             'status': 'ok',
         }
+
+
+def _audio_has_sound(path: str | Path) -> bool:
+    """True only when ffprobe reads a positive duration from the file.
+
+    Used to reject a header-only clip (a few hundred bytes, no audio frames) that a
+    TTS engine can produce without raising — for example a Windows voice asked for a
+    language it cannot speak. Without ffprobe the file cannot be verified, so a
+    non-empty file is accepted rather than blocking the dub.
+    """
+    target = Path(path)
+    try:
+        if not target.is_file() or target.stat().st_size == 0:
+            return False
+    except OSError:
+        return False
+    try:
+        import shutil
+
+        ffprobe = shutil.which('ffprobe')
+        if not ffprobe:
+            from .main import find_media_tool
+
+            ffprobe = find_media_tool('ffprobe')
+    except Exception:
+        ffprobe = None
+    if not ffprobe:
+        return True
+    try:
+        result = subprocess.run(
+            [ffprobe, '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', str(target)],
+            capture_output=True, text=True, check=True,
+        )
+        return float(result.stdout.strip() or '0') > 0.0
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return False
 
 
 # (language, UI label) -> Edge neural voice id. The labels are what the
@@ -881,7 +942,23 @@ class EdgeTTSProvider(TextToSpeechProvider):
                 if attempt < 2:
                     await asyncio.sleep(1.0 * (attempt + 1))
         else:
+            # "No audio was received" is what Edge returns when its backend has no
+            # audio for that voice (seen for whole languages during an outage) —
+            # retrying the same voice will not help, so report it as unavailable.
+            if last_error is not None and 'No audio' in str(last_error):
+                raise SpeechUnavailableError(
+                    f'Edge TTS returned no audio for {language} ({selected_voice}). '
+                    'Microsoft\'s Edge voice service is currently not serving this '
+                    'language — other languages still work. Retry later or pick another '
+                    'voice engine.'
+                ) from last_error
             raise RuntimeError(f'Edge TTS failed after 3 attempts: {last_error}') from last_error
+        # Some failures skip the loop's break but still leave an empty file.
+        if not _audio_has_sound(output):
+            output.unlink(missing_ok=True)
+            raise SpeechUnavailableError(
+                f'Edge TTS produced no audible audio for {language} ({selected_voice}).'
+            )
         return {
             'provider': 'Edge TTS',
             'voice': selected_voice,
