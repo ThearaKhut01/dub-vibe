@@ -168,6 +168,9 @@ function App() {
     nllbModel,
     downloadNllb,
     deleteNllb,
+    genderModel,
+    downloadGender,
+    deleteGender,
     activeTranslateEngine,
     activeSeparateEngine,
     cudaPack,
@@ -217,6 +220,7 @@ function App() {
   const [modelBusy, setModelBusy] = useState<string | null>(null);
   const [nllbConfirm, setNllbConfirm] = useState(false);
   const [voxcpmConfirm, setVoxcpmConfirm] = useState(false);
+  const [genderConfirm, setGenderConfirm] = useState(false);
   const [transcribeLanguage, setTranscribeLanguage] = useState(() => localStorage.getItem('dubvibe-transcribe-language') ?? '');
   const [beamSize, setBeamSize] = useState(() => Number(localStorage.getItem('dubvibe-beam-size') ?? 5));
   const [deleteTarget, setDeleteTarget] = useState<ProjectSummary | null>(null);
@@ -3084,6 +3088,79 @@ function App() {
                   )}
                   {nllbModel.status === 'error' && nllbModel.error && (
                     <p className="mt-3 rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[10px] text-rose-200">{nllbModel.error}</p>
+                  )}
+                </div>
+              )}
+              {genderModel && (
+                <div className={`mt-3 rounded-xl border p-4 ${genderModel.installed ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-white/10 bg-slate-900/80'}`}>
+                  <div className="flex items-start gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+                        <p className="text-sm font-medium text-slate-200">{genderModel.name}</p>
+                        <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${genderModel.status === 'downloading' ? 'bg-amber-500/20 text-amber-200'
+                            : genderModel.status === 'error' ? 'bg-rose-500/20 text-rose-200'
+                              : genderModel.installed ? 'bg-emerald-500/20 text-emerald-200'
+                                : 'bg-slate-700/60 text-slate-300'
+                          }`}>
+                          {genderModel.status === 'downloading' ? `Downloading ${genderModel.progress}%`
+                            : genderModel.status === 'error' ? 'Error'
+                              : genderModel.installed ? '✓ Installed' : 'Not installed'}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-xs leading-relaxed text-slate-500">
+                        {genderModel.installed
+                          ? `${genderModel.size_mb?.toFixed(0)} MB · hears male/female in Detect Speakers, so Mixed voice and Character voices pick correctly every time.`
+                          : `~${genderModel.total_mb} MB download · classifies male/female per speaker in Detect Speakers, so Mixed voice dubs each speaker in the correct voice (pitch fallback untouched). MIT license.`}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {genderModel.status === 'not_installed' && !genderConfirm && (
+                        <button
+                          onClick={() => setGenderConfirm(true)}
+                          disabled={modelBusy !== null}
+                          className="shrink-0 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-200 hover:bg-sky-500/20 transition disabled:opacity-40"
+                        >
+                          Download
+                        </button>
+                      )}
+                      {genderModel.status === 'not_installed' && genderConfirm && (
+                        <>
+                          <button
+                            onClick={() => { setGenderConfirm(false); void runModelAction('dl-gender', downloadGender); }}
+                            disabled={modelBusy !== null}
+                            className="shrink-0 rounded-lg border border-sky-500/30 bg-sky-500/20 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/30 transition disabled:opacity-40"
+                          >
+                            Confirm download (~{genderModel.total_mb} MB)
+                          </button>
+                          <button
+                            onClick={() => setGenderConfirm(false)}
+                            className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-white/5 transition"
+                          >
+                            Cancel
+                          </button>
+                        </>
+                      )}
+                      {genderModel.installed && (
+                        <button
+                          onClick={() => void runModelAction('del-gender', deleteGender)}
+                          disabled={modelBusy !== null}
+                          className="shrink-0 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/20 transition disabled:opacity-40"
+                        >
+                          Delete
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  {genderModel.status === 'downloading' && (
+                    <div className="mt-3">
+                      <div className="h-2 overflow-hidden rounded-full bg-slate-800">
+                        <div className="h-full rounded-full bg-gradient-to-r from-sky-500 to-violet-500" style={{ width: `${genderModel.progress}%` }} />
+                      </div>
+                      <p className="mt-1 text-[10px] text-slate-500">{genderModel.downloaded_mb.toFixed(0)} MB / ~{genderModel.total_mb} MB</p>
+                    </div>
+                  )}
+                  {genderModel.status === 'error' && genderModel.error && (
+                    <p className="mt-3 rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[10px] text-rose-200">{genderModel.error}</p>
                   )}
                 </div>
               )}

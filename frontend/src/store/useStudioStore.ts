@@ -42,6 +42,7 @@ interface StudioState {
   activeSeparateEngine: string | null;
   demucsModel: WhisperModelInfo | null;
   voxcpmModel: WhisperModelInfo | null;
+  genderModel: WhisperModelInfo | null;
   cudaPack: CudaPackInfo | null;
   /** True when the last Auto-Fix Overlaps run can still be undone (backup on disk). */
   canUndoOverlaps: boolean;
@@ -80,6 +81,8 @@ interface StudioState {
   deleteDemucs: () => Promise<void>;
   downloadVoxcpm: () => Promise<void>;
   deleteVoxcpm: () => Promise<void>;
+  downloadGender: () => Promise<void>;
+  deleteGender: () => Promise<void>;
   downloadCudaPack: () => Promise<void>;
   deleteCudaPack: () => Promise<void>;
   detectSpeakers: () => Promise<{ speakers: string[]; message: string }>;
@@ -366,6 +369,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   activeSeparateEngine: null,
   demucsModel: null,
   voxcpmModel: null,
+  genderModel: null,
   cudaPack: null,
   providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false } },
   voiceCapabilities: {},
@@ -412,7 +416,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   },
   refreshModels: async () => {
     try {
-      const [models, hardware, storage, qwen, demucs, nllb, voxcpm, cudaPack] = await Promise.all([
+      const [models, hardware, storage, qwen, demucs, nllb, voxcpm, gender, cudaPack] = await Promise.all([
         readJson<WhisperModelInfo[]>('/api/models/faster-whisper'),
         readJson<HardwareInfo>('/api/system/hardware'),
         readJson<ModelStorageInfo>('/api/models/storage').catch(() => null),
@@ -420,9 +424,10 @@ export const useStudioStore = create<StudioState>((set, get) => ({
         readJson<WhisperModelInfo>('/api/models/demucs').catch(() => null),
         readJson<WhisperModelInfo>('/api/models/nllb').catch(() => null),
         readJson<WhisperModelInfo>('/api/models/voxcpm').catch(() => null),
+        readJson<WhisperModelInfo>('/api/models/gender').catch(() => null),
         readJson<CudaPackInfo>('/api/models/cuda-pack').catch(() => null),
       ]);
-      set({ models, hardware, modelStorage: storage, qwenModel: qwen, demucsModel: demucs, voxcpmModel: voxcpm, nllbModel: nllb, cudaPack });
+      set({ models, hardware, modelStorage: storage, qwenModel: qwen, demucsModel: demucs, voxcpmModel: voxcpm, genderModel: gender, nllbModel: nllb, cudaPack });
     } catch {
       // Backend offline; keep the last known state.
     }
@@ -556,6 +561,22 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     if (!response.ok) {
       const problem = await response.json().catch(() => ({}));
       throw new Error(problem.detail ?? `Unable to delete VoxCPM2 (HTTP ${response.status})`);
+    }
+    await get().refreshModels();
+  },
+  downloadGender: async () => {
+    const response = await fetch(`${apiBase}/api/models/gender/download`, { method: 'POST' });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(problem.detail ?? `Unable to start the gender classifier download (HTTP ${response.status})`);
+    }
+    void get().refreshModels();
+  },
+  deleteGender: async () => {
+    const response = await fetch(`${apiBase}/api/models/gender`, { method: 'DELETE' });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(problem.detail ?? `Unable to delete the gender classifier (HTTP ${response.status})`);
     }
     await get().refreshModels();
   },
@@ -1288,6 +1309,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       activeSeparateEngine: null,
       demucsModel: null,
       voxcpmModel: null,
+      genderModel: null,
       cudaPack: null,
       providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false } },
       voiceCapabilities: {},

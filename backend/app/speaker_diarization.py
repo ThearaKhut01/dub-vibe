@@ -8,9 +8,11 @@ speaker, so pauses and breaths never create phantom speakers.
 Pipeline position: after transcription, before translation — the labels feed
 the Characters system, where each speaker gets a persistent voice.
 
-Gender detection rides on the same pass: median fundamental frequency (F0)
-per speaker cluster classifies Female (~>160 Hz) vs Male. The gender feeds
-the automatic voice assignment in the Characters profiles.
+Gender detection rides on the same pass: an ECAPA-TDNN neural classifier
+(JaesungHuh/voice-gender-classifier, ~62 MB, downloaded once) votes over each
+cluster's voiced windows, with the median fundamental frequency (F0) as the
+fallback when the model is unavailable or unsure. The gender feeds the
+automatic voice assignment in the Characters profiles.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ from typing import Any
 
 import numpy as np
 
+from . import gender_classifier
 from .providers import get_storage_dir
 
 logger = logging.getLogger(__name__)
@@ -70,6 +73,10 @@ def assign_speakers(media_path: str, segments: list[dict[str, Any]], ffmpeg: str
     wav_path = get_storage_dir('data') / 'diarize-temp.wav'
     _extract_audio(media_path, wav_path, ffmpeg)
 
+    # The ECAPA gender model rides the same pass: one download (~62 MB), then
+    # offline. When it is unavailable the pitch fallback decides instead.
+    gender_ready = gender_classifier.ensure_downloaded()
+
     try:
         import soundfile as sf
         from resemblyzer import preprocess_wav
@@ -106,6 +113,9 @@ def assign_speakers(media_path: str, segments: list[dict[str, Any]], ffmpeg: str
         cluster_names: list[str] = []
         cluster_vectors: list[np.ndarray] = []
         cluster_pitches: dict[int, list[np.ndarray]] = {}
+        # A voiced sample per cluster (VAD-trimmed, ≤2 s) feeds the neural
+        # gender vote — the same material the F0 fallback works from.
+        cluster_voices: dict[int, list[np.ndarray]] = {}
         window_labels: list[str] = []
         for index, vector in enumerate(window_vectors):
             best_cluster, best_similarity = -1, -1.0
@@ -123,6 +133,8 @@ def assign_speakers(media_path: str, segments: list[dict[str, Any]], ffmpeg: str
             pitch = window_pitches[index]
             if pitch is not None and len(cluster_pitches.get(best_cluster, [])) < _MAX_PITCH_WINDOWS_PER_SPEAKER:
                 cluster_pitches.setdefault(best_cluster, []).append(pitch)
+            if gender_ready and len(cluster_voices.get(best_cluster, [])) < gender_classifier._MAX_WINDOWS_PER_SPEAKER:
+                cluster_voices.setdefault(best_cluster, []).append(voiced[:2 * sample_rate])
             window_labels.append(cluster_names[best_cluster])
 
         # Majority vote per Whisper segment over overlapping windows.
@@ -152,7 +164,7 @@ def assign_speakers(media_path: str, segments: list[dict[str, Any]], ffmpeg: str
         for old_name, new_name in renamed.items():
             cluster_index = cluster_names.index(old_name)
             pitches = [frame for group in cluster_pitches.get(cluster_index, []) for frame in group]
-            genders[new_name] = _classify_gender(pitches)
+            genders[new_name] = _classify_gender(pitches, cluster_voices.get(cluster_index))
         return [renamed[label] for label in labels], genders
     finally:
         wav_path.unlink(missing_ok=True)
@@ -175,9 +187,29 @@ def _pitch_track(samples: Any, sample_rate: int) -> np.ndarray | None:
         return None
 
 
-def _classify_gender(pitches: list[Any]) -> dict[str, Any]:
-    if len(pitches) < _MIN_PITCH_FRAMES:
+def _classify_gender(pitches: list[Any], voices: list[Any] | None = None) -> dict[str, Any]:
+    """Gender of a speaker cluster: the ECAPA model first, median pitch as fallback.
+
+    The neural classifier listens to the whole voice (VoxCeleb-trained, ~99%)
+    where the 160 Hz pitch threshold breaks down — a low-pitched female reads
+    as male in F0, and noisy audio drowns the harmonic. Its vote is used only
+    above its confidence floor; otherwise (model missing, unsure, or failed)
+    the dict degrades to exactly the old pitch heuristic.
+    """
+    median_f0: float | None = None
+    gender: str | None = None
+    if len(pitches) >= _MIN_PITCH_FRAMES:
+        median_f0 = float(np.median(np.asarray(pitches, dtype=np.float64)))
+        gender = 'Female' if median_f0 >= _GENDER_F0_THRESHOLD_HZ else 'Male'
+
+    classifier = gender_classifier.classify_speaker_windows(voices or [])
+    if classifier:
+        return {
+            'gender': classifier['gender'],
+            'median_f0_hz': round(median_f0, 1) if median_f0 is not None else None,
+            'gender_confidence': classifier['confidence'],
+            'gender_source': 'ecapa',
+        }
+    if gender is None:
         return {'gender': None, 'median_f0_hz': None}
-    median_f0 = float(np.median(np.asarray(pitches, dtype=np.float64)))
-    gender = 'Female' if median_f0 >= _GENDER_F0_THRESHOLD_HZ else 'Male'
     return {'gender': gender, 'median_f0_hz': round(median_f0, 1)}

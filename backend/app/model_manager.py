@@ -343,6 +343,92 @@ def delete_qwen() -> None:
     shutil.rmtree(qwen_local.qwen_model_dir(), ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Voice gender classifier (JaesungHuh/voice-gender-classifier, MIT). Small
+# (~60 MB). Auto-downloads on the first Detect Speakers run, but it is also
+# registered here so the AI Models panel can install and delete it manually.
+# ---------------------------------------------------------------------------
+
+GENDER_JOB_ID = 'ecapa-gender'
+
+
+def gender_status() -> dict:
+    from . import gender_classifier
+
+    job = _DOWNLOADS.get(GENDER_JOB_ID)
+    installed = gender_classifier.is_downloaded()
+    if job and job.get('status') == 'downloading':
+        status = 'downloading'
+    elif job and job.get('status') == 'error':
+        status = 'error'
+    elif installed:
+        status = 'installed'
+    else:
+        status = 'not_installed'
+    weights = gender_classifier.weights_path()
+    size_mb = round(weights.stat().st_size / (1024 * 1024), 1) if installed else None
+    return {
+        'id': GENDER_JOB_ID,
+        'name': 'Voice Gender Classifier (speaker detection)',
+        'repo': gender_classifier.REPO_ID,
+        'installed': installed,
+        'loaded': False,
+        'selected': False,
+        'status': status,
+        'progress': job.get('progress', 0) if job else 0,
+        'downloaded_mb': round(job.get('downloaded', 0), 1) if job else 0,
+        'total_mb': 60,
+        'size_mb': size_mb,
+        'path': str(weights) if installed else None,
+        'error': job.get('error') if job else None,
+    }
+
+
+def start_download_gender() -> dict:
+    from . import gender_classifier
+
+    with _STATE_LOCK:
+        job = _DOWNLOADS.get(GENDER_JOB_ID)
+        if job and job.get('status') == 'downloading':
+            return job
+        if gender_classifier.is_downloaded():
+            return {'status': 'installed', 'progress': 100}
+        free_bytes = shutil.disk_usage(models_root()).free
+        needed = 60 * 1024 * 1024 * 1.25
+        if free_bytes < needed:
+            raise ValueError(
+                f'Not enough disk space: {needed / 2**30:.1f} GB needed, '
+                f'{free_bytes / 2**30:.1f} GB free on {models_root()}'
+            )
+        job = {'status': 'downloading', 'progress': 0, 'downloaded': 0.0, 'error': None}
+        _DOWNLOADS[GENDER_JOB_ID] = job
+
+    def worker() -> None:
+        try:
+            def job_progress(percent: int) -> None:
+                job.update(progress=percent, downloaded=60.0 * percent / 100)
+
+            # _get_model cache is reset on delete below; an older cached model
+            # inside this process stays valid for an identical revision.
+            gender_classifier.ensure_downloaded(job_progress)
+            job.update(status='installed', progress=100)
+        except Exception as error:  # noqa: BLE001
+            job.update(status='error', error=str(error))
+
+    threading.Thread(target=worker, name='download-ecapa-gender', daemon=True).start()
+    return job
+
+
+def delete_gender() -> None:
+    from . import gender_classifier
+
+    with _STATE_LOCK:
+        job = _DOWNLOADS.get(GENDER_JOB_ID)
+        if job and job.get('status') == 'downloading':
+            raise ValueError('Cannot delete a model while it is downloading.')
+    shutil.rmtree(gender_classifier.weights_path().parent, ignore_errors=True)
+
+
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------

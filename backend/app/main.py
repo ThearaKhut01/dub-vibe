@@ -505,6 +505,29 @@ async def delete_qwen_model() -> dict[str, str]:
     return {'status': 'ok', 'deleted': 'qwen3-4b'}
 
 
+@app.get('/api/models/gender')
+async def gender_model_status() -> dict[str, Any]:
+    return model_manager.gender_status()
+
+
+@app.post('/api/models/gender/download')
+async def download_gender_model() -> dict[str, Any]:
+    try:
+        job = model_manager.start_download_gender()
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {'status': 'ok', 'model': model_manager.GENDER_JOB_ID, 'job': job}
+
+
+@app.delete('/api/models/gender')
+async def delete_gender_model() -> dict[str, str]:
+    try:
+        model_manager.delete_gender()
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {'status': 'ok', 'deleted': model_manager.GENDER_JOB_ID}
+
+
 @app.get('/api/models/cuda-pack')
 async def cuda_pack_status() -> dict[str, Any]:
     return await run_in_threadpool(cuda_pack.pack_status)
