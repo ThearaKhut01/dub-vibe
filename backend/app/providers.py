@@ -407,13 +407,17 @@ class GoogleTranslateProvider(TranslationProvider):
             return text
         query = urlencode({'client': 'gtx', 'sl': source, 'tl': target, 'dt': 't', 'q': text})
         url = f'https://translate.googleapis.com/translate_a/single?{query}'
+        # Same trust settings as the keyed providers, so a corporate CA bundle
+        # (DUBVIBE_CA_BUNDLE) fixes every online call in the app, not just some.
+        from backend.app.online_providers import _ssl_context
+
         last_error: Exception | None = None
         for attempt in range(self.max_attempts):
             try:
                 # A browser-like User-Agent avoids the aggressive throttling that
                 # the endpoint applies to default urllib clients on long runs.
                 request = Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
-                with urlopen(request, timeout=30) as response:
+                with urlopen(request, timeout=30, context=_ssl_context()) as response:
                     payload = json.load(response)
                 translated = ''.join(part[0] for part in payload[0] if part and part[0])
                 if not translated:

@@ -82,6 +82,17 @@ Open **AI Models** in the header to manage Faster-Whisper transcription models â
 | `DUBVIBE_MODELS_DIR` | Where Whisper/Argos models are stored (default `<AppRoot>\models`, falling back to `%LOCALAPPDATA%\DubVibe\models`) |
 | `DUBVIBE_WHISPER_MODEL` | Whisper model size (`base` default) |
 | `DUBVIBE_ALLOWED_ORIGINS` | Extra browser origins allowed to call the local API |
+| `DUBVIBE_CA_BUNDLE` | Extra PEM file of trusted root CAs, added on top of the Windows store (for corporate TLS inspection) |
+
+### Corporate networks and SSL inspection
+
+If an online provider fails with `<urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate>`,
+a firewall (FortiGate, Zscaler, Palo Alto...) is re-signing HTTPS traffic with a private CA that Windows does not trust. Certificate
+verification is never disabled. Fix it by one of:
+
+1. Have IT install the inspection root CA in the Windows **Trusted Root Certification Authorities** store (machine or user).
+2. Have IT exempt `codecraftapi.com` (or the affected host) from SSL inspection.
+3. Point `DUBVIBE_CA_BUNDLE` at that CA exported as a PEM file and restart the app.
 
 ## Project goals
 

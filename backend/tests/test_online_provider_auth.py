@@ -7,7 +7,11 @@ fake transport so a regression fails here instead of at the provider.
 from __future__ import annotations
 
 import json
+import ssl
+import urllib.error
 import urllib.request
+
+import pytest
 
 from backend.app import online_providers
 
@@ -29,9 +33,10 @@ class _FakeResponse:
 def _capture(monkeypatch, payload: bytes) -> dict:
     seen: dict = {}
 
-    def fake_urlopen(request, timeout=None):
+    def fake_urlopen(request, timeout=None, **kwargs):
         seen['request'] = request
         seen['timeout'] = timeout
+        seen['kwargs'] = kwargs
         return _FakeResponse(payload)
 
     monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
@@ -108,3 +113,58 @@ def test_codecraft_retries_with_a_listed_model_when_the_default_is_retired(monke
     monkeypatch.setattr(online_providers, '_request_json', fake_request)
     assert online_providers.codecraft_chat('cc-123', [{'role': 'user', 'content': 'hi'}]) == 'Bonjour'
     assert calls[-1][1]['model'] == 'cheapest-chat'
+
+
+def _certificate_error() -> urllib.error.URLError:
+    reason = ssl.SSLCertVerificationError(1, 'certificate verify failed: unable to get local issuer certificate')
+    return urllib.error.URLError(reason)
+
+
+def test_request_json_explains_tls_verification_failure(monkeypatch):
+    """A corporate firewall re-signing the host must not surface as a bare OSError."""
+
+    def boom(*args, **kwargs):
+        raise _certificate_error()
+
+    monkeypatch.setattr(urllib.request, 'urlopen', boom)
+    with pytest.raises(RuntimeError) as caught:
+        online_providers._request_json('https://codecraftapi.com/v1/models', 'cc-123')
+    message = str(caught.value)
+    assert 'DUBVIBE_CA_BUNDLE' in message
+    assert 'certificate verify failed' in message
+
+
+def test_request_json_leaves_other_network_errors_alone(monkeypatch):
+    def boom(*args, **kwargs):
+        raise urllib.error.URLError('connection refused')
+
+    monkeypatch.setattr(urllib.request, 'urlopen', boom)
+    with pytest.raises(urllib.error.URLError):
+        online_providers._request_json('https://codecraftapi.com/v1/models', 'cc-123')
+
+
+def test_openai_tts_explains_tls_verification_failure(monkeypatch, tmp_path):
+    def boom(*args, **kwargs):
+        raise _certificate_error()
+
+    monkeypatch.setattr(urllib.request, 'urlopen', boom)
+    with pytest.raises(RuntimeError, match='DUBVIBE_CA_BUNDLE'):
+        online_providers.openai_synthesize('key-123', 'hello', str(tmp_path / 'line.mp3'))
+
+
+def test_https_calls_use_the_shared_tls_context(monkeypatch):
+    seen = _capture(monkeypatch, json.dumps({'data': [{'id': 'tts-1'}]}).encode('utf-8'))
+    online_providers.openai_list_models('key-123')
+    assert seen['kwargs'].get('context') is online_providers._ssl_context()
+
+
+def test_tls_context_never_disables_verification(monkeypatch, tmp_path):
+    """An unusable DUBVIBE_CA_BUNDLE is logged, not turned into an insecure context."""
+    monkeypatch.setenv('DUBVIBE_CA_BUNDLE', str(tmp_path / 'missing.pem'))
+    online_providers._ssl_context.cache_clear()
+    try:
+        context = online_providers._ssl_context()
+    finally:
+        online_providers._ssl_context.cache_clear()
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True

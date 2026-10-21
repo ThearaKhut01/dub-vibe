@@ -15,11 +15,17 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import os
 import re
+import ssl
 import time
 import urllib.error
 import urllib.request
 import wave
+from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 
 GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta'
 OPENAI_BASE = 'https://api.openai.com/v1'
@@ -207,6 +213,44 @@ def _auth_headers(url: str, key: str) -> dict[str, str]:
     return headers
 
 
+@lru_cache(maxsize=1)
+def _ssl_context() -> ssl.SSLContext:
+    """TLS context shared by every online provider.
+
+    Uses the OS trust store (on Windows that includes the machine and user
+    ROOT/CA stores). Corporate networks often terminate HTTPS with a firewall
+    that re-signs traffic using a private CA (FortiGate, Zscaler, Palo Alto...).
+    That CA has to be trusted by the OS, or supplied explicitly through
+    ``DUBVIBE_CA_BUNDLE`` (a PEM file). Verification is never disabled here.
+    """
+    context = ssl.create_default_context()
+    extra = (
+        os.environ.get('DUBVIBE_CA_BUNDLE')
+        or os.environ.get('REQUESTS_CA_BUNDLE')
+        or os.environ.get('SSL_CERT_FILE')
+    )
+    if extra:
+        try:
+            context.load_verify_locations(cafile=extra)
+        except OSError as error:
+            logger.warning('Ignoring CA bundle %s: %s', extra, error)
+    return context
+
+
+def _tls_error_hint(error: BaseException) -> str | None:
+    """Human explanation for a certificate-verification failure, or None."""
+    reason = getattr(error, 'reason', error)
+    if isinstance(reason, ssl.SSLCertVerificationError) or 'CERTIFICATE_VERIFY_FAILED' in str(reason):
+        return (
+            'TLS certificate verification failed. On a corporate network a firewall '
+            '(FortiGate, Zscaler, Palo Alto...) may be inspecting HTTPS with a private '
+            'CA that Windows does not trust. Ask IT to install that root CA in Windows '
+            '(or exempt this host from inspection), or set DUBVIBE_CA_BUNDLE to the CA '
+            'PEM file and restart the app.'
+        )
+    return None
+
+
 def _request_json(url: str, key: str, body: dict | None = None, timeout: int = 60) -> dict:
     request = urllib.request.Request(
         url,
@@ -214,8 +258,17 @@ def _request_json(url: str, key: str, body: dict | None = None, timeout: int = 6
         headers=_auth_headers(url, key),
         method='POST' if body is not None else 'GET',
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode('utf-8'))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError:
+        # A real API response (401/429/...): the caller reads the status and body.
+        raise
+    except urllib.error.URLError as error:
+        hint = _tls_error_hint(error)
+        if hint:
+            raise RuntimeError(f'{hint} ({getattr(error, "reason", error)})') from error
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -481,11 +534,16 @@ def openai_synthesize(key: str, text: str, out_path: str, model: str = OPENAI_DE
         method='POST',
     )
     try:
-        with urllib.request.urlopen(request, timeout=180) as response:
+        with urllib.request.urlopen(request, timeout=180, context=_ssl_context()) as response:
             audio = response.read()
     except urllib.error.HTTPError as error:
         detail = error.read().decode('utf-8', errors='replace')[:300]
         raise RuntimeError(f'OpenAI TTS failed ({error.code}): {detail}') from error
+    except urllib.error.URLError as error:
+        hint = _tls_error_hint(error)
+        if hint:
+            raise RuntimeError(f'{hint} ({getattr(error, "reason", error)})') from error
+        raise
     with open(out_path, 'wb') as audio_file:
         audio_file.write(audio)
     return out_path
