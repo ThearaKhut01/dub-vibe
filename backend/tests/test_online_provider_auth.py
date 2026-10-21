@@ -201,3 +201,51 @@ def test_http_error_detail_explains_a_cloudflare_block():
     detail = online_providers._http_error_detail(error)
     assert 'Cloudflare' in detail
     assert 'developers.cloudflare.com' not in detail
+
+
+def _quota_402(url: str) -> urllib.error.HTTPError:
+    import io
+
+    body = (b'{"error":{"code":"insufficient_quota","message":"Billing verification failed. '
+            b'Please check your payment method."}}')
+    return urllib.error.HTTPError(url, 402, 'Payment Required', {}, io.BytesIO(body))
+
+
+def test_codecraft_402_parks_the_engine_after_one_request(monkeypatch):
+    """A dead allowance must cost one request, not one per subtitle line."""
+    calls: list[int] = []
+    monkeypatch.setattr(online_providers, '_billing_blocked_until', {})
+
+    def fake_request(*args, **kwargs):
+        calls.append(1)
+        raise _quota_402('https://codecraftapi.com/v1/chat/completions')
+
+    monkeypatch.setattr(online_providers, '_request_json', fake_request)
+    messages = [{'role': 'user', 'content': 'hi'}]
+    with pytest.raises(RuntimeError, match='no remaining allowance'):
+        online_providers.codecraft_chat('cc-123', messages)
+    with pytest.raises(RuntimeError, match='no remaining allowance'):
+        online_providers.codecraft_chat('cc-123', messages)
+    assert len(calls) == 1
+
+
+def test_successful_codecraft_call_clears_a_parked_engine(monkeypatch):
+    import time
+
+    state = {'codecraft': time.monotonic() - 1}
+    monkeypatch.setattr(online_providers, '_billing_blocked_until', state)
+    payload = {'choices': [{'message': {'content': 'Bonjour'}}]}
+    _capture(monkeypatch, json.dumps(payload).encode('utf-8'))
+    assert online_providers.codecraft_chat('cc-123', [{'role': 'user', 'content': 'hi'}]) == 'Bonjour'
+    assert 'codecraft' not in state
+
+
+def test_openai_402_parks_openai_too(monkeypatch):
+    monkeypatch.setattr(online_providers, '_billing_blocked_until', {})
+
+    def fake_request(*args, **kwargs):
+        raise _quota_402('https://api.openai.com/v1/chat/completions')
+
+    monkeypatch.setattr(online_providers, '_request_json', fake_request)
+    with pytest.raises(RuntimeError, match='no remaining allowance'):
+        online_providers.openai_chat('key-123', [{'role': 'user', 'content': 'hi'}])

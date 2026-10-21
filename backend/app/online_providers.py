@@ -64,6 +64,12 @@ _GEMINI_TEXT_TRANSIENT_RETRIES = 2
 # After a full sweep hits quota on every model, skip Gemini for this long so the
 # rest of the run falls back immediately instead of re-probing every line.
 _GEMINI_QUOTA_COOLDOWN_SECONDS = 600.0
+# A 402 (no allowance / billing) will not fix itself mid-run, so an OpenAI-style
+# provider that answers it is parked for a while: without this, every subtitle
+# line repeats the same failed request and the run crawls.
+_BILLING_COOLDOWN_SECONDS = 600.0
+# provider -> time.monotonic() before which calls are skipped.
+_billing_blocked_until: dict[str, float] = {}
 # key -> time.monotonic() before which Gemini text is not worth trying.
 _gemini_quota_blocked_until: dict[str, float] = {}
 # key -> model that answered successfully, so later lines skip the probing.
@@ -374,6 +380,36 @@ def gemini_list_chat_models(key: str) -> list[str]:
     return sorted(names)
 
 
+def _billing_block_remaining(provider: str) -> float:
+    """Seconds left before this provider is worth calling again (0 when ready)."""
+    return _billing_blocked_until.get(provider, 0.0) - time.monotonic()
+
+
+def _park_billing_error(provider: str, error: urllib.error.HTTPError, label: str) -> RuntimeError:
+    """Park a provider that answered 402 and explain why the chain moves on."""
+    _billing_blocked_until[provider] = time.monotonic() + _BILLING_COOLDOWN_SECONDS
+    return RuntimeError(
+        f'{label} has no remaining allowance ({_http_error_detail(error)}). '
+        f'Skipping {label} for {int(_BILLING_COOLDOWN_SECONDS // 60)} minutes so the '
+        'fallback engine handles this line; top up and restart to use it again.'
+    )
+
+
+def _billing_parked(provider: str, label: str) -> RuntimeError | None:
+    """Fast-fail before the network when the provider is still parked."""
+    if _billing_block_remaining(provider) > 0:
+        return RuntimeError(
+            f'{label} has no remaining allowance (last call returned HTTP 402); '
+            'using the fallback engine.'
+        )
+    return None
+
+
+def _clear_billing_block(provider: str) -> None:
+    """A successful call proves the allowance is back; stop skipping the provider."""
+    _billing_blocked_until.pop(provider, None)
+
+
 def _http_error_detail(error: urllib.error.HTTPError) -> str:
     """Short, human-readable reason from a Gemini/OpenAI error response."""
     try:
@@ -572,7 +608,16 @@ def openai_chat(key: str, messages: list[dict], model: str = 'gpt-4o-mini', json
     body: dict = {'model': model, 'messages': messages}
     if json_mode:
         body['response_format'] = {'type': 'json_object'}
-    payload = _request_json(f'{OPENAI_BASE}/chat/completions', key, body, timeout=timeout)
+    parked = _billing_parked('openai', 'OpenAI')
+    if parked is not None:
+        raise parked
+    try:
+        payload = _request_json(f'{OPENAI_BASE}/chat/completions', key, body, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        if error.code == 402:
+            raise _park_billing_error('openai', error, 'OpenAI') from error
+        raise
+    _clear_billing_block('openai')
     try:
         return payload['choices'][0]['message']['content']
     except (KeyError, IndexError) as error:
@@ -652,9 +697,15 @@ def codecraft_chat(key: str, messages: list[dict], model: str = CODECRAFT_DEFAUL
     """
     url = f'{CODECRAFT_BASE}/chat/completions'
     body: dict = {'model': model, 'messages': messages}
+    parked = _billing_parked('codecraft', 'CodeCraft')
+    if parked is not None:
+        raise parked
     try:
         payload = _request_json(url, key, body, timeout=timeout)
     except urllib.error.HTTPError as error:
+        if error.code == 402:
+            # No allowance on the account: one request is enough to learn that.
+            raise _park_billing_error('codecraft', error, 'CodeCraft') from error
         if error.code != 404:
             raise RuntimeError(f'CodeCraft translation failed ({_http_error_detail(error)})') from error
         fallback = _codecraft_fallback_model(key)
@@ -666,9 +717,12 @@ def codecraft_chat(key: str, messages: list[dict], model: str = CODECRAFT_DEFAUL
         try:
             payload = _request_json(url, key, body, timeout=timeout)
         except urllib.error.HTTPError as retry_error:
+            if retry_error.code == 402:
+                raise _park_billing_error('codecraft', retry_error, 'CodeCraft') from retry_error
             raise RuntimeError(
                 f'CodeCraft translation failed ({_http_error_detail(retry_error)})'
             ) from retry_error
+    _clear_billing_block('codecraft')
     try:
         content = payload['choices'][0]['message']['content']
     except (KeyError, IndexError, TypeError) as error:
