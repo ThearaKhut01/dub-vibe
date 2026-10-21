@@ -160,6 +160,65 @@ def test_failed_paid_engine_falls_back_and_reports_the_real_engine(keys, monkeyp
     assert translator.active_mode == 'online'
 
 
+# --- Wrong-script protection (Khmer must never be dubbed from English text) --
+
+def test_script_validation_rules():
+    """The validator accepts real translations and rejects wrong-script answers."""
+    assert providers._translation_script_ok('សួស្តី', 'hello', 'en', 'Khmer')
+    assert not providers._translation_script_ok('hello', 'hello', 'en', 'Khmer')
+    assert not providers._translation_script_ok('Sorry, I cannot help with that.', 'hello', 'en', 'Khmer')
+    # A brand name inside a real Khmer translation stays acceptable.
+    assert providers._translation_script_ok('សួស្តី OK', 'hello', 'en', 'Khmer')
+    # Latin-script targets are never script-checked.
+    assert providers._translation_script_ok('Bonjour', 'hello', 'en', 'French')
+    # Pure numbers/punctuation have nothing to verify.
+    assert providers._translation_script_ok('1234', '1234', 'en', 'Khmer')
+
+
+def test_wrong_script_answer_gets_one_corrective_retry(keys, monkeypatch):
+    """English instead of Khmer is refused: one retry with the requirement spelled out."""
+    keys['gemini'] = 'g-key'
+    seen: list[list[dict]] = []
+
+    def fake_chat(key, messages, model=None, timeout=90):
+        seen.append(messages)
+        if len(seen) == 1:
+            return 'Sorry, I cannot help with that.'
+        return 'សួស្តី'
+
+    monkeypatch.setattr('backend.app.online_providers.gemini_chat', fake_chat)
+    provider = GeminiTranslationProvider()
+    assert provider.translate('hello', 'Khmer', 'en') == 'សួស្តី'
+    assert len(seen) == 2
+    # The first prompt already demands the native script; the retry repeats it harder.
+    assert 'native script' in seen[0][0]['content']
+    assert 'Khmer script' in seen[1][0]['content']
+
+
+def test_engine_that_never_returns_khmer_fails_over_to_the_next_engine(keys, monkeypatch):
+    """Two wrong-script answers raise, and the chain dubs with the next engine."""
+    keys['gemini'] = 'g-key'
+    monkeypatch.setattr(
+        'backend.app.online_providers.gemini_chat',
+        lambda *args, **kwargs: 'This is English, not Khmer.',
+    )
+    monkeypatch.setattr(
+        providers.GoogleTranslateProvider, 'translate',
+        lambda self, text, target, source='en': 'ជំរាបសួរ',
+    )
+    translator = HybridTranslationProvider(preference='gemini')
+    assert translator.translate('hello', 'Khmer') == 'ជំរាបសួរ'
+    assert translator.active_mode == 'online'
+
+
+def test_echoed_source_is_rejected_for_khmer(keys, monkeypatch):
+    """The English line coming back unchanged is never accepted as a Khmer dub."""
+    keys['codecraft'] = 'cc-key'
+    monkeypatch.setattr('backend.app.online_providers.codecraft_chat', lambda *a, **k: 'hello')
+    with pytest.raises(RuntimeError, match='did not return Khmer'):
+        CodeCraftTranslationProvider().translate('hello', 'Khmer', 'en')
+
+
 def test_provider_health_reports_online_translation_engines(keys):
     rows = {row['id']: row for row in providers.get_provider_status()}
     assert rows['gemini']['mode'] == 'PAID API'

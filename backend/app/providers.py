@@ -230,6 +230,64 @@ def _resolve_lang_code(language: str) -> str:
     return LANGUAGE_CODES.get(language, language.lower()[:2])
 
 
+# ---------------------------------------------------------------------------
+# Target-script validation for translated lines
+# ---------------------------------------------------------------------------
+
+# Unicode script ranges for the non-Latin writing systems the app can target,
+# keyed by ISO 639-1 code. Latin-script targets (fr, es, de, vi...) have no
+# script guarantee to verify, so they are absent on purpose.
+NON_LATIN_SCRIPT_RANGES: dict[str, str] = {
+    'km': '\u1780-\u17FF',               # Khmer: consonants, vowels, signs, digits
+    'th': '\u0E00-\u0E7F',               # Thai (also lo partly)
+    'zh': '\u4E00-\u9FFF',               # CJK unified ideographs
+    'ja': '\u3040-\u30FF\u4E00-\u9FFF',  # kana + kanji
+    'ko': '\uAC00-\uD7AF\u1100-\u11FF',  # Hangul syllables + jamo
+    'ru': '\u0400-\u04FF',               # Cyrillic (also uk, bg, sr...)
+    'ar': '\u0600-\u06FF',               # Arabic (also fa, ur...)
+    'hi': '\u0900-\u097F',               # Devanagari (also mr, ne...)
+}
+
+
+def target_uses_non_latin_script(target_language: str) -> bool:
+    """Return True when the target language is written in a non-Latin script."""
+    return _resolve_lang_code(target_language) in NON_LATIN_SCRIPT_RANGES
+
+
+def _translation_script_ok(
+    text: str, source_text: str, source_language: str, target_language: str,
+) -> bool:
+    """Return True when `text` plausibly IS a translation into the target language.
+
+    The most damaging online-engine failure for dubbing is an answer in the wrong
+    script — an English refusal, a transliteration, or the source line echoed
+    back — which would be dubbed as English-sounding audio over the video. For a
+    non-Latin target the result must actually be written in that script, and
+    Latin letters must not dominate it (a brand name inside a real translation
+    stays acceptable). Latin-script targets and number-only lines carry nothing
+    to verify and always pass.
+    """
+    script = NON_LATIN_SCRIPT_RANGES.get(_resolve_lang_code(target_language))
+    if script is None:
+        return True
+
+    source = str(source_text or '')
+    if not re.search(r'[A-Za-z]', source):
+        return True  # pure numbers/punctuation: no script to check against
+
+    body = str(text or '').strip()
+    if not body:
+        return False
+    if re.sub(r'\s+', ' ', body).casefold() == re.sub(r'\s+', ' ', source).strip().casefold():
+        return False  # the source came back unchanged
+
+    script_chars = len(re.findall(f'[{script}]', body))
+    if script_chars == 0:
+        return False
+    latin_chars = len(re.findall('[A-Za-z]', body))
+    return latin_chars <= script_chars
+
+
 def _argos_available() -> bool:
     """Return True if argostranslate is installed and importable."""
     try:
@@ -422,6 +480,13 @@ class GoogleTranslateProvider(TranslationProvider):
                 translated = ''.join(part[0] for part in payload[0] if part and part[0])
                 if not translated:
                     raise RuntimeError('Google Translate returned an empty result')
+                # Guard the last-resort engine too: a wrong-script answer (rare,
+                # but possible for Khmer on edge cases) must fail the line and
+                # surface the error rather than be dubbed as gibberish.
+                if not _translation_script_ok(translated, text, source_language, target_language):
+                    raise RuntimeError(
+                        f'Google Translate returned text that is not in {target_language}'
+                    )
                 return translated
             except Exception as error:
                 last_error = error
@@ -472,6 +537,11 @@ class OnlineLLMTranslationProvider(TranslationProvider):
             'Keep it natural, spoken, and concise — like real movie dialogue. '
             'Preserve tone and emotion. Respond ONLY with the translation, no notes.'
         )
+        if target_uses_non_latin_script(target_language):
+            system += (
+                f' Write the line in {target_language} native script only — never '
+                f'transliterate, never repeat the {source_language} text, never explain.'
+            )
         if self.style_hint:
             system += f' Character/style direction: {self.style_hint}'
         return [
@@ -482,14 +552,42 @@ class OnlineLLMTranslationProvider(TranslationProvider):
     def _complete(self, messages: list[dict], key: str) -> str:  # pragma: no cover - overridden
         raise NotImplementedError
 
+    @staticmethod
+    def _clean_result(result: object) -> str:
+        return str(result or '').strip().strip('"“”').strip()
+
     def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
         if not str(text or '').strip():
             return ''
-        result = self._complete(self._messages(text, target_language, source_language), self._key())
-        cleaned = str(result or '').strip().strip('"“”').strip()
+        key = self._key()
+        messages = self._messages(text, target_language, source_language)
+        cleaned = self._clean_result(self._complete(messages, key))
         if not cleaned:
             raise RuntimeError(f'{self._provider_label()} returned an empty translation')
-        return cleaned
+        if _translation_script_ok(cleaned, text, source_language, target_language):
+            return cleaned
+        # Wrong script (an English refusal, a transliteration, or the source echoed
+        # back): one corrective retry with the requirement spelled out. A second bad
+        # answer raises so the hybrid chain falls over to the next engine instead of
+        # dubbing the wrong language into the video.
+        retry_messages = [
+            {
+                'role': 'system',
+                'content': (
+                    messages[0]['content']
+                    + f' Your previous attempt was NOT in {target_language}. Answer with '
+                    f'ONLY the {target_language} text, written in the {target_language} script.'
+                ),
+            },
+            messages[1],
+        ]
+        retried = self._clean_result(self._complete(retry_messages, key))
+        if retried and _translation_script_ok(retried, text, source_language, target_language):
+            return retried
+        raise RuntimeError(
+            f'{self._provider_label()} did not return {target_language} text'
+            + (f' (got: {cleaned[:60]})' if cleaned else '')
+        )
 
 
 class GeminiTranslationProvider(OnlineLLMTranslationProvider):
