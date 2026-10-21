@@ -234,6 +234,7 @@ function App() {
   const [showApiKeys, setShowApiKeys] = useState(false);
   const [geminiKeyInput, setGeminiKeyInput] = useState('');
   const [openaiKeyInput, setOpenaiKeyInput] = useState('');
+  const [codecraftKeyInput, setCodecraftKeyInput] = useState('');
   const [keyTestMessage, setKeyTestMessage] = useState('');
   const [keyBusy, setKeyBusy] = useState<string | null>(null);
   const [ttsProvider, setTtsProvider] = useState(() => localStorage.getItem('dubvibe-tts-provider') ?? 'auto');
@@ -1023,6 +1024,7 @@ function App() {
         google: 'google_translate',
         gemini: 'gemini',
         openai: 'openai',
+        codecraft: 'codecraft',
       };
       if (activeTranslateEngine && engineRows[activeTranslateEngine]) {
         return new Set([engineRows[activeTranslateEngine]]);
@@ -2655,11 +2657,16 @@ function App() {
                   <option value="openai" disabled={!providerKeys.openai.has_key}>
                     OpenAI (online){providerKeys.openai.has_key ? ' — key configured' : ' — add a key in API Settings'}
                   </option>
+                  <option value="codecraft" disabled={!providerKeys.codecraft.has_key}>
+                    CodeCraft (online){providerKeys.codecraft.has_key ? ' — key configured' : ' — add a key in API Settings'}
+                  </option>
                 </select>
                 <p className="mt-1 text-[10px] leading-4 text-slate-500">
                   {translationProvider === 'gemini' || translationProvider === 'openai'
                     ? 'Paid engine: every translated line is a billed API request. Uses the same key as the voice engine.'
-                    : 'Local engines are free. Paid API keys are only used when you pick that engine — Auto never spends money.'}
+                    : translationProvider === 'codecraft'
+                      ? 'CodeCraft free tier: 1M tokens/month, no card required. Translation only — it has no voice engine.'
+                      : 'Local engines are free. Online API keys are only used when you pick that engine — Auto never spends money.'}
                   {' '}If the selected engine fails on a line, the next best engine takes over automatically.
                 </p>
               </div>
@@ -3170,23 +3177,37 @@ function App() {
               <div>
                 <h2 className="text-lg font-semibold">Online AI Providers</h2>
                 <p className="text-xs text-slate-500">
-                  Keys are stored in Windows Credential Manager — never in the browser. Each key enables both
+                  Keys are stored in Windows Credential Manager — never in the browser. Gemini and OpenAI keys enable
                   <span className="text-slate-300"> dubbing (TTS)</span> and
-                  <span className="text-slate-300"> translation</span> with that provider.
+                  <span className="text-slate-300"> translation</span>; the CodeCraft key adds
+                  <span className="text-slate-300"> free-tier translation</span>.
                 </p>
               </div>
               <button onClick={() => setShowApiKeys(false)} className="rounded p-1 text-slate-500 hover:text-white transition">✕</button>
             </div>
             <div className="flex-1 overflow-y-auto px-5 py-4">
-              {(['gemini', 'openai'] as const).map((provider) => {
+              {([
+                {
+                  id: 'gemini', label: 'Google Gemini',
+                  placeholder: 'Paste your Google AI API key (AI Studio)',
+                  value: geminiKeyInput, setValue: setGeminiKeyInput,
+                },
+                {
+                  id: 'openai', label: 'OpenAI',
+                  placeholder: 'Paste your OpenAI API key (sk-...)',
+                  value: openaiKeyInput, setValue: setOpenaiKeyInput,
+                },
+                {
+                  id: 'codecraft', label: 'CodeCraft',
+                  placeholder: 'Paste your CodeCraft API key (cc_...)',
+                  value: codecraftKeyInput, setValue: setCodecraftKeyInput,
+                },
+              ] as const).map(({ id: provider, label, placeholder, value, setValue }) => {
                 const configured = providerKeys[provider]?.has_key;
-                const isGemini = provider === 'gemini';
-                const value = isGemini ? geminiKeyInput : openaiKeyInput;
-                const setValue = isGemini ? setGeminiKeyInput : setOpenaiKeyInput;
                 return (
                   <div key={provider} className="mb-4 rounded-xl border border-white/10 bg-slate-900/80 p-3">
                     <div className="mb-2 flex items-center justify-between">
-                      <p className="text-sm font-medium text-slate-200">{isGemini ? 'Google Gemini' : 'OpenAI'}</p>
+                      <p className="text-sm font-medium text-slate-200">{label}</p>
                       <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${configured ? 'bg-emerald-500/20 text-emerald-200' : 'bg-slate-700/60 text-slate-300'}`}>
                         {configured ? '●— Key stored' : '○ Not configured'}
                       </span>
@@ -3195,7 +3216,7 @@ function App() {
                       type="password"
                       value={value}
                       onChange={(event) => setValue(event.target.value)}
-                      placeholder={isGemini ? 'Paste your Google AI API key (AI Studio)' : 'Paste your OpenAI API key (sk-...)'}
+                      placeholder={placeholder}
                       spellCheck={false}
                       className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-200"
                     />
@@ -3234,6 +3255,14 @@ function App() {
                       <p className="mt-1.5 text-[10px] leading-4 text-slate-500">
                         This is the OpenAI <span className="text-slate-400">API</span> key from platform.openai.com — your ChatGPT subscription is not used here.
                         It powers OpenAI voice dubbing, translation, acting analysis, and the translation review pass.
+                      </p>
+                    )}
+                    {provider === 'codecraft' && (
+                      <p className="mt-1.5 text-[10px] leading-4 text-slate-500">
+                        Get a key at codecraftapi.com — the free tier includes 1M tokens/month with no card required.
+                        CodeCraft powers <span className="text-slate-400">translation only</span> (OpenAI-compatible
+                        chat models); voice dubbing still uses Edge, Gemini, or OpenAI. The engine is only used when you
+                        pick it in the Translation engine list.
                       </p>
                     )}
                   </div>

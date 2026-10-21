@@ -616,6 +616,12 @@ async def test_provider(provider: str) -> dict[str, Any]:
 
             result = await run_in_threadpool(gemini_test, key)
             text = await run_in_threadpool(gemini_text_test, key)
+        elif provider == 'codecraft':
+            from backend.app.online_providers import codecraft_text_test
+
+            # CodeCraft is translation-only: it exposes no speech endpoint.
+            result = {'models': []}
+            text = await run_in_threadpool(codecraft_text_test, key)
         else:
             from backend.app.online_providers import openai_test, openai_text_test
 

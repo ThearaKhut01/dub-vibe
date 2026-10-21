@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 
-PROVIDERS = ('gemini', 'openai')
+PROVIDERS = ('gemini', 'openai', 'codecraft')
 _SERVICE = 'DubVibe Studio'
 
 _LOCK = threading.Lock()

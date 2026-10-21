@@ -14,6 +14,7 @@ import pytest
 
 from backend.app import api_keys, providers
 from backend.app.providers import (
+    CodeCraftTranslationProvider,
     GeminiTranslationProvider,
     HybridTranslationProvider,
     OpenAITranslationProvider,
@@ -35,20 +36,21 @@ def _fake_time(now: float = 0.0) -> types.SimpleNamespace:
 
 
 def test_engines_are_registered():
-    assert ONLINE_TRANSLATION_ENGINES == ('gemini', 'openai')
+    assert ONLINE_TRANSLATION_ENGINES == ('gemini', 'openai', 'codecraft')
     assert GeminiTranslationProvider.ENGINE == 'gemini'
     assert OpenAITranslationProvider.ENGINE == 'openai'
+    assert CodeCraftTranslationProvider.ENGINE == 'codecraft'
 
 
-def test_auto_never_uses_a_paid_engine(keys):
-    """A configured key must not start billing the user from the default engine."""
+def test_auto_never_uses_a_keyed_engine(keys):
+    """A configured key must not start billing or spending quota from Auto."""
     keys['gemini'] = 'g-key'
     keys['openai'] = 'o-key'
+    keys['codecraft'] = 'cc-key'
     translator = HybridTranslationProvider(preference='auto')
-    assert translator.first_engine() != 'gemini'
-    assert translator.first_engine() != 'openai'
-    assert 'gemini' not in [key for key, _ in translator._chain()]
-    assert 'openai' not in [key for key, _ in translator._chain()]
+    for engine in ONLINE_TRANSLATION_ENGINES:
+        assert translator.first_engine() != engine
+        assert engine not in [key for key, _ in translator._chain()]
 
 
 @pytest.mark.parametrize('engine', ONLINE_TRANSLATION_ENGINES)
@@ -70,6 +72,8 @@ def test_missing_key_reports_which_provider(keys):
         HybridTranslationProvider(preference='openai').check_preferred_engine('Khmer', 'en')
     with pytest.raises(RuntimeError, match='Gemini API key is not configured'):
         HybridTranslationProvider(preference='gemini').check_preferred_engine('Khmer', 'en')
+    with pytest.raises(RuntimeError, match='CodeCraft API key is not configured'):
+        HybridTranslationProvider(preference='codecraft').check_preferred_engine('Khmer', 'en')
 
 
 def test_gemini_translation_goes_through_gemini_chat(keys, monkeypatch):
@@ -105,9 +109,30 @@ def test_openai_translation_goes_through_openai_chat(keys, monkeypatch):
     assert seen['key'] == 'o-key'
 
 
+def test_codecraft_translation_goes_through_codecraft_chat(keys, monkeypatch):
+    keys['codecraft'] = 'cc-key'
+    seen: dict = {}
+
+    def fake_chat(key, messages, model=None, timeout=90):
+        seen['key'] = key
+        seen['model'] = model
+        seen['messages'] = messages
+        return 'សួស្តី'
+
+    monkeypatch.setattr('backend.app.online_providers.codecraft_chat', fake_chat)
+    provider = CodeCraftTranslationProvider()
+    assert provider.translate('hello', 'Khmer', 'en') == 'សួស្តី'
+    assert seen['key'] == 'cc-key'
+    # The same dubbing prompt as the other hosted engines.
+    assert 'Khmer' in seen['messages'][0]['content']
+    assert seen['messages'][-1] == {'role': 'user', 'content': 'hello'}
+
+
 def test_engine_without_a_key_raises_on_translate(keys):
     with pytest.raises(RuntimeError, match='API key is not configured'):
         GeminiTranslationProvider().translate('hello', 'Khmer')
+    with pytest.raises(RuntimeError, match='CodeCraft API key is not configured'):
+        CodeCraftTranslationProvider().translate('hello', 'Khmer')
 
 
 def test_empty_translation_is_an_error(keys, monkeypatch):
@@ -139,10 +164,14 @@ def test_provider_health_reports_online_translation_engines(keys):
     rows = {row['id']: row for row in providers.get_provider_status()}
     assert rows['gemini']['mode'] == 'PAID API'
     assert rows['openai']['mode'] == 'PAID API'
+    assert rows['codecraft']['mode'] == 'FREE ONLINE'
     assert rows['gemini']['connected'] is False
+    assert rows['codecraft']['connected'] is False
     keys['gemini'] = 'g-key'
+    keys['codecraft'] = 'cc-key'
     rows = {row['id']: row for row in providers.get_provider_status()}
     assert rows['gemini']['connected'] is True
+    assert rows['codecraft']['connected'] is True
 
 
 # --- Gemini text model selection -------------------------------------------

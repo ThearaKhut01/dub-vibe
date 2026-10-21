@@ -23,6 +23,9 @@ import wave
 
 GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta'
 OPENAI_BASE = 'https://api.openai.com/v1'
+# CodeCraft is an OpenAI-compatible aggregator with a free monthly token tier
+# (1M tokens/month, no card). Translation only: it exposes no speech endpoint.
+CODECRAFT_BASE = 'https://codecraftapi.com/v1'
 
 GEMINI_DEFAULT_MODEL = 'gemini-2.5-flash-preview-tts'
 OPENAI_DEFAULT_MODEL = 'gpt-4o-mini-tts'
@@ -33,6 +36,10 @@ OPENAI_DEFAULT_MODEL = 'gpt-4o-mini-tts'
 # caches the first one that works.
 GEMINI_DEFAULT_CHAT_MODEL = 'gemini-flash-latest'
 OPENAI_DEFAULT_CHAT_MODEL = 'gpt-4o-mini'
+# Cheap, strong multilingual chat model from the CodeCraft catalog. Model names
+# are retired over time, so codecraft_chat falls back to another listed chat
+# model on a 404 instead of failing the translation run.
+CODECRAFT_DEFAULT_CHAT_MODEL = 'deepseek-v4-flash-0731'
 # One subtitle line does not need more than this; a slow model is skipped instead
 # of stalling the whole translation run.
 _GEMINI_TEXT_ATTEMPT_TIMEOUT = 20
@@ -191,11 +198,11 @@ def _auth_headers(url: str, key: str) -> dict[str, str]:
     """Request headers with the provider's auth in the place it expects it.
 
     Gemini takes its key in the query string (the callers append it), while every
-    OpenAI endpoint requires an `Authorization: Bearer <key>` header. Without it
-    every OpenAI call fails with 401.
+    OpenAI and CodeCraft endpoint requires an `Authorization: Bearer <key>` header.
+    Without it those calls fail with 401.
     """
     headers = {'Content-Type': 'application/json'}
-    if url.startswith(OPENAI_BASE):
+    if url.startswith((OPENAI_BASE, CODECRAFT_BASE)):
         headers['Authorization'] = f'Bearer {key}'
     return headers
 
@@ -512,3 +519,93 @@ def openai_text_test(key: str) -> dict:
         if not str(entry.get('id', '')).startswith(('tts', 'whisper', 'dall-e', 'text-embedding'))
     )
     return {'ok': True, 'models': names or [OPENAI_DEFAULT_CHAT_MODEL]}
+
+
+# ---------------------------------------------------------------------------
+# CodeCraft (OpenAI-compatible, translation only)
+# ---------------------------------------------------------------------------
+
+def _codecraft_chat_entries(payload: dict) -> list[dict]:
+    """Chat-capable model entries from a /models response."""
+    entries = []
+    for entry in payload.get('data', []) or []:
+        model_id = str(entry.get('id') or '').strip()
+        if not model_id:
+            continue
+        if str(entry.get('type') or 'chat').lower() != 'chat':
+            continue
+        if any(marker in model_id.lower() for marker in ('embedding', 'moderation')):
+            continue
+        entries.append(entry)
+    return entries
+
+
+def codecraft_list_models(key: str) -> list[str]:
+    """Chat model ids this CodeCraft key can use (never hard-coded)."""
+    payload = _request_json(f'{CODECRAFT_BASE}/models', key)
+    return sorted(str(entry['id']) for entry in _codecraft_chat_entries(payload))
+
+
+def _codecraft_fallback_model(key: str) -> str | None:
+    """The cheapest listed chat model, used when the preferred name is retired."""
+    try:
+        payload = _request_json(f'{CODECRAFT_BASE}/models', key)
+    except Exception:
+        return None
+    entries = _codecraft_chat_entries(payload)
+    if not entries:
+        return None
+
+    def rank(entry: dict) -> tuple[float, str]:
+        pricing = entry.get('pricing') or {}
+        try:
+            price = float(pricing.get('input_per_1k') or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        return price, str(entry.get('id'))
+
+    return str(sorted(entries, key=rank)[0]['id'])
+
+
+def codecraft_chat(key: str, messages: list[dict], model: str = CODECRAFT_DEFAULT_CHAT_MODEL,
+                   timeout: int = 90) -> str:
+    """One-shot chat completion on the CodeCraft API (OpenAI-compatible shape).
+
+    A retired model name returns 404; that case retries once with the cheapest
+    chat model the key can actually use, so a catalog change never fails a run.
+    """
+    url = f'{CODECRAFT_BASE}/chat/completions'
+    body: dict = {'model': model, 'messages': messages}
+    try:
+        payload = _request_json(url, key, body, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        if error.code != 404:
+            raise RuntimeError(f'CodeCraft translation failed ({_http_error_detail(error)})') from error
+        fallback = _codecraft_fallback_model(key)
+        if not fallback or fallback == model:
+            raise RuntimeError(
+                f'CodeCraft model "{model}" is unavailable ({_http_error_detail(error)})'
+            ) from error
+        body['model'] = fallback
+        try:
+            payload = _request_json(url, key, body, timeout=timeout)
+        except urllib.error.HTTPError as retry_error:
+            raise RuntimeError(
+                f'CodeCraft translation failed ({_http_error_detail(retry_error)})'
+            ) from retry_error
+    try:
+        content = payload['choices'][0]['message']['content']
+    except (KeyError, IndexError, TypeError) as error:
+        raise RuntimeError(f'CodeCraft returned no completion: {json.dumps(payload)[:200]}') from error
+    text = str(content or '').strip()
+    if not text:
+        raise RuntimeError('CodeCraft returned an empty completion')
+    return text
+
+
+def codecraft_text_test(key: str) -> dict:
+    """Live connection test for translation: list the key's chat models."""
+    models = codecraft_list_models(key)
+    if not models:
+        raise RuntimeError('No chat models are available for this CodeCraft key')
+    return {'ok': True, 'models': models}

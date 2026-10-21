@@ -522,17 +522,41 @@ class OpenAITranslationProvider(OnlineLLMTranslationProvider):
         return api_keys.has_key('openai')
 
 
+class CodeCraftTranslationProvider(OnlineLLMTranslationProvider):
+    """CodeCraft API text translation (OpenAI-compatible, free monthly tier).
+
+    Translation only: the CodeCraft API exposes no speech endpoint, so this
+    engine never appears in the TTS picker. Keys start with ``cc_``.
+    """
+
+    ENGINE = 'codecraft'
+
+    def _provider_label(self) -> str:
+        return 'CodeCraft'
+
+    def _complete(self, messages: list[dict], key: str) -> str:
+        from .online_providers import CODECRAFT_DEFAULT_CHAT_MODEL, codecraft_chat
+
+        return codecraft_chat(key, messages, model=CODECRAFT_DEFAULT_CHAT_MODEL)
+
+    @staticmethod
+    def is_available() -> bool:
+        from . import api_keys
+
+        return api_keys.has_key('codecraft')
+
+
 # Every language the app offers is supported by the hosted LLMs (unlike their TTS
 # voices, which do not officially list Khmer).
-ONLINE_TRANSLATION_ENGINES = ('gemini', 'openai')
+ONLINE_TRANSLATION_ENGINES = ('gemini', 'openai', 'codecraft')
 
 
 class HybridTranslationProvider(TranslationProvider):
     """Translation chain with a user-selectable first choice.
 
     Default (``auto``) order stays local/free: Qwen3 4B -> Argos -> Google, plus
-    Gemini -> OpenAI when their keys exist but only if explicitly chosen, so
-    configuring a key never silently bills the user for translation.
+    Gemini -> OpenAI -> CodeCraft when their keys exist but only if explicitly
+    chosen, so configuring a key never silently spends the user's quota or money.
     ``preference`` moves one engine to the front; the rest stay as fallbacks.
     """
 
@@ -545,6 +569,7 @@ class HybridTranslationProvider(TranslationProvider):
         # again per call, so adding a key takes effect without a restart.
         self._gemini: TranslationProvider | None = None
         self._openai: TranslationProvider | None = None
+        self._codecraft: TranslationProvider | None = None
         self._mode: str = 'online'
         self._preference = preference if preference in (
             'qwen', 'nllb', 'argos', 'google', *ONLINE_TRANSLATION_ENGINES,
@@ -561,6 +586,12 @@ class HybridTranslationProvider(TranslationProvider):
                 self._openai = OpenAITranslationProvider(style_hint)
         except Exception as error:
             logger.info('OpenAI translation unavailable: %s', error)
+
+        try:
+            if CodeCraftTranslationProvider.is_available():
+                self._codecraft = CodeCraftTranslationProvider(style_hint)
+        except Exception as error:
+            logger.info('CodeCraft translation unavailable: %s', error)
 
         try:
             from . import qwen_local
@@ -604,6 +635,7 @@ class HybridTranslationProvider(TranslationProvider):
             'google': self._online,
             'gemini': self._gemini,
             'openai': self._openai,
+            'codecraft': self._codecraft,
         }
         chain: list[tuple[str, TranslationProvider]] = []
         for key in order:
@@ -613,7 +645,7 @@ class HybridTranslationProvider(TranslationProvider):
         return chain
 
     def first_engine(self) -> str | None:
-        """Key of the first engine tried ('qwen', 'nllb', 'argos', 'google', 'gemini', 'openai')."""
+        """Key of the first engine tried ('qwen', 'nllb', 'argos', 'google', 'gemini', 'openai', 'codecraft')."""
         chain = self._chain()
         return chain[0][0] if chain else None
 
@@ -626,9 +658,13 @@ class HybridTranslationProvider(TranslationProvider):
         if self._preference == 'auto' or self._preference == 'google':
             return
         if self._preference in ONLINE_TRANSLATION_ENGINES:
-            provider = self._gemini if self._preference == 'gemini' else self._openai
+            online = {
+                'gemini': (self._gemini, 'Gemini'),
+                'openai': (self._openai, 'OpenAI'),
+                'codecraft': (self._codecraft, 'CodeCraft'),
+            }
+            provider, label = online[self._preference]
             if provider is None:
-                label = 'Gemini' if self._preference == 'gemini' else 'OpenAI'
                 raise RuntimeError(
                     f'{label} API key is not configured. Add it in API Settings or choose another engine.'
                 )
@@ -657,7 +693,7 @@ class HybridTranslationProvider(TranslationProvider):
     def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
         modes = {
             'qwen': 'qwen', 'nllb': 'nllb', 'argos': 'offline', 'google': 'online',
-            'gemini': 'gemini', 'openai': 'openai',
+            'gemini': 'gemini', 'openai': 'openai', 'codecraft': 'codecraft',
         }
         last_error: Exception | None = None
         for key, provider in self._chain():
@@ -1118,6 +1154,14 @@ def get_provider_status() -> list[dict]:
             'connected': OpenAITranslationProvider.is_available(),
             'primary': False,
             'fallback': OpenAITranslationProvider.is_available(),
+        },
+        {
+            'id': 'codecraft',
+            'name': 'CodeCraft (translation, free tier)',
+            'mode': 'FREE ONLINE',
+            'connected': CodeCraftTranslationProvider.is_available(),
+            'primary': False,
+            'fallback': CodeCraftTranslationProvider.is_available(),
         },
         {
             'id': 'speaker-diarization',

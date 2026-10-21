@@ -51,7 +51,7 @@ interface StudioState {
    * preview discards audio elements holding the previous clip.
    */
   dubAudioVersion: number;
-  providerKeys: { gemini: { has_key: boolean }; openai: { has_key: boolean } };
+  providerKeys: { gemini: { has_key: boolean }; openai: { has_key: boolean }; codecraft: { has_key: boolean } };
   voiceCapabilities: Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean; voices_by_language?: Record<string, Array<{ id: string; label: string; voice: string; gender: string }>> }> & { emotions?: string[] };
   characters: { speakers: string[]; characters: Record<string, Record<string, unknown>> };
   workflowSteps: WorkflowStep[];
@@ -367,7 +367,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   demucsModel: null,
   voxcpmModel: null,
   cudaPack: null,
-  providerKeys: { gemini: { has_key: false }, openai: { has_key: false } },
+  providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false } },
   voiceCapabilities: {},
   characters: { speakers: [], characters: {} },
   workflowSteps: initialWorkflowSteps,
@@ -796,7 +796,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   refreshVoiceConfig: async () => {
     try {
       const [keys, capabilities] = await Promise.all([
-        readJson<{ gemini: { has_key: boolean }; openai: { has_key: boolean } }>('/api/providers/keys').catch(() => null),
+        readJson<{ gemini: { has_key: boolean }; openai: { has_key: boolean }; codecraft: { has_key: boolean } }>('/api/providers/keys').catch(() => null),
         readJson<Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean; voices_by_language?: Record<string, Array<{ id: string; label: string; voice: string; gender: string }>> }> & { emotions?: string[] }>('/api/tts/capabilities').catch(() => null),
       ]);
       set({
@@ -1289,7 +1289,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       demucsModel: null,
       voxcpmModel: null,
       cudaPack: null,
-      providerKeys: { gemini: { has_key: false }, openai: { has_key: false } },
+      providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false } },
       voiceCapabilities: {},
       characters: { speakers: [], characters: {} },
       workflowSteps: initialWorkflowSteps.map((step) => ({ ...step })),

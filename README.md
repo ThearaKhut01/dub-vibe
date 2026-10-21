@@ -9,7 +9,7 @@ DubVibe is a local-first AI video dubbing studio for Windows. It combines a dark
 - Media engine: FFmpeg/FFprobe (staged audio mixing, per-part renders, sidechain ducking)
 - Desktop shell: Tauri (NSIS installer, bundled Python backend sidecar + FFmpeg)
 - AI layer: interchangeable providers with automatic fallback —
-  Faster-Whisper (local) → Qwen3 4B (local translation) → Argos Translate (offline) → Google Translate (online, retried) → Gemini TTS / OpenAI TTS (online, keyed) → Edge TTS (online, retried) → VoxCPM2 (offline, English, optional) → Khmer MMS-VITS (offline, Khmer only) → SAPI5 (offline).
+  Faster-Whisper (local) → Qwen3 4B (local translation) → Argos Translate (offline) → Google Translate (online, retried) → Gemini / OpenAI / CodeCraft (online translation, keyed; CodeCraft has a free monthly tier) → Gemini TTS / OpenAI TTS (online, keyed) → Edge TTS (online, retried) → VoxCPM2 (offline, English, optional) → Khmer MMS-VITS (offline, Khmer only) → SAPI5 (offline).
   API keys live in Windows Credential Manager (never in the browser); AI acting analysis reads the scene and steers supported TTS engines; paid TTS results are cached.
 
 ## Quick start (development)
