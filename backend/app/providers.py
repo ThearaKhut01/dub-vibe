@@ -272,7 +272,7 @@ def _translation_script_ok(
         return True
 
     source = str(source_text or '')
-    if not re.search(r'[A-Za-z]', source):
+    if not re.search(r'[^\W\d_]', source):
         return True  # pure numbers/punctuation: no script to check against
 
     body = str(text or '').strip()
@@ -286,6 +286,116 @@ def _translation_script_ok(
         return False
     latin_chars = len(re.findall('[A-Za-z]', body))
     return latin_chars <= script_chars
+
+
+# Reasoning-style models sometimes answer with their entire chain of thought
+# ("Source text... Meaning... Option 1... Selected Translation...") instead of
+# the line alone. These helpers strip, validate, and salvage that pollution so
+# a subtitle never ends up as an analysis essay or a doubled sentence.
+_SENTENCE_ENDERS = '។।。！!？?；;…'
+_META_LINE = re.compile(
+    r'^\s*(?:[*>-]|\d+[.)])?\s*'
+    r'(?:source text|meaning|context|tone|breakdown|option|alternative|candidate'
+    r'|selected translation|final translation|translation selected|note|notes'
+    r'|pinyin|romanization|check|checking|refine|refining|script analysis|intent)\b',
+    re.IGNORECASE,
+)
+
+
+class _WrongScriptError(RuntimeError):
+    """An engine answered in the wrong script; re-requesting cannot fix it."""
+
+
+def _strip_reasoning(raw: str) -> str:
+    """Remove <think>-style reasoning blocks and stray think tags from an answer."""
+    text = str(raw or '')
+    # Paired blocks go away entirely.
+    if re.search(r'<think\b[^>]*>.*?</think\s*>', text, re.DOTALL | re.IGNORECASE):
+        text = re.sub(r'<think\b[^>]*>.*?</think\s*>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # An answer emitted behind an unterminated block sits after the LAST
+    # closing tag; anything above it is reasoning, never the translation.
+    opens = re.findall(r'<think\b', text, re.IGNORECASE)
+    closes = re.findall(r'</think\s*>', text, re.IGNORECASE)
+    if closes:
+        text = re.split(r'</think\s*>', text, flags=re.IGNORECASE)[-1]
+        text = re.sub(r'^[\s>]*', '', text)
+    elif opens:
+        text = ''  # unclosed think block: no usable answer followed it
+    # Stray tags left around non-think markup.
+    text = re.sub(r'</?(?:think|reasoning)\b[^>]*>', '', text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def _subtitle_length_ok(text: str, source_text: str) -> bool:
+    """Reject sprawling answers: a subtitle line is about the size of its source.
+
+    A real translation grows at most a few times over the source (Khmer writes
+    Chinese/English dialogue with roughly 3-6x more characters). A dumped
+    reasoning chain runs dozens of times longer — that is never a line.
+    """
+    body = re.sub(r'\s+', '', str(text or ''))
+    source = re.sub(r'\s+', '', str(source_text or ''))
+    if not body or not source or not re.search(r'[^\W\d_]', source):
+        return True
+    return len(body) <= max(len(source) * 6, len(source) + 30)
+
+
+def _collapse_duplicate_sentences(text: str) -> str:
+    """Remove an immediately repeated sentence ('A។A។' -> 'A។').
+
+    Some reasoning answers end with the chosen line twice back to back; the
+    second copy must never reach the dub audio.
+    """
+    parts = re.split(rf'([{_SENTENCE_ENDERS}])', str(text or ''))
+    rebuilt = ''
+    previous: str | None = None
+    index = 0
+    while index < len(parts):
+        unit = parts[index]
+        ender = parts[index + 1] if index + 1 < len(parts) else ''
+        key = re.sub(r'\s+', '', unit)
+        if key and key == previous:
+            index += 2  # same sentence again: drop it, keep the first copy
+            continue
+        if key:
+            previous = key
+        rebuilt += unit + ender
+        index += 2
+    return rebuilt.strip() or str(text or '').strip()
+
+
+def _extract_subtitle_answer(
+    raw: str, source_text: str, source_language: str, target_language: str,
+) -> str | None:
+    """Salvage the real translated line out of a verbose model answer.
+
+    Iterates the lines of the answer bottom-up (reasoning models put the final
+    choice last), keeps every translation-labelled line and every candidate
+    that reads like the target language at subtitle length, and returns the
+    most recent one. Returns None when nothing in the answer looks like the
+    translation — the caller then retries or fails over.
+    """
+    lines = [line.strip() for line in _strip_reasoning(raw).splitlines() if line.strip()]
+    extracted = ''
+    for line in reversed(lines):
+        label = re.match(r'^\s*[-*>]?\s*(?:selected translation|final translation|best translation)\s*[:：]\s*(.+)$', line, re.IGNORECASE)
+        if label:
+            line = label.group(1).strip().strip('"“”').strip()
+        elif _META_LINE.match(line):
+            continue
+        line = line.strip('`').strip()
+        if not line:
+            continue
+        line = _collapse_duplicate_sentences(line)
+        if not re.sub(r'\s+', '', line).strip(_SENTENCE_ENDERS):
+            continue
+        if not _translation_script_ok(line, source_text, source_language, target_language):
+            continue
+        if not _subtitle_length_ok(line, source_text):
+            continue
+        extracted = line
+        break
+    return extracted or None
 
 
 def _argos_available() -> bool:
@@ -480,14 +590,16 @@ class GoogleTranslateProvider(TranslationProvider):
                 translated = ''.join(part[0] for part in payload[0] if part and part[0])
                 if not translated:
                     raise RuntimeError('Google Translate returned an empty result')
-                # Guard the last-resort engine too: a wrong-script answer (rare,
-                # but possible for Khmer on edge cases) must fail the line and
-                # surface the error rather than be dubbed as gibberish.
+                # Guard the last-resort engine too, but never re-request: a
+                # wrong-script answer will not change on a second identical
+                # call, so fail over immediately instead of sleeping/retrying.
                 if not _translation_script_ok(translated, text, source_language, target_language):
-                    raise RuntimeError(
+                    raise _WrongScriptError(
                         f'Google Translate returned text that is not in {target_language}'
                     )
                 return translated
+            except _WrongScriptError:
+                raise
             except Exception as error:
                 last_error = error
                 if attempt < self.max_attempts - 1:
@@ -535,7 +647,10 @@ class OnlineLLMTranslationProvider(TranslationProvider):
             'You are a professional subtitle translator for movie dubbing. '
             f"Translate the user's line from {source_language} to {target_language}. "
             'Keep it natural, spoken, and concise — like real movie dialogue. '
-            'Preserve tone and emotion. Respond ONLY with the translation, no notes.'
+            'Preserve tone and emotion. '
+            'Answer with ONLY the translated line itself — one line of plain text. '
+            'Never show reasoning, analysis, alternatives, labels, quotes, or the '
+            'source line, and never repeat the translation.'
         )
         if target_uses_non_latin_script(target_language):
             system += (
@@ -556,34 +671,32 @@ class OnlineLLMTranslationProvider(TranslationProvider):
     def _clean_result(result: object) -> str:
         return str(result or '').strip().strip('"“”').strip()
 
+    def _accepts(self, candidate: str, text: str, source_language: str, target_language: str) -> bool:
+        """A clean result that is in the target script and subtitle-sized."""
+        return bool(candidate) and _translation_script_ok(
+            candidate, text, source_language, target_language,
+        ) and _subtitle_length_ok(candidate, text)
+
     def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
         if not str(text or '').strip():
             return ''
-        key = self._key()
-        messages = self._messages(text, target_language, source_language)
-        cleaned = self._clean_result(self._complete(messages, key))
+        # Exactly ONE engine call per line (the normal cost): cleanup and
+        # salvage below are local string work and never spend tokens or time.
+        raw = self._complete(self._messages(text, target_language, source_language), self._key())
+        cleaned = self._clean_result(_strip_reasoning(raw))
         if not cleaned:
             raise RuntimeError(f'{self._provider_label()} returned an empty translation')
-        if _translation_script_ok(cleaned, text, source_language, target_language):
+        if self._accepts(cleaned, text, source_language, target_language):
             return cleaned
-        # Wrong script (an English refusal, a transliteration, or the source echoed
-        # back): one corrective retry with the requirement spelled out. A second bad
-        # answer raises so the hybrid chain falls over to the next engine instead of
-        # dubbing the wrong language into the video.
-        retry_messages = [
-            {
-                'role': 'system',
-                'content': (
-                    messages[0]['content']
-                    + f' Your previous attempt was NOT in {target_language}. Answer with '
-                    f'ONLY the {target_language} text, written in the {target_language} script.'
-                ),
-            },
-            messages[1],
-        ]
-        retried = self._clean_result(self._complete(retry_messages, key))
-        if retried and _translation_script_ok(retried, text, source_language, target_language):
-            return retried
+        # Reasoning-style engines sometimes answer with their whole analysis
+        # ("Source text... Meaning... Option 1... Selected Translation...") or
+        # the line doubled. Salvage the last line that actually reads like the
+        # translation — free, same single answer, no second request.
+        salvaged = _extract_subtitle_answer(raw, text, source_language, target_language)
+        if salvaged:
+            return salvaged
+        # Nothing usable in the answer: fail over immediately (as any provider
+        # error always has), never by paying for another completion.
         raise RuntimeError(
             f'{self._provider_label()} did not return {target_language} text'
             + (f' (got: {cleaned[:60]})' if cleaned else '')

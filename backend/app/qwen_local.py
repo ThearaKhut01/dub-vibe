@@ -122,6 +122,21 @@ class QwenTranslationProvider(TranslationProvider):
                 temperature=0.2,
             )
         translated = str(completion['choices'][0]['message']['content']).strip()
+        # Qwen3 is a thinking-capable model: its reasoning or an over-eager
+        # answer can come back as analysis instead of the line. The validators
+        # live in providers (shared with the online engines). Local inference is
+        # free, so the cleanup is always zero-cost — no second generation.
+        from .providers import _extract_subtitle_answer, _strip_reasoning, _subtitle_length_ok, _translation_script_ok
+
+        translated = _strip_reasoning(translated).strip()
         if not translated:
             raise RuntimeError('Qwen returned an empty translation')
+        if _translation_script_ok(translated, text, source_language, target_language) and _subtitle_length_ok(
+                translated, text):
+            return translated
+        salvage = _extract_subtitle_answer(translated, text, source_language, target_language)
+        if salvage:
+            return salvage
+        # Nothing usable: return what was generated (normal behavior) rather
+        # than triggering a paid fallback for a local-only run.
         return translated

@@ -175,24 +175,19 @@ def test_script_validation_rules():
     assert providers._translation_script_ok('1234', '1234', 'en', 'Khmer')
 
 
-def test_wrong_script_answer_gets_one_corrective_retry(keys, monkeypatch):
-    """English instead of Khmer is refused: one retry with the requirement spelled out."""
+def test_wrong_script_answer_costs_exactly_one_call(keys, monkeypatch):
+    """Normal cost: one engine call per line — no corrective second request."""
     keys['gemini'] = 'g-key'
-    seen: list[list[dict]] = []
+    calls: list[int] = []
 
     def fake_chat(key, messages, model=None, timeout=90):
-        seen.append(messages)
-        if len(seen) == 1:
-            return 'Sorry, I cannot help with that.'
-        return 'សួស្តី'
+        calls.append(1)
+        return 'Sorry, I cannot help with that.'
 
     monkeypatch.setattr('backend.app.online_providers.gemini_chat', fake_chat)
-    provider = GeminiTranslationProvider()
-    assert provider.translate('hello', 'Khmer', 'en') == 'សួស្តី'
-    assert len(seen) == 2
-    # The first prompt already demands the native script; the retry repeats it harder.
-    assert 'native script' in seen[0][0]['content']
-    assert 'Khmer script' in seen[1][0]['content']
+    with pytest.raises(RuntimeError, match='did not return Khmer'):
+        GeminiTranslationProvider().translate('hello', 'Khmer', 'en')
+    assert calls == [1]  # no retry: the chain will try the next engine instead
 
 
 def test_engine_that_never_returns_khmer_fails_over_to_the_next_engine(keys, monkeypatch):
@@ -217,6 +212,91 @@ def test_echoed_source_is_rejected_for_khmer(keys, monkeypatch):
     monkeypatch.setattr('backend.app.online_providers.codecraft_chat', lambda *a, **k: 'hello')
     with pytest.raises(RuntimeError, match='did not return Khmer'):
         CodeCraftTranslationProvider().translate('hello', 'Khmer', 'en')
+
+
+# --- Reasoning-dump pollution (analysis must never become the subtitle) -------
+
+_REASONING_DUMP = (
+    'The user wants a translation for a fantasy drama subtitle line. '
+    'Breakdown of each word, then candidates:\n'
+    '*   Option 1 (Formal/Epic): ថាមពលឈាមនៃត្រកូលទាំងមូលក៏នឹងរលត់អស់ដែរ។\n'
+    '*   Option 2 (More concise/Spoken): កម្លាំងឈាមនៃត្រកូលទាំងមូលនឹងត្រូវអស់រលីងដែរ។\n'
+    'Let me refine for natural dialogue and pick the best balance:\n'
+    '*   Selected Translation: ថាមពលឈាមនៃត្រកូលទាំងមូលក៏នឹងរលត់អស់ដែរ។'
+)
+
+
+def test_reasoning_dump_is_salvaged_to_the_final_line(keys, monkeypatch):
+    """An analysis essay still contains one clean answer line — use it, no retry."""
+    keys['codecraft'] = 'cc-key'
+    calls: list[int] = []
+
+    def fake_chat(key, messages, model=None, timeout=90):
+        calls.append(1)
+        return _REASONING_DUMP
+
+    monkeypatch.setattr('backend.app.online_providers.codecraft_chat', fake_chat)
+    provider = CodeCraftTranslationProvider()
+    result = provider.translate('其全族血脉之力也将枯竭', 'Khmer', 'zh')
+    assert result == 'ថាមពលឈាមនៃត្រកូលទាំងមូលក៏នឹងរលត់អស់ដែរ។'
+    assert calls == [1]  # salvaged from the first answer, no retry spent
+
+
+def test_reasoning_tag_is_stripped_before_use(keys, monkeypatch):
+    keys['gemini'] = 'g-key'
+    monkeypatch.setattr(
+        'backend.app.online_providers.gemini_chat',
+        lambda *args, **kwargs: 'Khmer greeting is suosdey.</think>"សួស្តី"',
+    )
+    assert GeminiTranslationProvider().translate('hello', 'Khmer', 'en') == 'សួស្តី'
+
+
+def test_doubled_final_line_is_collapsed(keys, monkeypatch):
+    """'A។A។' must never reach the dub audio as one doubled sentence."""
+    keys['codecraft'] = 'cc-key'
+    doubled = 'ថាមពលឈាមនៃត្រកូលទាំងមូល ក៏នឹងរលត់អស់ដែរ។ថាមពលឈាមនៃត្រកូលទាំងមូល ក៏នឹងរលត់អស់ដែរ។'
+    monkeypatch.setattr('backend.app.online_providers.codecraft_chat', lambda *a, **k: doubled)
+    result = CodeCraftTranslationProvider().translate('其全族血脉之力也将枯竭', 'Khmer', 'zh')
+    assert result == 'ថាមពលឈាមនៃត្រកូលទាំងមូល ក៏នឹងរលត់អស់ដែរ។'
+
+
+def test_pure_analysis_with_no_answer_is_refused(keys, monkeypatch):
+    """A dump that contains no actual translation fails over to the next engine."""
+    keys['gemini'] = 'g-key'
+    monkeypatch.setattr(
+        'backend.app.online_providers.gemini_chat',
+        lambda *args, **kwargs: (
+            'The user wants a translation for a fantasy drama subtitle line.\n'
+            'Source text (zh): 其全族血脉之力也将枯竭\n'
+            'Meaning: The bloodline power of their entire clan will be exhausted.\n'
+            '*   Option 1 (Formal/Epic): [need khmer wording]\n'
+            '*   Option 2 (More concise/Spoken): [need khmer wording]\n'
+            'Selected Translation: [need khmer wording]'
+        ),
+    )
+    monkeypatch.setattr(
+        providers.GoogleTranslateProvider, 'translate',
+        lambda self, text, target, source='zh': 'ថាមពលឈាមនៃត្រកូលទាំងមូលនឹងអស់រលីង។',
+    )
+    translator = HybridTranslationProvider(preference='gemini')
+    assert translator.translate('其全族血脉之力也将枯竭', 'Khmer') == 'ថាមពលឈាមនៃត្រកូលទាំងមូលនឹងអស់រលីង។'
+    assert translator.active_mode == 'online'
+
+
+def test_subtitle_length_guard_rules():
+    source = '其全族血脉之力也将枯竭'
+    assert providers._subtitle_length_ok('ថាមពលឈាមនៃត្រកូលទាំងមូលក៏នឹងរលត់អស់ដែរ។', source)
+    assert not providers._subtitle_length_ok('word ' * 80, source)
+
+
+def test_doubled_sentences_collapse_helper():
+    assert providers._collapse_duplicate_sentences(
+        'ថាមពលឈាមនៃត្រកូលទាំងមូល ក៏នឹងរលត់អស់ដែរ។ថាមពលឈាមនៃត្រកូលទាំងមូល ក៏នឹងរលត់អស់ដែរ។'
+    ) == 'ថាមពលឈាមនៃត្រកូលទាំងមូល ក៏នឹងរលត់អស់ដែរ។'
+    # A single sentence passes through untouched.
+    assert providers._collapse_duplicate_sentences(
+        'ថាមពលឈាមនៃត្រកូលទាំងមូល ក៏នឹងរលត់អស់ដែរ។'
+    ) == 'ថាមពលឈាមនៃត្រកូលទាំងមូល ក៏នឹងរលត់អស់ដែរ។'
 
 
 def test_provider_health_reports_online_translation_engines(keys):
