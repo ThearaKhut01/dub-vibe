@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+import wave
 from abc import ABC, abstractmethod
 from functools import lru_cache
 from pathlib import Path
@@ -1061,13 +1062,105 @@ class Pyttsx3Provider(TextToSpeechProvider):
         }
 
 
+_MPEG1_KBPS: dict[int, tuple[int, ...]] = {
+    3: (0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448),
+    2: (0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384),
+    1: (0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320),
+}
+_MPEG2_KBPS: dict[int, tuple[int, ...]] = {
+    3: (0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256),
+    2: (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160),
+    1: (0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160),
+}
+_MPEG1_RATES = (44100, 48000, 32000)
+_MPEG2_RATES = (22050, 24000, 16000)
+_MPEG25_RATES = (11025, 12000, 8000)
+
+
+def _mp3_frame_length(header: bytes) -> int | None:
+    """Byte length of the MPEG audio frame whose 4-byte header is `header`.
+
+    None when the bytes are not a usable frame header (reserved version/layer,
+    free or invalid bitrate, invalid sample rate).
+    """
+    if len(header) < 4:
+        return None
+    version = (header[1] >> 3) & 0x03  # 3=MPEG1, 2=MPEG2, 0=MPEG2.5, 1=reserved
+    layer = (header[1] >> 1) & 0x03  # 3=Layer I, 2=Layer II, 1=Layer III, 0=reserved
+    if version == 1 or layer == 0:
+        return None
+    bitrate_index = (header[2] >> 4) & 0x0F
+    rate_index = (header[2] >> 2) & 0x03
+    padding = (header[2] >> 1) & 0x01
+    if bitrate_index in (0, 15) or rate_index == 3:
+        return None
+    mpeg1 = version == 3
+    table = _MPEG1_KBPS if mpeg1 else _MPEG2_KBPS
+    bitrate = table[layer][bitrate_index] * 1000
+    if mpeg1:
+        sample_rate = _MPEG1_RATES[rate_index]
+    elif version == 2:
+        sample_rate = _MPEG2_RATES[rate_index]
+    else:
+        sample_rate = _MPEG25_RATES[rate_index]
+    if layer == 3:  # Layer I: 4-byte slots
+        return (12 * bitrate // sample_rate + padding) * 4
+    if layer == 1 and not mpeg1:  # Layer III, MPEG2/2.5 halves the samples
+        return 72 * bitrate // sample_rate + padding
+    return 144 * bitrate // sample_rate + padding
+
+
+def _frames_without_ffprobe(target: Path) -> bool | None:
+    """Decoder-free frame check: False only when the container provably has none.
+
+    Returns None when the format is not recognized, so callers keep the
+    permissive "accept a non-empty file" behavior for anything unverifiable.
+    """
+    try:
+        data = target.read_bytes()
+    except OSError:
+        return False
+    if not data:
+        return False
+
+    if data[:4] in (b'RIFF', b'RIFX', b'RF64'):
+        try:
+            with wave.open(str(target), 'rb') as handle:
+                return handle.getnframes() > 0
+        except (wave.Error, EOFError, OSError):
+            return None
+
+    start = 0
+    is_mp3 = False
+    if data[:3] == b'ID3' and len(data) >= 10:
+        is_mp3 = True
+        size = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) \
+            | ((data[8] & 0x7F) << 7) | (data[9] & 0x7F)
+        start = 10 + size + (10 if data[5] & 0x10 else 0)  # optional footer
+    elif len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
+        is_mp3 = True
+    if not is_mp3:
+        return None
+
+    for index in range(start, len(data) - 3):
+        if data[index] != 0xFF or (data[index + 1] & 0xE0) != 0xE0:
+            continue
+        length = _mp3_frame_length(data[index:index + 4])
+        # A frame only counts when it actually fits: the header-only clip has a
+        # valid sync word but stops before its first frame ends.
+        if length and index + length <= len(data):
+            return True
+    return False
+
+
 def _audio_has_sound(path: str | Path) -> bool:
-    """True only when ffprobe reads a positive duration from the file.
+    """True only when the file really contains audio frames.
 
     Used to reject a header-only clip (a few hundred bytes, no audio frames) that a
     TTS engine can produce without raising — for example a Windows voice asked for a
-    language it cannot speak. Without ffprobe the file cannot be verified, so a
-    non-empty file is accepted rather than blocking the dub.
+    language it cannot speak. ffprobe is authoritative when present; without it a
+    decoder-free frame check still rejects a header-only MP3 or an empty WAV, and
+    anything unrecognizable is accepted rather than blocking the dub.
     """
     target = Path(path)
     try:
@@ -1086,7 +1179,10 @@ def _audio_has_sound(path: str | Path) -> bool:
     except Exception:
         ffprobe = None
     if not ffprobe:
-        return True
+        # Without ffprobe the file used to be accepted unconditionally, which is
+        # how a 226-byte header-only MP3 reached the exported dub.
+        measured = _frames_without_ffprobe(target)
+        return True if measured is None else measured
     try:
         result = subprocess.run(
             [ffprobe, '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', str(target)],

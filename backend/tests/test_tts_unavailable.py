@@ -100,6 +100,71 @@ def test_missing_file_has_no_sound(tmp_path):
     assert _audio_has_sound(tmp_path / 'nope.mp3') is False
 
 
+# --- No ffprobe: the CI/clean-machine path -----------------------------------
+# The guard must not depend on ffmpeg being installed, or a header-only clip is
+# accepted and the dub exports silently with no voice.
+
+@pytest.fixture
+def no_ffprobe(monkeypatch):
+    """Simulate a machine without ffmpeg (exactly the GitHub runner)."""
+    import shutil
+
+    monkeypatch.setattr(shutil, 'which', lambda name: None)
+    monkeypatch.setattr('backend.app.main.find_media_tool', lambda name: None)
+
+
+def test_header_only_clip_is_rejected_without_ffprobe(tmp_path, no_ffprobe):
+    clip = tmp_path / 'empty.mp3'
+    clip.write_bytes(b'\xff\xfb\x90\x64' + b'\0' * 222)
+    assert _audio_has_sound(clip) is False
+
+
+def test_header_only_clip_behind_an_id3_tag_is_rejected_without_ffprobe(tmp_path, no_ffprobe):
+    """edge-tts/SAPI5 files start with an ID3v2 tag; its size must be skipped."""
+    clip = tmp_path / 'tagged.mp3'
+    id3 = b'ID3\x04\x00\x00' + bytes([0, 0, 0, 20]) + b'\0' * 20  # 20-byte tag body
+    clip.write_bytes(id3 + b'\xff\xfb\x90\x64' + b'\0' * 222)
+    assert _audio_has_sound(clip) is False
+
+
+def test_mp3_with_one_complete_frame_has_sound_without_ffprobe(tmp_path, no_ffprobe):
+    """The 417-byte frame implied by the header makes the clip audible."""
+    clip = tmp_path / 'frame.mp3'
+    clip.write_bytes(b'\xff\xfb\x90\x64' + b'\0' * 413)
+    assert _audio_has_sound(clip) is True
+
+
+def test_real_audio_still_has_sound_without_ffprobe(tmp_path, no_ffprobe):
+    import wave
+
+    target = tmp_path / 'ok.wav'
+    with wave.open(str(target), 'wb') as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(8000)
+        handle.writeframes(b'\0\0' * 800)
+    assert _audio_has_sound(target) is True
+
+
+def test_empty_wav_is_rejected_without_ffprobe(tmp_path, no_ffprobe):
+    import wave
+
+    target = tmp_path / 'silent.wav'
+    with wave.open(str(target), 'wb') as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(8000)
+        handle.writeframes(b'')
+    assert _audio_has_sound(target) is False
+
+
+def test_unverifiable_container_is_accepted_without_ffprobe(tmp_path, no_ffprobe):
+    """Never block a dub over a format the frame check cannot read."""
+    clip = tmp_path / 'voice.ogg'
+    clip.write_bytes(b'OggS' + b'\0' * 400)
+    assert _audio_has_sound(clip) is True
+
+
 def test_synthesize_line_falls_through_when_a_provider_makes_no_audio(monkeypatch, tmp_path):
     """A provider that writes an empty file is skipped, and the next one is used."""
     import backend.app.providers as providers
