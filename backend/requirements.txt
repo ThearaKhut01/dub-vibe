@@ -5,6 +5,9 @@ python-multipart==0.0.9
 # Direct dependency: model downloads are streamed with requests so progress comes
 # from the bytes actually received (see hf_progress.py).
 requests>=2.31
+# Direct dependency: speaker_diarization/gender_classifier import numpy at module
+# level. It also arrives via torch, but a direct import must be declared.
+numpy>=1.26,<3
 edge-tts>=7.3.1,<8
 faster-whisper==1.2.1
 argostranslate>=1.9,<2
