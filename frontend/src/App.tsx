@@ -352,6 +352,7 @@ function App() {
       const healthRes = await fetch(`${apiBaseUrl}/health`).catch(() => null);
       setApiAvailable(healthRes?.ok ?? false);
       await hydrateStudio();
+      await refreshVoiceConfig();
       setNotice('Studio, AI engines, and timeline refreshed successfully.');
     } catch (err) {
       setNotice(err instanceof Error ? err.message : 'Refresh failed.');
@@ -960,8 +961,25 @@ function App() {
 
   const completedParts = partStats.stats.filter((stat) => partState(stat) === 'complete').length;
 
-  // Voice provider config (keys status + capability tables) on mount.
-  useEffect(() => { void refreshVoiceConfig(); }, [refreshVoiceConfig]);
+  // Voice provider config (keys status + capability tables). The desktop app
+  // starts the Python sidecar in parallel with the UI, so a request issued on
+  // mount can land before the API is up. Retry when the health check confirms
+  // it is, and keep retrying while the capability table is still empty —
+  // otherwise the Voice list stays at "Default voice" for every target
+  // language (no Piseth/Sreymom for Khmer).
+  useEffect(() => {
+    if (apiAvailable !== true) return;
+    void refreshVoiceConfig();
+  }, [apiAvailable, refreshVoiceConfig]);
+
+  const capabilitiesLoaded = Object.keys(voiceCapabilities).length > 0;
+  useEffect(() => {
+    if (apiAvailable !== true || capabilitiesLoaded) return;
+    // Keep retrying until the table arrives: a single retry can land while the
+    // sidecar is still warming up and then never run again.
+    const timer = window.setInterval(() => void refreshVoiceConfig(), 5000);
+    return () => window.clearInterval(timer);
+  }, [apiAvailable, capabilitiesLoaded, refreshVoiceConfig]);
   // Character list follows the loaded project.
   useEffect(() => { void refreshCharacters(); }, [project.id, refreshCharacters]);
 

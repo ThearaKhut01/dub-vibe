@@ -45,6 +45,18 @@ def test_every_edge_language_has_at_least_two_voices():
         assert len(edge_voice_options(language)) >= 2, language
 
 
+def test_voice_labels_name_the_real_edge_voice():
+    """The Voice list must show Piseth/Sreymom, not the abstract voice slot."""
+    assert [option['label'] for option in edge_voice_options('Khmer')] == [
+        'Piseth (Male)',
+        'Sreymom (Female)',
+    ]
+    english = {option['id']: option['label'] for option in edge_voice_options('English')}
+    assert english['Narrator Voice'] == 'Christopher (Narrator)'
+    assert english['Male Voice A'] == 'Guy (Male)'
+    assert english['Female Voice B'] == 'Jenny (Female)'
+
+
 def test_unknown_language_offers_no_voices():
     assert edge_voice_options('Klingon') == []
 

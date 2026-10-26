@@ -1143,6 +1143,17 @@ def edge_gender_voice(language: str, gender: str) -> str | None:
     return EDGE_LANGUAGE_VOICES.get((language, label))
 
 
+def edge_voice_label(neural: str, gender: str) -> str:
+    """Display name of an Edge neural voice: km-KH-PisethNeural -> 'Piseth (Male)'.
+
+    The UI used to show the abstract slot ("Male Voice A"), which hid the fact
+    that Edge offers Piseth and Sreymom for Khmer. Naming the real voice keeps
+    the list self-explanatory.
+    """
+    name = neural.rsplit('-', 1)[-1].removesuffix('Neural')
+    return f'{name} (Narrator)' if gender == 'Any' else f'{name} ({gender})'
+
+
 def edge_voice_options(language: str) -> list[dict[str, str]]:
     """Every Edge voice that really speaks `language`, in display order.
 
@@ -1156,7 +1167,12 @@ def edge_voice_options(language: str) -> list[dict[str, str]]:
             continue
         lowered = label.lower()
         gender = 'Female' if 'female' in lowered else 'Male' if 'male' in lowered else 'Any'
-        options.append({'id': label, 'label': label, 'voice': neural, 'gender': gender})
+        options.append({
+            'id': label,
+            'label': edge_voice_label(neural, gender),
+            'voice': neural,
+            'gender': gender,
+        })
     return options
 
 
