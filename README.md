@@ -1,6 +1,7 @@
 # DubVibe Studio
 
 DubVibe is a local-first AI video dubbing studio for Windows. It combines a dark timeline video editor UI, a FastAPI backend for orchestration, and a modular AI provider layer for transcription, translation, and speech synthesis — built around smart chunk processing so long movies dub fast, reliably, and with the original sound intact.
+![alt text](image.png)
 
 ## Architecture
 
