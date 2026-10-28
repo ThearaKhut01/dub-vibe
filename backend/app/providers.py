@@ -255,6 +255,26 @@ def target_uses_non_latin_script(target_language: str) -> bool:
     return _resolve_lang_code(target_language) in NON_LATIN_SCRIPT_RANGES
 
 
+_CJK_RANGES = '\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF'
+
+
+def _short_cjk_source(source_text: str) -> bool:
+    """True for a short Chinese/Japanese/Korean line (usually a name or term)."""
+    body = re.sub(r'\s+', '', str(source_text or ''))
+    return 1 <= len(body) <= 12 and bool(re.search(f'[{_CJK_RANGES}]', body))
+
+
+def _looks_romanized_name(text: str) -> bool:
+    """A name-sized Latin answer: one to three capitalized words, no placeholders."""
+    body = str(text or '')
+    if re.search(r'[\[\]{}<>]', body):
+        return False  # "[need khmer wording]" and other placeholders are not names
+    words = re.findall(r"[A-Za-z][A-Za-z'’\-]*", body)
+    if not 1 <= len(words) <= 3:
+        return False
+    return all(word[:1].isupper() for word in words)
+
+
 def _translation_script_ok(
     text: str, source_text: str, source_language: str, target_language: str,
 ) -> bool:
@@ -267,6 +287,10 @@ def _translation_script_ok(
     Latin letters must not dominate it (a brand name inside a real translation
     stays acceptable). Latin-script targets and number-only lines carry nothing
     to verify and always pass.
+
+    Short CJK lines are the exception: a character name has no translation and
+    every engine romanizes it ("蕭顏" -> "Xiao Yan"). Rejecting that used to fail
+    an entire run on a handful of names, so a name-sized romanization is accepted.
     """
     script = NON_LATIN_SCRIPT_RANGES.get(_resolve_lang_code(target_language))
     if script is None:
@@ -283,10 +307,16 @@ def _translation_script_ok(
         return False  # the source came back unchanged
 
     script_chars = len(re.findall(f'[{script}]', body))
-    if script_chars == 0:
-        return False
     latin_chars = len(re.findall('[A-Za-z]', body))
-    return latin_chars <= script_chars
+    name_like = _short_cjk_source(source)
+    if script_chars == 0:
+        # Romanized name/term: "Xiao Yan", "Xueer?" — not an English refusal.
+        return name_like and _looks_romanized_name(body)
+    if latin_chars <= script_chars:
+        return True
+    # Mostly-Latin answer for a short CJK line: proper names kept in Latin next
+    # to real Khmer text ("... បានធំឡើង" with three names in front).
+    return name_like and not re.search(r'[\[\]{}<>]', body)
 
 
 # Reasoning-style models sometimes answer with their entire chain of thought
@@ -651,7 +681,8 @@ class OnlineLLMTranslationProvider(TranslationProvider):
             'Preserve tone and emotion. '
             'Answer with ONLY the translated line itself — one line of plain text. '
             'Never show reasoning, analysis, alternatives, labels, quotes, or the '
-            'source line, and never repeat the translation.'
+            'source line, and never repeat the translation. '
+            'Write personal names phonetically in the target language\'s own script.'
         )
         if target_uses_non_latin_script(target_language):
             system += (
@@ -812,9 +843,18 @@ class HybridTranslationProvider(TranslationProvider):
         try:
             from . import qwen_local
 
-            if qwen_local.is_installed():
+            # A Qwen that cannot load is worse than no Qwen: the chain would
+            # retry it on every line and then translate the video with the
+            # fallback engine while the UI still says "Qwen". Skip it here and
+            # let first_engine() report the engine that will really run.
+            if qwen_local.is_installed() and qwen_local.runtime_problem() is None:
                 self._qwen = qwen_local.QwenTranslationProvider(style_hint)
                 self._mode = 'qwen'
+            elif qwen_local.is_installed():
+                logger.warning(
+                    'Qwen3 4B is installed but llama.cpp cannot start (%s); '
+                    'translation will use the next engine.', qwen_local.runtime_problem(),
+                )
         except Exception as error:
             logger.info('Qwen local translation unavailable: %s', error)
 
@@ -843,7 +883,13 @@ class HybridTranslationProvider(TranslationProvider):
         # Auto stays local/free: a configured key is used only when the user picks
         # that engine, so translation never costs money by surprise. NLLB is opt-in
         # for the same reason (it is not in the Auto order).
-        order = ([self._preference] if self._preference != 'auto' else []) + ['qwen', 'argos', 'google']
+        # An explicit LOCAL choice stays local: choosing Qwen/NLLB/Argos must never
+        # send the video to Google behind the user's back.
+        local_engines = ('qwen', 'nllb', 'argos')
+        if self._preference in local_engines:
+            order = [self._preference] + [key for key in local_engines if key != self._preference]
+        else:
+            order = ([self._preference] if self._preference != 'auto' else []) + ['qwen', 'argos', 'google']
         available = {
             'qwen': self._qwen,
             'nllb': self._nllb,
@@ -893,8 +939,23 @@ class HybridTranslationProvider(TranslationProvider):
                     f'Argos Translate has no {source_language} -> {target_language} language package, '
                     'so it cannot translate this project. Choose Google Translate or another engine.'
                 )
-        if self._preference == 'qwen' and self._qwen is None:
-            raise RuntimeError('Qwen3 4B is not downloaded. Install it in AI Models or choose another engine.')
+        if self._preference == 'qwen':
+            from . import qwen_local
+
+            if not qwen_local.is_installed():
+                raise RuntimeError(
+                    'Qwen3 4B is not downloaded. Install it in AI Models or choose another engine.'
+                )
+            problem = qwen_local.runtime_problem()
+            if problem:
+                raise RuntimeError(
+                    f'Qwen3 4B cannot start on this machine: {problem}. '
+                    'Reinstall the CPU llama.cpp build (or install the NVIDIA CUDA '
+                    'runtime), or choose another engine. Nothing was translated, so '
+                    'no online requests were made.'
+                )
+            if self._qwen is None:
+                raise RuntimeError('Qwen3 4B could not be initialised. Choose another engine.')
         if self._preference == 'nllb':
             if self._nllb is None:
                 raise RuntimeError('NLLB-200 is not downloaded. Install it in AI Models or choose another engine.')

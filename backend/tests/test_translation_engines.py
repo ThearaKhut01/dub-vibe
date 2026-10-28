@@ -70,3 +70,50 @@ def test_nllb_choice_refuses_unknown_language_with_clear_message():
 
 def test_first_engine_reports_the_engine_that_will_run():
     assert HybridTranslationProvider(preference='google').first_engine() == 'google'
+
+
+@pytest.mark.parametrize('preference', ['qwen', 'nllb', 'argos'])
+def test_local_choice_never_falls_back_to_google(preference):
+    """Picking Qwen/NLLB/Argos is a promise: no line goes silently online."""
+    provider = HybridTranslationProvider(preference=preference)
+    provider._qwen = provider._qwen or object()
+    assert 'google' not in [key for key, _ in provider._chain()]
+
+
+def test_failed_local_engine_is_not_replaced_by_google():
+    provider = HybridTranslationProvider(preference='qwen')
+
+    class Broken:
+        def translate(self, text, target_language, source_language='en'):
+            raise RuntimeError('qwen exploded')
+
+    provider._qwen = Broken()
+    provider._offline = None
+    provider._nllb = None
+    with mock.patch.object(providers.GoogleTranslateProvider, 'translate',
+                           side_effect=AssertionError('Google must not be called')) as google:
+        with pytest.raises(RuntimeError, match='qwen exploded'):
+            provider.translate('hello', 'Khmer', 'en')
+    assert not google.called
+
+
+def test_qwen_choice_refuses_when_llama_cpp_cannot_start(monkeypatch):
+    from backend.app import qwen_local
+
+    monkeypatch.setattr(qwen_local, 'is_installed', lambda: True)
+    monkeypatch.setattr(qwen_local, 'runtime_problem',
+                        lambda: 'this llama.cpp build needs the NVIDIA CUDA runtime')
+    provider = HybridTranslationProvider(preference='qwen')
+    with pytest.raises(RuntimeError, match='cannot start on this machine'):
+        provider.check_preferred_engine('Khmer', 'zh')
+
+
+def test_auto_skips_a_qwen_that_cannot_load_instead_of_retrying_every_line(monkeypatch):
+    """A broken local engine must not be reported as the running engine."""
+    from backend.app import qwen_local
+
+    monkeypatch.setattr(qwen_local, 'is_installed', lambda: True)
+    monkeypatch.setattr(qwen_local, 'runtime_problem', lambda: 'llama.dll failed to load')
+    provider = HybridTranslationProvider(preference='auto')
+    assert provider._qwen is None
+    assert provider.first_engine() != 'qwen'

@@ -2081,7 +2081,8 @@ function App() {
                   onChange={(event) => { setTranslationProvider(event.target.value); localStorage.setItem('dubvibe-translation-provider', event.target.value); }}
                   className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200"
                 >
-                  <option value="auto">Qwen3 4B (local) — default</option>
+                  <option value="auto">Auto — Qwen3 4B local first, Google fallback</option>
+                  <option value="qwen">Qwen3 4B (local only — no online)</option>
                   <option value="nllb" disabled={!nllbModel?.installed}>
                     {nllbModel?.installed ? 'NLLB-200 (offline)' : 'NLLB-200 (offline) — download in AI Models'}
                   </option>
@@ -2102,8 +2103,10 @@ function App() {
                     ? 'Paid engine: every translated line is a billed API request. Uses the same key as the voice engine.'
                     : translationProvider === 'codecraft'
                       ? 'CodeCraft free tier: 1M tokens/month, no card required. Translation only — it has no voice engine.'
-                      : 'Local engines are free. Online API keys are only used when you pick that engine — Auto never spends money.'}
-                  {' '}If the selected engine fails on a line, the next best engine takes over automatically.
+                      : translationProvider === 'qwen'
+                        ? 'Local and free: Qwen3 4B only. If it cannot start, translation stops with an error — Google is never contacted.'
+                        : 'Auto tries Qwen3 4B (local) first, then Argos, then Google Translate. Online API keys are only used when you pick that engine.'}
+                  {' '}A line that fails moves to the next engine in this chain.
                 </p>
               </div>
               <div className="border-t border-white/10 pt-3">

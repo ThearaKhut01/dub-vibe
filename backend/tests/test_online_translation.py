@@ -289,6 +289,20 @@ def test_pure_analysis_with_no_answer_is_refused(keys, monkeypatch):
     assert translator.active_mode == 'online'
 
 
+def test_short_cjk_name_romanization_is_accepted():
+    """A character name has no Khmer translation; romanizing it must not fail the run."""
+    assert providers._translation_script_ok('Xiao Yan', '蕭顏', 'zh', 'Khmer')
+    assert providers._translation_script_ok('Xueer?', '薛儿吗', 'zh', 'Khmer')
+    # Names kept in Latin next to real Khmer text are normal subtitle style.
+    assert providers._translation_script_ok(
+        'Jiuwen Thunder Eagle Group បានធំឡើង', '九闻雷鹰组长大了', 'zh', 'Khmer',
+    )
+    # An English sentence is not a name and is still refused.
+    assert not providers._translation_script_ok(
+        'Sorry, I cannot help with that.', '你好吗', 'zh', 'Khmer',
+    )
+
+
 def test_subtitle_length_guard_rules():
     source = '其全族血脉之力也将枯竭'
     assert providers._subtitle_length_ok('ថាមពលឈាមនៃត្រកូលទាំងមូលក៏នឹងរលត់អស់ដែរ។', source)

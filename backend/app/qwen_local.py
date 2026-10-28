@@ -40,6 +40,77 @@ def is_installed() -> bool:
     return qwen_model_file().is_file() and qwen_model_file().stat().st_size > 1024 * 1024 * 100
 
 
+_RUNTIME_PROBLEM: str | None | bool = False
+_RUNTIME_LOCK = threading.Lock()
+
+
+def _missing_cuda_runtime() -> list[str]:
+    """CUDA DLLs a CUDA-linked llama.cpp needs but this machine cannot load."""
+    import ctypes
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec('llama_cpp')
+    except Exception:
+        return []
+    if spec is None or not spec.submodule_search_locations:
+        return []
+    lib_dir = Path(list(spec.submodule_search_locations)[0]) / 'lib'
+    if not (lib_dir / 'ggml-cuda.dll').is_file():
+        return []  # CPU-only build: nothing CUDA to miss
+    missing: list[str] = []
+    for name in ('cudart64_12.dll', 'cublas64_12.dll', 'nvcuda.dll'):
+        try:
+            local = lib_dir / name
+            ctypes.WinDLL(str(local) if local.is_file() else name)
+        except OSError:
+            missing.append(name)
+    return missing
+
+
+def runtime_problem() -> str | None:
+    """Why llama.cpp cannot start on this machine, or None when it can.
+
+    Importing llama_cpp loads llama.dll. A CUDA-enabled build fails at that
+    import on a machine without the CUDA runtime/driver, and the translation
+    chain would then quietly send every line to the fallback engine — so this
+    check runs before a run starts instead of after 200 silent Google calls.
+    """
+    global _RUNTIME_PROBLEM
+    with _RUNTIME_LOCK:
+        if _RUNTIME_PROBLEM is not False:
+            return _RUNTIME_PROBLEM
+        problem: str | None = None
+        try:
+            import llama_cpp  # noqa: F401  (import loads llama.dll)
+        except Exception as error:  # OSError from ctypes, ImportError, ...
+            detail = str(error)
+            lowered = detail.lower()
+            missing = _missing_cuda_runtime()
+            if missing:
+                detail = (
+                    'this llama.cpp build links the NVIDIA CUDA backend, but '
+                    f'{", ".join(missing)} cannot be loaded (no NVIDIA driver/runtime)'
+                )
+            elif 'cudart' in lowered or 'cublas' in lowered or 'nvcuda' in lowered:
+                detail = (
+                    'this llama.cpp build needs the NVIDIA CUDA runtime, which is '
+                    'not installed on this machine'
+                )
+            elif 'llama.dll' in lowered or 'shared library' in lowered:
+                detail = 'llama.cpp could not load its libraries (llama.dll)'
+            problem = detail
+        _RUNTIME_PROBLEM = problem
+        return problem
+
+
+def clear_runtime_problem() -> None:
+    """Forget a cached failure (after installing/replacing llama.cpp)."""
+    global _RUNTIME_PROBLEM
+    with _RUNTIME_LOCK:
+        _RUNTIME_PROBLEM = False
+
+
 def download_with_progress(progress_cb=None) -> None:
     """Blocking download of the Qwen3 4B GGUF file."""
     from .hf_progress import download_file
@@ -108,7 +179,8 @@ class QwenTranslationProvider(TranslationProvider):
             'You are a professional subtitle translator for movie dubbing. '
             f'Translate the user\'s line from {source_language} to {target_language}. '
             'Keep it natural, spoken, and concise — like real movie dialogue. '
-            'Preserve tone and emotion. Respond ONLY with the translation, no notes.'
+            'Preserve tone and emotion. Respond ONLY with the translation, no notes. '
+            'Write personal names phonetically in the target language\'s own script.'
         )
         if self.style_hint:
             system += f' Character/style direction: {self.style_hint}'
