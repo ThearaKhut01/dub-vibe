@@ -7,11 +7,15 @@ phrasing, at the cost of speed on CPU.
 """
 from __future__ import annotations
 
+import logging
 import os
+import sys
 import threading
 from pathlib import Path
 
 from .providers import TranslationProvider, models_root
+
+logger = logging.getLogger(__name__)
 
 QWEN_MODEL_ID = 'qwen3-4b'
 QWEN_REPO = 'unsloth/Qwen3-4B-Instruct-2507-GGUF'
@@ -75,6 +79,7 @@ def runtime_problem() -> str | None:
     import on a machine without the CUDA runtime/driver, and the translation
     chain would then quietly send every line to the fallback engine — so this
     check runs before a run starts instead of after 200 silent Google calls.
+    The backend (CPU or NVIDIA CUDA) is chosen here, before the import.
     """
     global _RUNTIME_PROBLEM
     with _RUNTIME_LOCK:
@@ -82,7 +87,25 @@ def runtime_problem() -> str | None:
             return _RUNTIME_PROBLEM
         problem: str | None = None
         try:
-            import llama_cpp  # noqa: F401  (import loads llama.dll)
+            from . import llama_backend
+
+            choice = llama_backend.prepare()
+            if choice['backend'] == 'none':
+                problem = 'llama-cpp-python is not installed'
+            else:
+                try:
+                    import llama_cpp  # noqa: F401  (import loads llama.dll)
+                except Exception:
+                    if choice['backend'] != 'cuda':
+                        raise
+                    # The CUDA build looked usable but cannot load after all.
+                    # Switch this process to the bundled CPU build and retry
+                    # once, so a GPU problem never takes Qwen down.
+                    logger.warning('CUDA llama.cpp failed to load; switching to the CPU build.')
+                    llama_backend.force_cpu()
+                    for name in [key for key in sys.modules if key == 'llama_cpp' or key.startswith('llama_cpp.')]:
+                        sys.modules.pop(name, None)
+                    import llama_cpp  # noqa: F401
         except Exception as error:  # OSError from ctypes, ImportError, ...
             detail = str(error)
             lowered = detail.lower()
@@ -102,6 +125,33 @@ def runtime_problem() -> str | None:
             problem = detail
         _RUNTIME_PROBLEM = problem
         return problem
+
+
+def backend_label() -> str:
+    """'NVIDIA GPU', 'CPU' or 'not installed' — what Qwen will actually use."""
+    try:
+        from . import llama_backend
+
+        return llama_backend.backend_label()
+    except Exception:
+        return 'CPU'
+
+
+def forget_backend() -> None:
+    """Re-check the backend after the CUDA build was installed or removed."""
+    global _RUNTIME_PROBLEM
+    with _RUNTIME_LOCK:
+        _RUNTIME_PROBLEM = False
+    try:
+        from . import llama_backend
+
+        llama_backend.reset()
+    except Exception:
+        pass
+    unload()
+    for name in [name for name in sys.modules if name == 'llama_cpp' or name.startswith('llama_cpp.')]:
+        sys.modules.pop(name, None)
+
 
 
 def clear_runtime_problem() -> None:
@@ -132,17 +182,85 @@ def download_with_progress(progress_cb=None) -> None:
         progress_cb(100)
 
 
+def _inference_threads() -> int:
+    """Physical cores, capped — 8 logical threads on a 4-core laptop makes it lag.
+
+    llama.cpp gains almost nothing from hyper-threads but competes with the UI
+    for them, so the default is the physical core count (4 on an i5-1135G7).
+    """
+    logical = os.cpu_count() or 2
+    physical = 0
+    try:
+        import psutil
+
+        physical = psutil.cpu_count(logical=False) or 0
+    except Exception:
+        physical = 0
+    cores = physical or max(1, logical // 2)
+    return max(2, min(cores, 8))
+
+
+def _lower_thread_priority() -> int | None:
+    """Run generation below normal priority so the app stays responsive."""
+    if os.name != 'nt':
+        return None
+    try:
+        import ctypes
+
+        handle = ctypes.windll.kernel32.GetCurrentThread()
+        previous = ctypes.windll.kernel32.GetThreadPriority(handle)
+        # THREAD_PRIORITY_BELOW_NORMAL = -1
+        ctypes.windll.kernel32.SetThreadPriority(handle, -1)
+        return previous
+    except Exception:
+        return None
+
+
+def _restore_thread_priority(previous: int | None) -> None:
+    if previous is None or os.name != 'nt':
+        return
+    try:
+        import ctypes
+
+        handle = ctypes.windll.kernel32.GetCurrentThread()
+        ctypes.windll.kernel32.SetThreadPriority(handle, previous)
+    except Exception:
+        pass
+
+
+_UNLOAD_TIMER: threading.Timer | None = None
+_UNLOAD_LOCK = threading.Lock()
+
+
+def schedule_unload(delay: float = 300.0) -> None:
+    """Free the model after a quiet period so a 2.4 GB model does not sit in RAM.
+
+    Loaded again (a few seconds on CPU) the next time a line is translated.
+    """
+    global _UNLOAD_TIMER
+    with _UNLOAD_LOCK:
+        if _UNLOAD_TIMER is not None:
+            _UNLOAD_TIMER.cancel()
+        _UNLOAD_TIMER = threading.Timer(delay, unload)
+        _UNLOAD_TIMER.daemon = True
+        _UNLOAD_TIMER.start()
+
+
 def _get_llm():
     """Load (once) the Qwen model for translation. Thread-safe.
 
     Honors the Model Manager device setting: 'cpu' forces CPU inference,
-    'cuda'/'auto' offload every layer to the GPU when one is available.
+    'cuda'/'auto' offload every layer to the GPU when one is available and the
+    CUDA llama.cpp backend (llama_backend) selected it.
     """
     global _LLM
     with _LLM_LOCK:
         if _LLM is None:
             if not is_installed():
                 raise RuntimeError('Qwen3 4B is not installed. Download it in the AI Model Manager first.')
+            from . import llama_backend
+
+            choice = llama_backend.prepare()
             from llama_cpp import Llama
 
             try:
@@ -151,11 +269,12 @@ def _get_llm():
                 device, _ = resolve_device_compute()
             except Exception:
                 device = 'cpu'
+            use_gpu = device == 'cuda' and choice['backend'] == 'cuda'
             _LLM = Llama(
                 model_path=str(qwen_model_file()),
                 n_ctx=4096,
-                n_threads=max(2, os.cpu_count() or 2),
-                n_gpu_layers=-1 if device == 'cuda' else 0,
+                n_threads=_inference_threads(),
+                n_gpu_layers=-1 if use_gpu else 0,
                 verbose=False,
             )
         return _LLM
@@ -164,6 +283,11 @@ def _get_llm():
 def unload() -> None:
     global _LLM
     with _LLM_LOCK:
+        if _LLM is not None:
+            try:
+                _LLM.close()  # release the context before dropping the reference
+            except Exception:
+                pass
         _LLM = None
 
 
@@ -184,15 +308,27 @@ class QwenTranslationProvider(TranslationProvider):
         )
         if self.style_hint:
             system += f' Character/style direction: {self.style_hint}'
-        with _INFERENCE_LOCK:
-            completion = llm.create_chat_completion(
-                messages=[
-                    {'role': 'system', 'content': system},
-                    {'role': 'user', 'content': text},
-                ],
-                max_tokens=512,
-                temperature=0.2,
+        from .providers import target_uses_non_latin_script
+
+        if target_uses_non_latin_script(target_language):
+            system += (
+                f' Write the line in {target_language} native script only — never '
+                f'transliterate, never repeat the {source_language} text, never explain.'
             )
+        with _INFERENCE_LOCK:
+            previous_priority = _lower_thread_priority()
+            try:
+                completion = llm.create_chat_completion(
+                    messages=[
+                        {'role': 'system', 'content': system},
+                        {'role': 'user', 'content': text},
+                    ],
+                    max_tokens=512,
+                    temperature=0.2,
+                )
+            finally:
+                _restore_thread_priority(previous_priority)
+        schedule_unload()
         translated = str(completion['choices'][0]['message']['content']).strip()
         # Qwen3 is a thinking-capable model: its reasoning or an over-eager
         # answer can come back as analysis instead of the line. The validators
@@ -209,6 +345,10 @@ class QwenTranslationProvider(TranslationProvider):
         salvage = _extract_subtitle_answer(translated, text, source_language, target_language)
         if salvage:
             return salvage
-        # Nothing usable: return what was generated (normal behavior) rather
-        # than triggering a paid fallback for a local-only run.
-        return translated
+        # A short CJK name may legitimately come back romanized ("Siao Yen"),
+        # which _translation_script_ok already accepts. Anything else here is an
+        # English/other-language answer: raise so the chain uses the next engine
+        # (Argos/Google) instead of dubbing the wrong language into the video.
+        raise RuntimeError(
+            f'Qwen returned text that is not in {target_language}'
+        )

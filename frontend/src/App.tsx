@@ -2927,7 +2927,7 @@ function App() {
                         {cudaPack.installed ? ' · pack installed' : ''}
                       </p>
                       <p className="mt-0.5 text-[10px] text-slate-500">
-                        Accelerates Faster-Whisper transcription only. VoxCPM uses the GPU when a CUDA build of torch is installed; MMS, NLLB, and Demucs run on CPU.
+                        Accelerates Faster-Whisper transcription and Qwen3 4B translation. VoxCPM uses the GPU when a CUDA build of torch is installed; MMS, NLLB, and Demucs run on CPU.
                       </p>
                     </div>
                     <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-semibold ${cudaPack.status === 'installed' ? 'bg-emerald-500/20 text-emerald-200'
@@ -2967,7 +2967,7 @@ function App() {
                         <div className="h-full rounded-full bg-gradient-to-r from-sky-500 to-violet-500" style={{ width: `${cudaPack.progress}%` }} />
                       </div>
                       <p className="mt-1 text-[10px] text-slate-500">
-                        {cudaPack.downloaded_mb.toFixed(0)} MB / ~{cudaPack.total_mb} MB · speeds up transcription ~5-10x on NVIDIA
+                        {cudaPack.downloaded_mb.toFixed(0)} MB / ~{cudaPack.total_mb} MB · faster Whisper + Qwen translation on NVIDIA
                       </p>
                     </div>
                   )}
@@ -2976,7 +2976,7 @@ function App() {
                   )}
                   {cudaPack.status === 'unavailable' && (
                     <p className="mt-2 text-[10px] leading-4 text-slate-500">
-                      The pack only helps on machines with an NVIDIA GPU (CUDA 12 driver required). Transcription runs on CPU otherwise.
+                      The pack only helps on machines with an NVIDIA GPU (CUDA 12 driver required). Whisper and Qwen run on CPU otherwise.
                     </p>
                   )}
                 </div>
@@ -3003,6 +3003,13 @@ function App() {
                           ? `${qwenModel.size_mb?.toFixed(0)} MB · local translation, works offline`
                           : `~${qwenModel.total_mb} MB download · local translation engine, works offline`}
                       </p>
+                      {qwenModel.installed && qwenModel.backend_label && (
+                        <p className={`mt-1 text-[10px] leading-4 ${qwenModel.runtime_problem ? 'text-amber-300/80' : 'text-slate-500'}`}>
+                          {qwenModel.runtime_problem
+                            ? `Cannot start: ${qwenModel.runtime_problem}`
+                            : `Runs on ${qwenModel.backend_label}${qwenModel.backend === 'cpu' ? ' — no NVIDIA GPU needed' : ''}${qwenModel.backend_reason ? ` · ${qwenModel.backend_reason}` : ''}`}
+                        </p>
+                      )}
                     </div>
                     <div className="flex shrink-0 items-center gap-2">
                       {qwenModel.status === 'not_installed' && (

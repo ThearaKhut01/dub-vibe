@@ -77,6 +77,12 @@ export interface WhisperModelInfo {
   error: string | null;
   // Set only by the VoxCPM2 status: why the model is not usable (missing or incomplete files).
   verify_error?: string | null;
+  // Set only by the Qwen status: which llama.cpp backend will actually run.
+  backend?: 'cpu' | 'cuda' | 'none' | 'unknown';
+  backend_label?: string;
+  backend_reason?: string | null;
+  cuda_backend_installed?: boolean;
+  runtime_problem?: string | null;
 }
 
 export interface HardwareInfo {

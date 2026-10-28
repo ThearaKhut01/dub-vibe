@@ -23,6 +23,12 @@ from backend.app.providers import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_local_qwen(monkeypatch):
+    """These tests pin online routing; a runnable local Qwen would answer first."""
+    monkeypatch.setattr('backend.app.qwen_local.is_installed', lambda: False)
+
+
 @pytest.fixture
 def keys(monkeypatch):
     store: dict[str, str] = {}

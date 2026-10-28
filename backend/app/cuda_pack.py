@@ -27,12 +27,18 @@ from pathlib import Path
 
 from .providers import models_root
 
-# ctranslate2 4.x requires cuDNN 9 + CUDA 12 (cublas). These PyPI packages are
-# NVIDIA's own redistributions of those runtimes for Windows.
+# ctranslate2 4.x requires cuDNN 9 + CUDA 12 (cublas); the CUDA llama.cpp
+# backend also needs cudart. These PyPI packages are NVIDIA's own
+# redistributions of those runtimes for Windows.
 _PACK_WHEELS = {
     'cublas': ('nvidia-cublas-cu12', 'cublas64_12.dll', 'nvidia/cublas/bin'),
     'cudnn': ('nvidia-cudnn-cu12', 'cudnn64_9.dll', 'nvidia/cudnn/bin'),
+    'cudart': ('nvidia-cuda-runtime-cu12', 'cudart64_12.dll', 'nvidia/cuda_runtime/bin'),
 }
+# The first 55 % of the bar is the CUDA runtime; the rest is the CUDA build of
+# llama.cpp (Qwen translation), downloaded only when an NVIDIA GPU is present.
+_RUNTIME_SPAN = 55.0
+_DEFAULT_TOTAL_MB = 2600.0
 
 _DOWNLOADS: dict[str, dict] = {}
 _LOCK = threading.Lock()
@@ -91,8 +97,9 @@ def pack_status() -> dict:
         'status': status,
         'progress': job.get('progress', 0) if job else 0,
         'downloaded_mb': round(job.get('downloaded_mb', 0), 1) if job else 0,
-        'total_mb': round(job.get('total_mb', 0), 1) if job else 1600,
+        'total_mb': round(job.get('total_mb', 0), 1) if job else _DEFAULT_TOTAL_MB,
         'error': job.get('error') if job else None,
+        'note': job.get('note') if job else None,
         'size_mb': round(size_mb, 1) if installed else None,
         'path': str(bin_dir) if installed else None,
         'gpu': gpu,
@@ -164,24 +171,42 @@ def start_download() -> dict:
             return job
         if is_pack_installed():
             return {'status': 'installed', 'progress': 100}
-        job = {'status': 'downloading', 'progress': 0, 'downloaded_mb': 0.0, 'total_mb': 1600.0, 'error': None}
+        job = {'status': 'downloading', 'progress': 0, 'downloaded_mb': 0.0, 'total_mb': _DEFAULT_TOTAL_MB, 'error': None, 'note': None}
         _DOWNLOADS['cuda-gpu-pack'] = job
 
     def worker() -> None:
         try:
             bin_dir = cuda_bin_dir()
-            spans = [(0.0, 50.0), (50.0, 100.0)]  # cublas first, then cudnn
-            for (name, (package, anchor_dll, wheel_subdir)), (base_fraction, span) in zip(_PACK_WHEELS.items(), spans):
+            items = list(_PACK_WHEELS.items())
+            span = _RUNTIME_SPAN / len(items)
+            for index, (package, anchor_dll, wheel_subdir) in enumerate(items):
                 url, size_bytes = _wheel_download_url(package)
                 _download_and_extract(url, bin_dir, wheel_subdir, anchor_dll,
                                       progress_cb=lambda f, size_bytes=size_bytes: job.update(
-                                          progress=min(99, int(f)),
+                                          progress=min(int(_RUNTIME_SPAN) - 1, int(f)),
                                           downloaded_mb=round(size_bytes / 2**20 * min(100.0, f) / 100, 1)),
-                                      base_fraction=base_fraction, span=span)
+                                      base_fraction=index * span, span=span)
             if not is_pack_installed():
                 raise RuntimeError('Pack extraction did not produce the required DLLs')
-            job.update(status='installed', progress=100)
+            job.update(progress=_RUNTIME_SPAN)
             activate_dll_search_path()  # usable immediately, no restart needed
+
+            # Qwen3 4B translates on the GPU with the matching CUDA llama.cpp
+            # build. It is the same optional download, so fetch it here; a
+            # failure leaves Whisper acceleration working and Qwen on CPU.
+            try:
+                from . import llama_backend
+
+                if llama_backend.has_nvidia_gpu() and not llama_backend.cuda_backend_installed():
+                    llama_backend.download_cuda_backend(
+                        progress_cb=lambda f: job.update(progress=int(_RUNTIME_SPAN + f * (100 - _RUNTIME_SPAN) * 0.99))
+                    )
+                    from . import qwen_local
+
+                    qwen_local.forget_backend()
+            except Exception as error:  # noqa: BLE001
+                job['note'] = f'Qwen GPU backend not installed: {error}'
+            job.update(status='installed', progress=100)
         except Exception as error:  # noqa: BLE001
             job.update(status='error', error=str(error))
 

@@ -116,6 +116,47 @@ def test_argos_installed_pair_needs_no_catalogue_refresh(monkeypatch):
         providers.reset_argos_cache()
 
 
+def test_qwen_wrong_script_answer_fails_over_instead_of_dubbing_english(monkeypatch):
+    """A local model that answers in English must not be dubbed into the video."""
+    from backend.app import qwen_local
+
+    class FakeLLM:
+        def create_chat_completion(self, **kwargs):
+            return {'choices': [{'message': {'content': 'This is an English answer, not Khmer.'}}]}
+
+    monkeypatch.setattr(qwen_local, '_get_llm', lambda: FakeLLM())
+    provider = qwen_local.QwenTranslationProvider()
+    with pytest.raises(RuntimeError, match='not in Khmer'):
+        provider.translate('其全族血脉之力也将枯竭', 'Khmer', 'zh')
+
+
+def test_qwen_romanized_name_is_kept(monkeypatch):
+    """Short CJK names have no Khmer translation; a romanization is still usable."""
+    from backend.app import qwen_local
+
+    class FakeLLM:
+        def create_chat_completion(self, **kwargs):
+            return {'choices': [{'message': {'content': 'Siao Yen'}}]}
+
+    monkeypatch.setattr(qwen_local, '_get_llm', lambda: FakeLLM())
+    assert qwen_local.QwenTranslationProvider().translate('蕭顏', 'Khmer', 'zh') == 'Siao Yen'
+
+
+def test_qwen_failure_in_auto_falls_to_the_next_engine(monkeypatch):
+    provider = HybridTranslationProvider(preference='auto')
+
+    class Broken:
+        def translate(self, text, target_language, source_language='en'):
+            raise RuntimeError('Qwen returned text that is not in Khmer')
+
+    provider._qwen = Broken()
+    provider._offline = None
+    with mock.patch.object(providers.GoogleTranslateProvider, 'translate',
+                           return_value='ខ្មែរ') as google:
+        assert provider.translate('蕭顏', 'Khmer', 'zh') == 'ខ្មែរ'
+    assert google.called
+
+
 def test_nllb_choice_refuses_unknown_language_with_clear_message():
     provider = HybridTranslationProvider(preference='nllb')
     provider._nllb = object()

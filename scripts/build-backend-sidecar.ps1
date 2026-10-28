@@ -25,6 +25,30 @@ if (Test-Path $typingPkg) {
   & $python -m pip uninstall typing -y | Out-Null
 }
 
+# llama.cpp must be a CPU build for the bundle. A CUDA-linked llama.dll cannot
+# load on a machine without the NVIDIA driver (Qwen dies before translating),
+# and deleting ggml-cuda.dll is not a fix: ggml.dll imports it directly, which
+# breaks loading on every PC. Rebuild from source with CUDA off when the venv
+# still holds a CUDA wheel; NVIDIA machines get GPU support at runtime from the
+# optional GPU Acceleration Pack instead.
+$llamaLib = Join-Path $projectRoot ".venv\Lib\site-packages\llama_cpp\lib"
+if (Test-Path (Join-Path $llamaLib "ggml-cuda.dll")) {
+  $llamaVersion = (& $python -c "import importlib.metadata; print(importlib.metadata.version('llama-cpp-python'))").Trim()
+  if (-not $llamaVersion) { throw "llama-cpp-python is not installed in the build venv." }
+  Write-Output "Building CPU-only llama.cpp $llamaVersion for the bundle (a few minutes)..."
+  $previousCmakeArgs = $env:CMAKE_ARGS
+  $previousForceCmake = $env:FORCE_CMAKE
+  $env:CMAKE_ARGS = "-DGGML_CUDA=OFF -DGGML_NATIVE=ON"
+  $env:FORCE_CMAKE = "1"
+  try {
+    & $python -m pip install --force-reinstall --no-deps --no-binary llama-cpp-python "llama-cpp-python==$llamaVersion"
+    if ($LASTEXITCODE -ne 0) { throw "CPU llama.cpp build failed (pip exit $LASTEXITCODE)." }
+  } finally {
+    $env:CMAKE_ARGS = $previousCmakeArgs
+    $env:FORCE_CMAKE = $previousForceCmake
+  }
+}
+
 $arguments = @(
   "--noconfirm",
   "--clean",
@@ -103,14 +127,14 @@ if ($baseSourceNested) {
 # Prune redundant heavy folders so the NSIS data file stays under the 32-bit
 # makensis mmap limit (~1.7 GB). torch/lib keeps its CUDA DLLs (the loader
 # chain needs them; unused at runtime without an NVIDIA GPU - the app falls
-# back to CPU), but the pip-wheel duplicate nvidia/ folder and the CUDA
-# llama.cpp backend are dead weight, as are torch's build-time headers.
+# back to CPU), but the pip-wheel duplicate nvidia/ folder is dead weight, as
+# are torch's build-time headers. llama.cpp is already a CPU build (see above),
+# so there is no CUDA backend to delete here.
 $internal = Join-Path (Split-Path $sidecar -Parent) "_internal"
 Remove-Item -Recurse -Force (Join-Path $internal "nvidia") -ErrorAction SilentlyContinue
-Remove-Item -Force (Join-Path $internal "llama_cpp\lib\ggml-cuda.dll") -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force (Join-Path $internal "torch\include") -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force (Join-Path $internal "torch\share") -ErrorAction SilentlyContinue
-Write-Output "Pruned nvidia/, ggml-cuda.dll, torch headers from the bundle."
+Write-Output "Pruned nvidia/, torch headers from the bundle."
 
 Write-Output "Bundled backend ready: $sidecar"
 Write-Output "Bundle folder (ship as a whole): $(Split-Path $sidecar -Parent)"

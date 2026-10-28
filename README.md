@@ -66,7 +66,9 @@ Choose **VoxCPM2 Voice Clone (English, own voice)** in the DUB mode voice engine
 - Requires the VoxCPM2 model (download it in AI Models) and FFmpeg.
 - Generation is verified for English. Speed on CPU is roughly 40–80 seconds per short line; an NVIDIA GPU with a CUDA build of torch is much faster.
 
-**GPU Acceleration Pack (NVIDIA CUDA 12):** the pack speeds up Faster-Whisper transcription only. VoxCPM uses the GPU when a CUDA build of torch is installed. MMS, NLLB, and Demucs run on CPU.
+**GPU Acceleration Pack (NVIDIA CUDA 12):** on a machine with an NVIDIA GPU the pack speeds up Faster-Whisper transcription and adds the CUDA build of llama.cpp, so Qwen3 4B translation runs on the GPU too. VoxCPM uses the GPU when a CUDA build of torch is installed. MMS, NLLB, and Demucs run on CPU.
+
+**Qwen3 4B on any laptop:** the app ships a **CPU-only** llama.cpp build, so Qwen3 4B starts and translates on machines without an NVIDIA GPU (roughly 3–8 s per subtitle line on a 4-core laptop; lines run one at a time with below-normal thread priority, and the model is unloaded five minutes after the last line so it does not sit in RAM). On an NVIDIA machine the GPU Acceleration Pack adds the matching CUDA build and the same app uses it automatically; if that backend cannot load, the app falls back to the CPU build and says why in AI Models. The model card shows which backend will run (CPU or NVIDIA GPU).
 
 **Translation engine choice:** Auto tries Qwen3 4B locally, then Argos, then Google Translate. Choosing a local engine explicitly (Qwen3 4B, NLLB-200, Argos) keeps the run local — it never sends a line to Google or a keyed API. If Qwen3 4B cannot start (its llama.cpp build needs a CUDA runtime/driver that is not installed), Auto skips it and reports the engine that actually runs, and an explicit Qwen-only choice stops with the reason instead of translating the video through Google.
 

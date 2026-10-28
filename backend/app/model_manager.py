@@ -276,6 +276,12 @@ def qwen_status() -> dict:
     else:
         status = 'not_installed'
     size_mb = round(qwen_local.qwen_model_file().stat().st_size / (1024 * 1024), 1) if installed else None
+    try:
+        from . import llama_backend
+
+        runtime = llama_backend.status()
+    except Exception as error:  # noqa: BLE001
+        runtime = {'backend': 'unknown', 'label': 'unknown', 'reason': str(error), 'gpu': False}
     return {
         'id': 'qwen3-4b',
         'name': 'Qwen3 4B Instruct (local translation)',
@@ -290,6 +296,11 @@ def qwen_status() -> dict:
         'size_mb': size_mb,
         'path': str(qwen_local.qwen_model_file()) if installed else None,
         'error': job.get('error') if job else None,
+        'backend': runtime.get('backend'),
+        'backend_label': runtime.get('label'),
+        'backend_reason': runtime.get('reason'),
+        'cuda_backend_installed': runtime.get('cuda_installed'),
+        'runtime_problem': qwen_local.runtime_problem() if installed else None,
     }
 
 
