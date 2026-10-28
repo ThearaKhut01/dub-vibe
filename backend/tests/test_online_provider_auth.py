@@ -24,6 +24,7 @@ def _fresh_online_state(monkeypatch):
     monkeypatch.setattr(online_providers, '_codecraft_dead_models', {})
     monkeypatch.setattr(online_providers, '_codecraft_model_cache', {})
     monkeypatch.setattr(online_providers, '_codecraft_catalog_cache', {})
+    monkeypatch.setattr(online_providers, '_gemini_catalog_cache', {})
     monkeypatch.setattr(online_providers, '_save_model_cache', lambda *args, **kwargs: None)
 
 

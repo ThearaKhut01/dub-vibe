@@ -7,6 +7,7 @@ keep a missing key from quietly falling back to another engine.
 from __future__ import annotations
 
 import json
+import sqlite3
 import types
 import urllib.error
 
@@ -27,6 +28,11 @@ def keys(monkeypatch):
     store: dict[str, str] = {}
     monkeypatch.setattr(api_keys, 'has_key', lambda provider: provider in store)
     monkeypatch.setattr(api_keys, 'get_key', lambda provider: store.get(provider))
+    # The model catalog is cached per key in production; tests swap the patched
+    # catalogs between cases, so start each one cold.
+    from backend.app import online_providers
+
+    monkeypatch.setattr(online_providers, '_gemini_catalog_cache', {})
     return store
 
 
@@ -511,7 +517,7 @@ def test_full_quota_exhaustion_cools_the_key_down(keys, monkeypatch):
         first_call_count = len(calls)
 
         # Next line short-circuits: no further HTTP attempts.
-        with pytest.raises(RuntimeError, match='quota is exhausted'):
+        with pytest.raises(RuntimeError, match='not usable for this key'):
             online.gemini_chat('dry-key', [{'role': 'user', 'content': 'again'}])
         assert len(calls) == first_call_count
     finally:
@@ -568,6 +574,125 @@ def test_gemini_chat_reports_failure_when_every_model_fails(keys, monkeypatch):
     finally:
         online._gemini_dead_models.pop('bad', None)
         online._gemini_text_model_cache.pop(online._model_cache_key('bad'), None)
+        online._gemini_quota_blocked_until.pop(online._model_cache_key('bad'), None)
+
+
+def test_gemini_catalog_is_listed_once_for_many_lines(keys, monkeypatch):
+    """One request per line: the model catalog is cached, not re-fetched per line."""
+    online = pytest.importorskip('backend.app.online_providers')
+    listings: list[str] = []
+    completions: list[str] = []
+
+    def fake_request(url, key, body=None, timeout=60):
+        if body is None:
+            listings.append(url)
+            return {'models': [
+                {'name': 'models/gemini-3.5-flash',
+                 'supportedGenerationMethods': ['generateContent']},
+            ]}
+        completions.append(url)
+        return {'candidates': [{'content': {'parts': [{'text': 'សួស្តី'}]}}]}
+
+    monkeypatch.setattr(online, '_request_json', fake_request)
+    monkeypatch.setattr(online, '_save_model_cache', lambda *args, **kwargs: None)
+    fingerprint = online._model_cache_key('catalog-key')
+    online._gemini_dead_models.pop('catalog-key', None)
+    online._gemini_quota_blocked_until.pop(fingerprint, None)
+    online._gemini_text_model_cache.pop(fingerprint, None)
+    for _ in range(5):
+        assert online.gemini_chat('catalog-key', [{'role': 'user', 'content': 'hi'}]) == 'សួស្តី'
+    assert len(completions) == 5
+    assert len(listings) == 1, 'the catalog GET must be reused across lines'
+
+
+def test_failed_model_sweep_parks_the_key_for_the_next_line(keys, monkeypatch):
+    """A key whose models all reject the call must not cost a 4-request sweep per line."""
+    online = pytest.importorskip('backend.app.online_providers')
+    calls: list[str] = []
+
+    def fake_request(url, key, body=None, timeout=60):
+        calls.append(url)
+        if body is None:
+            return {'models': [
+                {'name': f'models/gemini-3.{index}-flash',
+                 'supportedGenerationMethods': ['generateContent']}
+                for index in range(3)
+            ]}
+        raise urllib.error.HTTPError(url, 400, 'bad model', {}, __import__('io').BytesIO(b'{}'))
+
+    monkeypatch.setattr(online, '_request_json', fake_request)
+    monkeypatch.setattr(online, '_save_model_cache', lambda *args, **kwargs: None)
+    fingerprint = online._model_cache_key('reject-key')
+    online._gemini_dead_models.pop('reject-key', None)
+    online._gemini_quota_blocked_until.pop(fingerprint, None)
+    online._gemini_text_model_cache.pop(fingerprint, None)
+    try:
+        with pytest.raises(RuntimeError, match='no completion'):
+            online.gemini_chat('reject-key', [{'role': 'user', 'content': 'one'}])
+        after_first_line = len(calls)
+        # One catalog GET + the three listed models + the default alias = 5.
+        assert after_first_line == 5
+        assert len(calls) <= 6, 'one bounded sweep, not a sweep per model twice'
+        with pytest.raises(RuntimeError, match='not usable for this key'):
+            online.gemini_chat('reject-key', [{'role': 'user', 'content': 'two'}])
+        assert len(calls) == after_first_line, 'the next line must cost zero requests'
+    finally:
+        online._gemini_dead_models.pop('reject-key', None)
+        online._gemini_quota_blocked_until.pop(fingerprint, None)
+
+
+def test_identical_lines_share_one_translation_call(tmp_path, monkeypatch):
+    """Repeated dialogue is translated once and reused — not paid for line by line."""
+    from fastapi.testclient import TestClient
+
+    from backend.app import main
+
+    monkeypatch.setattr(main, 'DATA_ROOT', tmp_path / 'data')
+    monkeypatch.setattr(main, 'PROJECT_DB', tmp_path / 'data' / 'projects.sqlite3')
+    (tmp_path / 'data').mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(tmp_path / 'data' / 'projects.sqlite3') as connection:
+        connection.execute(
+            'CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, data TEXT NOT NULL)'
+        )
+    calls: list[str] = []
+
+    class FakeTranslator:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def check_preferred_engine(self, *args, **kwargs) -> None:
+            return None
+
+        def first_engine(self) -> str:
+            return 'gemini'
+
+        def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
+            calls.append(text)
+            return f'{text}!'
+
+    monkeypatch.setattr(main, 'HybridTranslationProvider', FakeTranslator)
+    project_id = 'dedupe-translate'
+    main.projects[project_id] = {
+        'id': project_id, 'name': 'd', 'mode': 'DUB', 'media_path': None,
+        'duration': '00:02:00', 'source_language': 'en', 'target_language': 'Khmer',
+        'segments': [
+            {'id': 'a', 'start': 0.0, 'end': 1.0, 'text': 'Yes.'},
+            {'id': 'b', 'start': 1.0, 'end': 2.0, 'text': 'Yes.'},
+            {'id': 'c', 'start': 2.0, 'end': 3.0, 'text': 'Come on.'},
+        ],
+    }
+    try:
+        response = TestClient(main.app).post(
+            '/api/process/translate',
+            json={'project_id': project_id, 'target_language': 'Khmer'},
+        )
+        assert response.status_code == 200, response.text
+        chunks = response.json()['translation']
+    finally:
+        main.projects.pop(project_id, None)
+
+    assert sorted(calls) == ['Come on.', 'Yes.']
+    assert [chunk['translation'] for chunk in chunks] == ['Yes.!', 'Yes.!', 'Come on.!']
 
 
 def test_gemini_text_listing_excludes_non_text_models():

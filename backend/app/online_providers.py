@@ -64,6 +64,10 @@ _GEMINI_TEXT_TRANSIENT_RETRIES = 2
 # After a full sweep hits quota on every model, skip Gemini for this long so the
 # rest of the run falls back immediately instead of re-probing every line.
 _GEMINI_QUOTA_COOLDOWN_SECONDS = 600.0
+# A sweep that fails for another reason (a key restricted to models it cannot use,
+# a 400 on every name, …) would otherwise repeat on every single subtitle line.
+# Park the key for a shorter while; the fallback engine covers the run meanwhile.
+_GEMINI_SWEEP_COOLDOWN_SECONDS = 120.0
 # A 402 (no allowance / billing) will not fix itself mid-run, so an OpenAI-style
 # provider that answers it is parked for a while: without this, every subtitle
 # line repeats the same failed request and the run crawls.
@@ -76,6 +80,11 @@ _gemini_quota_blocked_until: dict[str, float] = {}
 _gemini_text_model_cache: dict[str, str] = {}
 # key -> models that timed out or 404'd, skipped once measured.
 _gemini_dead_models: dict[str, set[str]] = {}
+# key -> (expiry, text-capable model names). Without this every translated line
+# pays an extra GET /models just to learn that the catalog did not change —
+# doubling the request count against a per-minute limit.
+_gemini_catalog_cache: dict[str, tuple[float, list[str]]] = {}
+_GEMINI_CATALOG_TTL_SECONDS = 600.0
 
 # CodeCraft (OpenAI-compatible) keeps the same three facts, per key fingerprint:
 # the model that last worked, the models this key rejected, and a short-lived
@@ -173,6 +182,28 @@ def _newest(names: list[str], preferred: str | None = None) -> str | None:
     return sorted(names, key=_model_rank, reverse=True)[0]
 
 
+def gemini_text_model_catalog(key: str) -> list[str]:
+    """Text-capable Gemini models for this key, cached for a few minutes.
+
+    Every translated line needs the candidate list; listing it live per line
+    doubles the request count (and free-tier quota is counted per request), so
+    the catalog is reused like CodeCraft's.
+    """
+    cache_key = _model_cache_key(key)
+    cached = _gemini_catalog_cache.get(cache_key)
+    if cached is not None and cached[0] > time.monotonic():
+        return cached[1]
+    try:
+        listed = gemini_list_chat_models(key)
+    except Exception:
+        return []
+    if listed:
+        _gemini_catalog_cache[cache_key] = (
+            time.monotonic() + _GEMINI_CATALOG_TTL_SECONDS, listed
+        )
+    return listed
+
+
 def gemini_text_model_candidates(key: str, preferred: str = GEMINI_DEFAULT_CHAT_MODEL) -> list[str]:
     """Models to try for translation, best guess first.
 
@@ -187,10 +218,7 @@ def gemini_text_model_candidates(key: str, preferred: str = GEMINI_DEFAULT_CHAT_
             candidates.append(name)
 
     add(_gemini_text_model_cache.get(_model_cache_key(key)))
-    try:
-        listed = gemini_list_chat_models(key)
-    except Exception:
-        listed = []
+    listed = gemini_text_model_catalog(key)
     dead = _gemini_dead_models.get(key, set())
     concrete = [name for name in listed if 'latest' not in name.lower() and name not in dead]
     for name in sorted(concrete, key=_model_rank, reverse=True):
@@ -493,11 +521,12 @@ def gemini_chat(key: str, messages: list[dict], model: str = GEMINI_DEFAULT_CHAT
 
     blocked_until = _gemini_quota_blocked_until.get(cache_key, 0.0)
     if time.monotonic() < blocked_until:
-        # The last full sweep hit quota on every model; fail fast so the caller's
-        # fallback engine handles this line instead of probing again.
+        # A recent sweep failed on every model (daily quota or model/key errors),
+        # so fail fast: the caller's fallback engine handles this line instead of
+        # spending another handful of requests on the same dead end.
         raise RuntimeError(
-            'Gemini quota is exhausted for this key right now '
-            '(free-tier limits are per model and reset daily). Using the fallback engine.'
+            'Gemini is not usable for this key right now (quota exhausted or every '
+            'model refused). Using the fallback engine.'
         )
 
     quota_hits = 0
@@ -537,19 +566,27 @@ def gemini_chat(key: str, messages: list[dict], model: str = GEMINI_DEFAULT_CHAT
                 _gemini_text_model_cache.pop(cache_key, None)
                 break
             else:
-                _gemini_text_model_cache[cache_key] = model_name
+                # Only touch the cache file when the winning model changed: a
+                # rewrite per subtitle line is pointless disk churn with four
+                # translation threads running.
+                if _gemini_text_model_cache.get(cache_key) != model_name:
+                    _gemini_text_model_cache[cache_key] = model_name
+                    _save_model_cache(cache_key, model_name)
                 dead.discard(model_name)
                 _gemini_quota_blocked_until.pop(cache_key, None)
-                _save_model_cache(cache_key, model_name)
                 break
         if payload is not None:
             break
     if payload is None:
-        if attempted and quota_hits == attempted:
-            # Every model refused on quota: cool the key down.
-            _gemini_quota_blocked_until[cache_key] = (
-                time.monotonic() + _GEMINI_QUOTA_COOLDOWN_SECONDS
+        if attempted:
+            # The whole candidate list failed. Re-probing on the next line would
+            # repeat the same requests (up to a handful per subtitle line), so park
+            # the key: a quota sweep cools down for longer than a model/key error.
+            cooldown = (
+                _GEMINI_QUOTA_COOLDOWN_SECONDS if quota_hits == attempted
+                else _GEMINI_SWEEP_COOLDOWN_SECONDS
             )
+            _gemini_quota_blocked_until[cache_key] = time.monotonic() + cooldown
         raise RuntimeError(f'Gemini returned no completion: {last_error or "no usable model"}')
 
     candidates = payload.get('candidates') or []
@@ -809,9 +846,10 @@ def codecraft_chat(key: str, messages: list[dict], model: str = CODECRAFT_DEFAUL
         if not text:
             last_error = RuntimeError(f'CodeCraft model "{candidate}" returned an empty completion')
             continue
-        _codecraft_model_cache[cache_key] = candidate
+        if _codecraft_model_cache.get(cache_key) != candidate:
+            _codecraft_model_cache[cache_key] = candidate
+            _save_model_cache(f'codecraft:{cache_key}', candidate)
         dead.discard(candidate)
-        _save_model_cache(f'codecraft:{cache_key}', candidate)
         _clear_billing_block('codecraft')
         return text
     if last_error is not None:

@@ -1993,27 +1993,38 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
         nonlocal translated_count, first_error
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        def work(segment: dict[str, Any]) -> str:
-            return translator.translate(segment['text'], payload.target_language, source_language)
+        # Dialogue repeats short lines constantly ("Yes.", "No.", "What?",
+        # someone's name). Identical source lines share one paid request instead
+        # of each costing their own: on a long video that is a real slice of the
+        # bill, and the translation would be the same anyway.
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for segment in pending:
+            groups.setdefault(segment['text'], []).append(segment)
 
         # A small bounded pool keeps long runs several times faster while the
         # retry/backoff inside the provider absorbs rate limiting. Google's free
         # endpoint throttles parallel callers, and a single local model (Qwen, NLLB)
         # runs one generation at a time behind its lock, so both run one line at a time.
         serial_engines = ('google', 'nllb', 'qwen')
-        workers = 1 if translator.first_engine() in serial_engines else min(4, max(1, len(pending)))
-        with ThreadPoolExecutor(max_workers=min(workers, max(1, len(pending)))) as pool:
-            futures = {pool.submit(work, segment): segment for segment in pending}
+        workers = 1 if translator.first_engine() in serial_engines else min(4, max(1, len(groups)))
+
+        def work(text: str) -> str:
+            return translator.translate(text, payload.target_language, source_language)
+
+        with ThreadPoolExecutor(max_workers=min(workers, max(1, len(groups)))) as pool:
+            futures = {pool.submit(work, text): text for text in groups}
             for future in as_completed(futures):
-                segment = futures[future]
+                text = futures[future]
                 try:
-                    segment['translation'] = future.result()
+                    translation = future.result()
                 except Exception as error:
                     # Keep every finished translation; remember the first failure.
                     if first_error is None:
                         first_error = error
                     continue
-                translated_count += 1
+                for segment in groups[text]:
+                    segment['translation'] = translation
+                translated_count += len(groups[text])
                 if translated_count % 5 == 0 or translated_count == len(pending):
                     done = already_done + translated_count
                     asyncio.run_coroutine_threadsafe(
