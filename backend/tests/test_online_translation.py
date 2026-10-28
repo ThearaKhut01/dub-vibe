@@ -289,6 +289,37 @@ def test_pure_analysis_with_no_answer_is_refused(keys, monkeypatch):
     assert translator.active_mode == 'online'
 
 
+def test_google_429_parks_the_engine_instead_of_retrying_for_minutes(monkeypatch):
+    """A rate limit is about the endpoint: one failed request, then stop."""
+    import io
+    import time as clock
+
+    calls = []
+
+    def rate_limited(*args, **kwargs):
+        calls.append(1)
+        raise urllib.error.HTTPError(
+            'https://translate.googleapis.com/', 429, 'Too Many Requests', {},
+            io.BytesIO(b'{}'),
+        )
+
+    monkeypatch.setattr(providers, 'urlopen', rate_limited)
+    providers._GOOGLE_COOLDOWN_UNTIL = 0.0
+    provider = providers.GoogleTranslateProvider()
+    started = clock.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match='rate-limited this machine'):
+            provider.translate('萧炎', 'Khmer', 'zh')
+        assert clock.monotonic() - started < 5
+        assert len(calls) == 1
+        # Every later line is refused locally: no more requests reach Google.
+        with pytest.raises(RuntimeError, match='rate-limiting this machine'):
+            provider.translate('萧炎', 'Khmer', 'zh')
+        assert len(calls) == 1
+    finally:
+        providers._GOOGLE_COOLDOWN_UNTIL = 0.0
+
+
 def test_short_cjk_name_romanization_is_accepted():
     """A character name has no Khmer translation; romanizing it must not fail the run."""
     assert providers._translation_script_ok('Xiao Yan', '蕭顏', 'zh', 'Khmer')

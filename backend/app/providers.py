@@ -8,6 +8,7 @@ import random
 import re
 import subprocess
 import sys
+import threading
 import time
 import wave
 from abc import ABC, abstractmethod
@@ -438,6 +439,37 @@ def _argos_available() -> bool:
         return False
 
 
+# Argos keeps an online package index. Refreshing it costs a network request,
+# and it used to be refreshed once per line whenever a pair was missing — a
+# Khmer video with no zh->km package made one request per subtitle line before
+# falling through to Google. Cache the catalogue and remember pairs that are
+# not available so the chain fails over immediately instead of re-probing.
+_ARGOS_INDEX_TTL = 600.0
+_ARGOS_MISSING_TTL = 600.0
+_ARGOS_PACKAGES: list | None = None
+_ARGOS_INDEX_AT = 0.0
+_ARGOS_MISSING_PAIRS: dict[tuple[str, str], float] = {}
+_ARGOS_LOCK = threading.Lock()
+
+
+# Google's free endpoint answers 429 when a machine sends too many lines in a
+# short time. Retrying the same line four times costs ~100 s and still fails, so
+# a 429 parks the engine briefly: the rest of the run stops with one clear
+# message instead of sending hundreds of doomed requests.
+_GOOGLE_COOLDOWN_SECONDS = 60.0
+_GOOGLE_COOLDOWN_UNTIL = 0.0
+_GOOGLE_LOCK = threading.Lock()
+
+
+def reset_argos_cache() -> None:
+    """Forget the cached package index and missing pairs (after installing one)."""
+    global _ARGOS_PACKAGES, _ARGOS_INDEX_AT
+    with _ARGOS_LOCK:
+        _ARGOS_PACKAGES = None
+        _ARGOS_INDEX_AT = 0.0
+        _ARGOS_MISSING_PAIRS.clear()
+
+
 class ArgosTranslationProvider(TranslationProvider):
     """Lightweight offline translation using Argos Translate.
 
@@ -481,10 +513,46 @@ class ArgosTranslationProvider(TranslationProvider):
         argos_translate.get_installed_languages.cache_clear()
 
     @staticmethod
+    def _available_packages(force_refresh: bool = False) -> list:
+        """The Argos package catalogue, refreshed at most once every ten minutes."""
+        global _ARGOS_PACKAGES, _ARGOS_INDEX_AT
+        from argostranslate import package as argos_package
+
+        with _ARGOS_LOCK:
+            stale = (
+                _ARGOS_PACKAGES is None
+                or force_refresh
+                or time.monotonic() - _ARGOS_INDEX_AT > _ARGOS_INDEX_TTL
+            )
+            if stale:
+                argos_package.update_package_index()
+                _ARGOS_PACKAGES = list(argos_package.get_available_packages())
+                _ARGOS_INDEX_AT = time.monotonic()
+            return list(_ARGOS_PACKAGES or [])
+
+    @staticmethod
+    def _pair_recently_missing(source: str, target: str) -> bool:
+        with _ARGOS_LOCK:
+            marked = _ARGOS_MISSING_PAIRS.get((source, target))
+            if marked is None:
+                return False
+            if time.monotonic() - marked > _ARGOS_MISSING_TTL:
+                _ARGOS_MISSING_PAIRS.pop((source, target), None)
+                return False
+            return True
+
+    @staticmethod
+    def _mark_pair_missing(source: str, target: str) -> None:
+        with _ARGOS_LOCK:
+            _ARGOS_MISSING_PAIRS[(source, target)] = time.monotonic()
+
+    @staticmethod
     def _ensure_package(source: str, target: str) -> bool:
         """Download the language package if it is not already installed.
 
         Returns True when the requested pair is available, False otherwise.
+        A missing pair is remembered for ten minutes so a whole run does not
+        refresh the catalogue (a network request) once per subtitle line.
         """
         try:
             from argostranslate import package as argos_package, translate as argos_translate
@@ -495,23 +563,31 @@ class ArgosTranslationProvider(TranslationProvider):
             installed = argos_translate.get_installed_languages()
             if ArgosTranslationProvider._find_installed_translation(installed, source, target) is not None:
                 return True
+            if ArgosTranslationProvider._pair_recently_missing(source, target):
+                return False
 
             # Try to download the package.
-            argos_package.update_package_index()
-            available = argos_package.get_available_packages()
             pkg = next(
-                (p for p in available if p.from_code == source and p.to_code == target),
+                (
+                    candidate
+                    for candidate in ArgosTranslationProvider._available_packages()
+                    if candidate.from_code == source and candidate.to_code == target
+                ),
                 None,
             )
             if pkg is None:
                 # No direct package for this pair; the caller may pivot via English.
+                ArgosTranslationProvider._mark_pair_missing(source, target)
                 return False
             download_path = pkg.download()
             argos_package.install_from_path(download_path)
             installed = argos_translate.get_installed_languages()
-            return ArgosTranslationProvider._find_installed_translation(installed, source, target) is not None
+            found = ArgosTranslationProvider._find_installed_translation(installed, source, target) is not None
+            reset_argos_cache()
+            return found
         except Exception as error:
             logger.warning('Argos package install failed for %s->%s: %s', source, target, error)
+            ArgosTranslationProvider._mark_pair_missing(source, target)
             return False
 
     def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
@@ -547,19 +623,23 @@ class ArgosTranslationProvider(TranslationProvider):
         if source == target:
             return True
         try:
-            from argostranslate import package as argos_package, translate as argos_translate
+            from argostranslate import translate as argos_translate
 
             ArgosTranslationProvider._configure_settings()
 
             installed = argos_translate.get_installed_languages()
             if ArgosTranslationProvider._find_installed_translation(installed, source, target) is not None:
                 return True
-            argos_package.update_package_index()
-            catalogue = {(p.from_code, p.to_code) for p in argos_package.get_available_packages()}
+            if ArgosTranslationProvider._pair_recently_missing(source, target):
+                return False
+            packages = ArgosTranslationProvider._available_packages()
+            catalogue = {(p.from_code, p.to_code) for p in packages}
             if (source, target) in catalogue:
                 return True
             if source != 'en' and target != 'en':
-                return (source, 'en') in catalogue and ('en', target) in catalogue
+                if (source, 'en') in catalogue and ('en', target) in catalogue:
+                    return True
+            ArgosTranslationProvider._mark_pair_missing(source, target)
             return False
         except Exception as error:
             logger.warning('Argos pair check failed for %s->%s: %s', source, target, error)
@@ -599,11 +679,30 @@ class GoogleTranslateProvider(TranslationProvider):
 
     max_attempts = 4
 
+    @staticmethod
+    def _cooldown_remaining() -> float:
+        with _GOOGLE_LOCK:
+            return max(0.0, _GOOGLE_COOLDOWN_UNTIL - time.monotonic())
+
+    @staticmethod
+    def _park() -> None:
+        """Stop sending lines to Google after it says 429 (rate limited)."""
+        global _GOOGLE_COOLDOWN_UNTIL
+        with _GOOGLE_LOCK:
+            _GOOGLE_COOLDOWN_UNTIL = time.monotonic() + _GOOGLE_COOLDOWN_SECONDS
+
     def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
         target = _resolve_lang_code(target_language)
         source = _resolve_lang_code(source_language)
         if source == target:
             return text
+        remaining = self._cooldown_remaining()
+        if remaining > 0:
+            raise RuntimeError(
+                'Google Translate is rate-limiting this machine. '
+                f'Wait about {max(1, int(remaining))} seconds, then press Translate again — '
+                'finished lines are already saved.'
+            )
         query = urlencode({'client': 'gtx', 'sl': source, 'tl': target, 'dt': 't', 'q': text})
         url = f'https://translate.googleapis.com/translate_a/single?{query}'
         # Same trust settings as the keyed providers, so a corporate CA bundle
@@ -633,13 +732,20 @@ class GoogleTranslateProvider(TranslationProvider):
                 raise
             except Exception as error:
                 last_error = error
+                # A 429 is about the whole endpoint, not this line: retrying it
+                # four times costs ~100 seconds per subtitle line and still
+                # fails. Park the engine so the run stops with one clear
+                # message instead of hammering Google for the rest of the video.
+                if isinstance(error, HTTPError) and error.code == 429:
+                    self._park()
+                    raise RuntimeError(
+                        'Google Translate rate-limited this machine (HTTP 429). '
+                        f'Wait about {int(_GOOGLE_COOLDOWN_SECONDS)} seconds, then press '
+                        'Translate again — finished lines are already saved.'
+                    ) from error
                 if attempt < self.max_attempts - 1:
-                    # Exponential backoff with jitter rides out rate limits and
-                    # transient network drops instead of failing the whole run.
-                    # A 429 means the endpoint wants a longer pause, so it waits longer.
-                    rate_limited = isinstance(error, HTTPError) and error.code == 429
-                    base = 15.0 if rate_limited else 0.5 * (2 ** attempt)
-                    time.sleep(min(60.0, base * (2 ** attempt if rate_limited else 1)) + random.uniform(0.0, 0.5))
+                    # Transient network drops: exponential backoff with jitter.
+                    time.sleep(0.5 * (2 ** attempt) + random.uniform(0.0, 0.5))
         raise RuntimeError(
             f'Google Translate failed after {self.max_attempts} attempts: {last_error}'
         ) from last_error
@@ -910,6 +1016,16 @@ class HybridTranslationProvider(TranslationProvider):
         """Key of the first engine tried ('qwen', 'nllb', 'argos', 'google', 'gemini', 'openai', 'codecraft')."""
         chain = self._chain()
         return chain[0][0] if chain else None
+
+    def max_parallel_lines(self) -> int:
+        """How many lines may translate at once.
+
+        Only a paid keyed engine benefits from a pool. Google's free endpoint
+        throttles parallel callers (parallel requests are what earns a 429), and
+        local engines run one generation at a time, so they stay serial — Auto
+        included, whatever its first engine happens to be.
+        """
+        return 4 if self.first_engine() in ONLINE_TRANSLATION_ENGINES else 1
 
     def check_preferred_engine(self, target_language: str, source_language: str = 'en') -> None:
         """Raise before any translation if the engine the user chose cannot handle the language.

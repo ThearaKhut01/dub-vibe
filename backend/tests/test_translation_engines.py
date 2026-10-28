@@ -61,6 +61,61 @@ def test_argos_choice_allowed_when_pair_available():
         provider.check_preferred_engine('French', 'en')
 
 
+def _fake_argos(monkeypatch, installed=(), catalogue=()):
+    """Point Argos at a fake catalogue and count index refreshes."""
+    from argostranslate import package as argos_package, translate as argos_translate
+
+    calls = {'index': 0}
+
+    def update_index():
+        calls['index'] += 1
+
+    monkeypatch.setattr(argos_package, 'update_package_index', update_index)
+    monkeypatch.setattr(argos_package, 'get_available_packages', lambda: list(catalogue))
+    monkeypatch.setattr(argos_translate, 'get_installed_languages', lambda: list(installed))
+    monkeypatch.setattr(ArgosTranslationProvider, '_configure_settings', staticmethod(lambda: None))
+    providers.reset_argos_cache()
+    return calls
+
+
+def test_argos_missing_pair_is_not_rechecked_for_every_line(monkeypatch):
+    """A Khmer run without the zh->km package must not hit the network per line."""
+    calls = _fake_argos(monkeypatch)
+    try:
+        for _ in range(25):
+            assert ArgosTranslationProvider._ensure_package('zh', 'km') is False
+        assert calls['index'] == 1
+    finally:
+        providers.reset_argos_cache()
+
+
+def test_argos_missing_pair_is_retried_after_the_cache_expires(monkeypatch):
+    import time
+
+    calls = _fake_argos(monkeypatch)
+    try:
+        assert ArgosTranslationProvider._ensure_package('zh', 'km') is False
+        assert calls['index'] == 1
+        expired = time.monotonic() - providers._ARGOS_INDEX_TTL - 1
+        providers._ARGOS_INDEX_AT = expired
+        providers._ARGOS_MISSING_PAIRS[('zh', 'km')] = expired
+        assert ArgosTranslationProvider._ensure_package('zh', 'km') is False
+        assert calls['index'] == 2
+    finally:
+        providers.reset_argos_cache()
+
+
+def test_argos_installed_pair_needs_no_catalogue_refresh(monkeypatch):
+    calls = _fake_argos(monkeypatch, installed=[object()])
+    monkeypatch.setattr(ArgosTranslationProvider, '_find_installed_translation',
+                        staticmethod(lambda installed, source, target: object()))
+    try:
+        assert ArgosTranslationProvider._ensure_package('en', 'km') is True
+        assert calls['index'] == 0
+    finally:
+        providers.reset_argos_cache()
+
+
 def test_nllb_choice_refuses_unknown_language_with_clear_message():
     provider = HybridTranslationProvider(preference='nllb')
     provider._nllb = object()
@@ -70,6 +125,19 @@ def test_nllb_choice_refuses_unknown_language_with_clear_message():
 
 def test_first_engine_reports_the_engine_that_will_run():
     assert HybridTranslationProvider(preference='google').first_engine() == 'google'
+
+
+def test_lines_are_serial_when_google_is_reachable(monkeypatch):
+    """Parallel requests are what earns Google's 429, so free engines run one at a time."""
+    assert HybridTranslationProvider(preference='google').max_parallel_lines() == 1
+    with mock.patch.object(providers, '_argos_available', return_value=True):
+        assert HybridTranslationProvider(preference='auto').max_parallel_lines() == 1
+
+
+def test_paid_keyed_engine_still_uses_a_small_pool(monkeypatch):
+    with mock.patch.object(providers.CodeCraftTranslationProvider, 'is_available', return_value=True):
+        provider = HybridTranslationProvider(preference='codecraft')
+    assert provider.max_parallel_lines() == 4
 
 
 @pytest.mark.parametrize('preference', ['qwen', 'nllb', 'argos'])

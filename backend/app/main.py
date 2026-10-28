@@ -2001,12 +2001,16 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
         for segment in pending:
             groups.setdefault(segment['text'], []).append(segment)
 
-        # A small bounded pool keeps long runs several times faster while the
-        # retry/backoff inside the provider absorbs rate limiting. Google's free
-        # endpoint throttles parallel callers, and a single local model (Qwen, NLLB)
-        # runs one generation at a time behind its lock, so both run one line at a time.
+        # A small bounded pool keeps long runs several times faster, but only a
+        # paid keyed engine benefits: Google's free endpoint throttles parallel
+        # callers (that is what earns a 429), and a single local model runs one
+        # generation at a time behind its lock, so Auto and local engines are
+        # serial no matter which engine in the chain starts.
         serial_engines = ('google', 'nllb', 'qwen')
-        workers = 1 if translator.first_engine() in serial_engines else min(4, max(1, len(groups)))
+        if hasattr(translator, 'max_parallel_lines'):
+            workers = min(translator.max_parallel_lines(), max(1, len(groups)))
+        else:
+            workers = 1 if translator.first_engine() in serial_engines else min(4, max(1, len(groups)))
 
         def work(text: str) -> str:
             return translator.translate(text, payload.target_language, source_language)
