@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type {
   CudaPackInfo,
+  CustomApiConfig,
   HardwareInfo,
   MediaAsset,
   ModelStorageInfo,
@@ -52,7 +53,8 @@ interface StudioState {
    * preview discards audio elements holding the previous clip.
    */
   dubAudioVersion: number;
-  providerKeys: { gemini: { has_key: boolean }; openai: { has_key: boolean }; codecraft: { has_key: boolean } };
+  providerKeys: { gemini: { has_key: boolean }; openai: { has_key: boolean }; codecraft: { has_key: boolean }; custom: { has_key: boolean } };
+  customApi: CustomApiConfig | null;
   voiceCapabilities: Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean; voices_by_language?: Record<string, Array<{ id: string; label: string; voice: string; gender: string }>> }> & { emotions?: string[] };
   characters: { speakers: string[]; characters: Record<string, Record<string, unknown>> };
   workflowSteps: WorkflowStep[];
@@ -96,7 +98,8 @@ interface StudioState {
   refreshVoiceConfig: () => Promise<void>;
   setProviderKey: (provider: string, key: string) => Promise<void>;
   removeProviderKey: (provider: string) => Promise<void>;
-  testProvider: (provider: string) => Promise<{ models: string[]; translationModels: string[] }>;
+  setCustomApi: (config: { base_url: string; model: string }) => Promise<void>;
+  testProvider: (provider: string) => Promise<{ models: string[]; translationModels: string[]; model?: string | null }>;
   previewLine: (payload: { text: string; provider: string; voice?: string; model?: string; emotion: string; intensity: number; speed?: number; language: string }) => Promise<string>;
   refreshCharacters: () => Promise<void>;
   saveCharacters: (characters: Record<string, Record<string, unknown>>) => Promise<void>;
@@ -371,7 +374,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   voxcpmModel: null,
   genderModel: null,
   cudaPack: null,
-  providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false } },
+  providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false }, custom: { has_key: false } },
+  customApi: null,
   voiceCapabilities: {},
   characters: { speakers: [], characters: {} },
   workflowSteps: initialWorkflowSteps,
@@ -816,13 +820,15 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   },
   refreshVoiceConfig: async () => {
     try {
-      const [keys, capabilities] = await Promise.all([
-        readJson<{ gemini: { has_key: boolean }; openai: { has_key: boolean }; codecraft: { has_key: boolean } }>('/api/providers/keys').catch(() => null),
+      const [keys, capabilities, customConfig] = await Promise.all([
+        readJson<{ gemini: { has_key: boolean }; openai: { has_key: boolean }; codecraft: { has_key: boolean }; custom: { has_key: boolean } }>('/api/providers/keys').catch(() => null),
         readJson<Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean; voices_by_language?: Record<string, Array<{ id: string; label: string; voice: string; gender: string }>> }> & { emotions?: string[] }>('/api/tts/capabilities').catch(() => null),
+        readJson<CustomApiConfig>('/api/providers/custom/config').catch(() => null),
       ]);
       set({
         providerKeys: keys ?? get().providerKeys,
         voiceCapabilities: capabilities ?? get().voiceCapabilities,
+        customApi: customConfig ?? get().customApi,
       });
     } catch {
       // Backend offline; keep last known state.
@@ -846,6 +852,19 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     get().appendLog(`${provider} API key removed.`);
     await get().refreshVoiceConfig();
   },
+  setCustomApi: async (config) => {
+    const response = await fetch(`${apiBase}/api/providers/custom/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(problem.detail ?? `Unable to save the custom API (HTTP ${response.status})`);
+    }
+    get().appendLog('Custom API configuration saved.', 'success');
+    await get().refreshVoiceConfig();
+  },
   testProvider: async (provider) => {
     const response = await fetch(`${apiBase}/api/providers/${provider}/test`, { method: 'POST' });
     const payload = await response.json().catch(() => ({}));
@@ -856,6 +875,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     return {
       models: payload.tts_models ?? [],
       translationModels: payload.translation_models ?? [],
+      model: payload.model ?? null,
     };
   },
   previewLine: async (payload) => {
@@ -1311,7 +1331,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       voxcpmModel: null,
       genderModel: null,
       cudaPack: null,
-      providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false } },
+      providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false }, custom: { has_key: false } },
+  customApi: null,
       voiceCapabilities: {},
       characters: { speakers: [], characters: {} },
       workflowSteps: initialWorkflowSteps.map((step) => ({ ...step })),

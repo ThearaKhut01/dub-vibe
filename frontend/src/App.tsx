@@ -182,10 +182,12 @@ function App() {
     mergeSegmentWithNext,
     deleteSegment,
     providerKeys,
+    customApi,
     voiceCapabilities,
     refreshVoiceConfig,
     setProviderKey,
     removeProviderKey,
+    setCustomApi,
     testProvider,
     previewLine,
     characters,
@@ -229,6 +231,9 @@ function App() {
   const [geminiKeyInput, setGeminiKeyInput] = useState('');
   const [openaiKeyInput, setOpenaiKeyInput] = useState('');
   const [codecraftKeyInput, setCodecraftKeyInput] = useState('');
+  const [customBaseUrl, setCustomBaseUrl] = useState('');
+  const [customModel, setCustomModel] = useState('');
+  const [customKeyInput, setCustomKeyInput] = useState('');
   const [keyTestMessage, setKeyTestMessage] = useState('');
   const [keyBusy, setKeyBusy] = useState<string | null>(null);
   const [ttsProvider, setTtsProvider] = useState(() => localStorage.getItem('dubvibe-tts-provider') ?? 'auto');
@@ -990,6 +995,15 @@ function App() {
       const result = await testProvider(provider);
       const voiceCount = result.models.length;
       const translationCount = result.translationModels.length;
+      if (provider === 'custom') {
+        const used = result.model ? ` — answering with ${result.model}` : '';
+        setKeyTestMessage(
+          translationCount
+            ? `custom: connected — ${translationCount} model${translationCount === 1 ? '' : 's'} available${used}`
+            : `custom: connected — the endpoint answered${used}`,
+        );
+        return;
+      }
       setKeyTestMessage(
         `${provider}: connected — ${voiceCount} TTS model${voiceCount === 1 ? '' : 's'} and `
         + `${translationCount} translation model${translationCount === 1 ? '' : 's'} available`,
@@ -1014,6 +1028,28 @@ function App() {
       await handleTestKey(provider);
     } catch (error) {
       setKeyTestMessage(`${provider}: ${error instanceof Error ? error.message : 'could not store key'}`);
+    } finally {
+      setKeyBusy(null);
+    }
+  };
+
+  const handleSaveCustom = async () => {
+    const baseUrl = customBaseUrl.trim();
+    const model = customModel.trim();
+    if (!baseUrl || !model) {
+      setKeyTestMessage('custom: enter both the base URL and the model name');
+      return;
+    }
+    setKeyBusy('custom');
+    setKeyTestMessage('');
+    try {
+      await setCustomApi({ base_url: baseUrl, model });
+      // A key is optional: local servers (LM Studio, vLLM, Ollama) take none.
+      if (customKeyInput.trim()) await setProviderKey('custom', customKeyInput.trim());
+      setCustomKeyInput('');
+      await handleTestKey('custom');
+    } catch (error) {
+      setKeyTestMessage(`custom: ${error instanceof Error ? error.message : 'could not save the configuration'}`);
     } finally {
       setKeyBusy(null);
     }
@@ -1304,7 +1340,11 @@ function App() {
             AI Models
           </button>
           <button
-            onClick={() => setShowApiKeys(true)}
+            onClick={() => {
+              setCustomBaseUrl(customApi?.base_url ?? '');
+              setCustomModel(customApi?.model ?? '');
+              setShowApiKeys(true);
+            }}
             title="Online AI provider settings"
             className="flex items-center gap-2 rounded-lg border border-violet-500/30 bg-violet-500/10 px-3 py-2 text-sm font-medium text-violet-200 transition hover:border-violet-500/60 hover:bg-violet-500/20"
           >
@@ -2097,13 +2137,20 @@ function App() {
                   <option value="codecraft" disabled={!providerKeys.codecraft.has_key}>
                     CodeCraft (online){providerKeys.codecraft.has_key ? ' — key configured' : ' — add a key in API Settings'}
                   </option>
+                  <option value="custom" disabled={!customApi?.configured}>
+                    Custom API (online){customApi?.configured
+                      ? ` — ${customApi.primary || customApi.model}${customApi.models.length > 1 ? ` +${customApi.models.length - 1} fallback` : ''}`
+                      : ' — configure in API Settings'}
+                  </option>
                 </select>
                 <p className="mt-1 text-[10px] leading-4 text-slate-500">
                   {translationProvider === 'gemini' || translationProvider === 'openai'
                     ? 'Paid engine: every translated line is a billed API request. Uses the same key as the voice engine.'
                     : translationProvider === 'codecraft'
                       ? 'CodeCraft free tier: 1M tokens/month, no card required. Translation only — it has no voice engine.'
-                      : translationProvider === 'qwen'
+                      : translationProvider === 'custom'
+                        ? `Custom API: ${customApi?.base_url ?? 'not configured'}${customApi?.primary ? ` (${customApi.primary}${customApi.models.length > 1 ? ` +${customApi.models.length - 1} fallback` : ''})` : ''}. Every line is a request to that endpoint; it is used for translation only.`
+                        : translationProvider === 'qwen'
                         ? 'Local and free: Qwen3 4B only. If it cannot start, translation stops with an error — Google is never contacted.'
                         : 'Auto tries Qwen3 4B (local) first, then Argos, then Google Translate. Online API keys are only used when you pick that engine.'}
                   {' '}A line that fails moves to the next engine in this chain.
@@ -2619,7 +2666,8 @@ function App() {
                   Keys are stored in Windows Credential Manager — never in the browser. Gemini and OpenAI keys enable
                   <span className="text-slate-300"> dubbing (TTS)</span> and
                   <span className="text-slate-300"> translation</span>; the CodeCraft key adds
-                  <span className="text-slate-300"> free-tier translation</span>.
+                  <span className="text-slate-300"> free-tier translation</span>, and a custom endpoint adds
+                  <span className="text-slate-300"> your own OpenAI-compatible API</span>.
                 </p>
               </div>
               <button onClick={() => setShowApiKeys(false)} className="rounded p-1 text-slate-500 hover:text-white transition">✕</button>
@@ -2707,6 +2755,74 @@ function App() {
                   </div>
                 );
               })}
+              <div className="mb-4 rounded-xl border border-violet-500/25 bg-slate-900/80 p-3">
+                <div className="mb-2 flex items-center justify-between">
+                  <p className="text-sm font-medium text-slate-200">Custom API (OpenAI-compatible)</p>
+                  <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${customApi?.configured ? 'bg-emerald-500/20 text-emerald-200' : 'bg-slate-700/60 text-slate-300'}`}>
+                    {customApi?.configured ? '● Configured' : '○ Not configured'}
+                  </span>
+                </div>
+                <div className="space-y-2">
+                  <input
+                    value={customBaseUrl}
+                    onChange={(event) => setCustomBaseUrl(event.target.value)}
+                    placeholder="Base URL — e.g. https://openrouter.ai/api/v1 or http://localhost:11434/v1"
+                    spellCheck={false}
+                    className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-200"
+                  />
+                  <input
+                    value={customModel}
+                    onChange={(event) => setCustomModel(event.target.value)}
+                    placeholder="Model — e.g. mistralai/mistral-large-2512, qwen/qwen3.8-omni-flash:free"
+                    spellCheck={false}
+                    className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-200"
+                  />
+                  <input
+                    type="password"
+                    value={customKeyInput}
+                    onChange={(event) => setCustomKeyInput(event.target.value)}
+                    placeholder="API key (optional — local servers usually need none)"
+                    spellCheck={false}
+                    className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-200"
+                  />
+                </div>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => void handleSaveCustom()}
+                    disabled={keyBusy !== null}
+                    className="rounded-lg border border-white/10 bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-700 transition disabled:opacity-40"
+                  >
+                    {keyBusy === 'custom' ? 'Saving…' : 'Save'}
+                  </button>
+                  <button
+                    onClick={() => void handleTestKey('custom')}
+                    disabled={keyBusy !== null || !customApi?.configured}
+                    className="rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-200 hover:bg-sky-500/20 transition disabled:opacity-40"
+                  >
+                    {keyBusy === 'custom' ? 'Testing…' : 'Test connection'}
+                  </button>
+                  {customApi?.has_key && (
+                    <button
+                      onClick={() => { setCustomKeyInput(''); void removeProviderKey('custom'); }}
+                      className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/20 transition"
+                    >
+                      Remove key
+                    </button>
+                  )}
+                </div>
+                <p className="mt-1.5 text-[10px] leading-4 text-slate-500">
+                  Any endpoint that implements <span className="text-slate-400">POST /chat/completions</span> with the
+                  OpenAI request shape (OpenRouter, DeepSeek, Groq, a company gateway, LM Studio, vLLM, Ollama /v1).
+                  Used for <span className="text-slate-400">translation only</span>, and only when you pick it in the
+                  Translation engine list. A bare host gets <span className="text-slate-400">/v1</span> appended.
+                </p>
+                <p className="mt-1 text-[10px] leading-4 text-slate-500">
+                  Separate models with commas to build a fallback chain. If one is busy
+                  (<span className="text-slate-400">429</span> or
+                  <span className="text-slate-400"> 5xx</span>) the next is tried, and the model that answered is
+                  reused for the following lines.
+                </p>
+              </div>
               {keyTestMessage && (
                 <p className={`rounded-lg border px-3 py-2 text-xs ${keyTestMessage.includes('connected') ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200' : 'border-amber-500/30 bg-amber-500/10 text-amber-200'}`}>
                   {keyTestMessage}

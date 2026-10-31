@@ -84,6 +84,15 @@ def save_settings(update: dict) -> dict:
         for key in ('selected_whisper_model', 'device', 'compute'):
             if key in update and update[key]:
                 settings[key] = update[key]
+        if 'custom_api' in update:
+            custom = update['custom_api']
+            if isinstance(custom, dict):
+                settings['custom_api'] = {
+                    'base_url': str(custom.get('base_url') or ''),
+                    'model': str(custom.get('model') or ''),
+                }
+            else:
+                settings.pop('custom_api', None)
         if settings.get('selected_whisper_model') not in WHISPER_CATALOG:
             settings['selected_whisper_model'] = 'base'
         try:

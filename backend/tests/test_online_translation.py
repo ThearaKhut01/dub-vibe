@@ -16,17 +16,24 @@ import pytest
 from backend.app import api_keys, providers
 from backend.app.providers import (
     CodeCraftTranslationProvider,
+    CustomAPITranslationProvider,
     GeminiTranslationProvider,
     HybridTranslationProvider,
     OpenAITranslationProvider,
     ONLINE_TRANSLATION_ENGINES,
 )
 
+# Engines that are enabled by an API key. The custom engine is enabled by its
+# base URL + model instead, so it is tested in test_custom_api.py.
+KEYED_ENGINES = ('gemini', 'openai', 'codecraft')
+
 
 @pytest.fixture(autouse=True)
 def _no_local_qwen(monkeypatch):
     """These tests pin online routing; a runnable local Qwen would answer first."""
     monkeypatch.setattr('backend.app.qwen_local.is_installed', lambda: False)
+    # A real saved custom endpoint must not leak into these routing tests.
+    monkeypatch.setattr('backend.app.custom_api.is_configured', lambda: False)
 
 
 @pytest.fixture
@@ -48,10 +55,11 @@ def _fake_time(now: float = 0.0) -> types.SimpleNamespace:
 
 
 def test_engines_are_registered():
-    assert ONLINE_TRANSLATION_ENGINES == ('gemini', 'openai', 'codecraft')
+    assert ONLINE_TRANSLATION_ENGINES == ('gemini', 'openai', 'codecraft', 'custom')
     assert GeminiTranslationProvider.ENGINE == 'gemini'
     assert OpenAITranslationProvider.ENGINE == 'openai'
     assert CodeCraftTranslationProvider.ENGINE == 'codecraft'
+    assert CustomAPITranslationProvider.ENGINE == 'custom'
 
 
 def test_auto_never_uses_a_keyed_engine(keys):
@@ -65,14 +73,14 @@ def test_auto_never_uses_a_keyed_engine(keys):
         assert engine not in [key for key, _ in translator._chain()]
 
 
-@pytest.mark.parametrize('engine', ONLINE_TRANSLATION_ENGINES)
+@pytest.mark.parametrize('engine', KEYED_ENGINES)
 def test_explicit_engine_is_first_when_the_key_exists(keys, engine):
     keys[engine] = 'secret'
     translator = HybridTranslationProvider(preference=engine)
     assert translator.first_engine() == engine
 
 
-@pytest.mark.parametrize('engine', ONLINE_TRANSLATION_ENGINES)
+@pytest.mark.parametrize('engine', KEYED_ENGINES)
 def test_explicit_engine_without_a_key_is_refused(keys, engine):
     translator = HybridTranslationProvider(preference=engine)
     with pytest.raises(RuntimeError, match='API key is not configured'):
@@ -356,18 +364,23 @@ def test_doubled_sentences_collapse_helper():
     ) == 'ថាមពលឈាមនៃត្រកូលទាំងមូល ក៏នឹងរលត់អស់ដែរ។'
 
 
-def test_provider_health_reports_online_translation_engines(keys):
+def test_provider_health_reports_online_translation_engines(keys, monkeypatch):
     rows = {row['id']: row for row in providers.get_provider_status()}
     assert rows['gemini']['mode'] == 'PAID API'
     assert rows['openai']['mode'] == 'PAID API'
     assert rows['codecraft']['mode'] == 'FREE ONLINE'
+    assert rows['custom']['mode'] == 'CUSTOM API'
     assert rows['gemini']['connected'] is False
     assert rows['codecraft']['connected'] is False
+    assert rows['custom']['connected'] is False
     keys['gemini'] = 'g-key'
     keys['codecraft'] = 'cc-key'
     rows = {row['id']: row for row in providers.get_provider_status()}
     assert rows['gemini']['connected'] is True
     assert rows['codecraft']['connected'] is True
+    monkeypatch.setattr('backend.app.custom_api.is_configured', lambda: True)
+    rows = {row['id']: row for row in providers.get_provider_status()}
+    assert rows['custom']['connected'] is True
 
 
 # --- Gemini text model selection -------------------------------------------

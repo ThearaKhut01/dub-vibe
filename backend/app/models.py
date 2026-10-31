@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-ProviderMode = Literal['LOCAL AI', 'FREE ONLINE', 'PAID API']
+ProviderMode = Literal['LOCAL AI', 'FREE ONLINE', 'PAID API', 'CUSTOM API']
 
 
 class ProviderSettings(BaseModel):

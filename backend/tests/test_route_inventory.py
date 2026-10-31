@@ -28,6 +28,8 @@ REQUIRED = {
     ('GET', '/api/models/qwen'),
     ('GET', '/api/models/cuda-pack'),
     ('GET', '/api/models/storage'),
+    ('GET', '/api/providers/custom/config'),
+    ('POST', '/api/providers/custom/config'),
     ('GET', '/api/tts/capabilities'),
     ('POST', '/api/tts/preview'),
     ('POST', '/api/process/tts'),

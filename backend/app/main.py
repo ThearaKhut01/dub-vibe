@@ -613,6 +613,24 @@ async def provider_keys_status() -> dict[str, Any]:
     }
 
 
+@app.get('/api/providers/custom/config')
+async def custom_api_config() -> dict[str, Any]:
+    """Base URL and model of the user's OpenAI-compatible endpoint (no key)."""
+    from backend.app import custom_api
+
+    return custom_api.get_config()
+
+
+@app.post('/api/providers/custom/config')
+async def save_custom_api_config(payload: dict[str, Any]) -> dict[str, Any]:
+    from backend.app import custom_api
+
+    try:
+        return custom_api.save_config(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
 @app.post('/api/providers/{provider}/key')
 async def set_provider_key(provider: str, payload: dict[str, Any]) -> dict[str, Any]:
     try:
@@ -634,6 +652,29 @@ async def test_provider(provider: str) -> dict[str, Any]:
     if provider not in api_keys.PROVIDERS:
         raise HTTPException(status_code=404, detail=f'Unknown provider: {provider}')
     key = api_keys.get_key(provider)
+    if provider == 'custom':
+        # A custom endpoint may be local and need no key, so it is tested
+        # without one; the base URL and model are the configuration that matters.
+        from backend.app import custom_api
+
+        if not custom_api.is_configured():
+            raise HTTPException(
+                status_code=400,
+                detail='Set the custom API base URL and model in API Settings first.',
+            )
+        try:
+            result = await run_in_threadpool(custom_api.test, key or '')
+        except Exception as error:
+            raise HTTPException(status_code=502, detail=f'custom connection failed: {error}') from error
+        return {
+            'status': 'ok',
+            'connected': True,
+            'provider': 'custom',
+            'tts_models': [],
+            'translation_models': result.get('models', []),
+            'model': result.get('model'),
+            'sample': result.get('sample'),
+        }
     if not key:
         raise HTTPException(status_code=400, detail=f'No API key stored for {provider}. Save a key first.')
     try:

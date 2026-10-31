@@ -1,6 +1,6 @@
 export type ProjectMode = 'EDIT' | 'DUB';
 export type ProjectStatus = 'Ready' | 'Processing' | 'Queued' | 'Exporting';
-export type ProviderMode = 'LOCAL AI' | 'FREE ONLINE' | 'PAID API';
+export type ProviderMode = 'LOCAL AI' | 'FREE ONLINE' | 'PAID API' | 'CUSTOM API';
 
 export interface ProviderStatus {
   id: string;
@@ -9,6 +9,18 @@ export interface ProviderStatus {
   connected: boolean;
   primary: boolean;
   fallback: boolean;
+}
+
+export interface CustomApiConfig {
+  base_url: string;
+  /** The full chain as typed, e.g. "model-a, model-b". */
+  model: string;
+  /** The chain in fallback order. */
+  models: string[];
+  /** First model in the chain, used for labels. */
+  primary: string;
+  configured: boolean;
+  has_key: boolean;
 }
 
 export interface TimelineSegment {

@@ -262,16 +262,18 @@ EMOTIONS = [
 ]
 
 
-def _auth_headers(url: str, key: str) -> dict[str, str]:
+def _auth_headers(url: str, key: str, force_auth: bool = False) -> dict[str, str]:
     """Request headers with the provider's auth in the place it expects it.
 
     Gemini takes its key in the query string (the callers append it), while every
     OpenAI and CodeCraft endpoint requires an `Authorization: Bearer <key>` header.
-    Without it those calls fail with 401.
+    Without it those calls fail with 401. ``force_auth`` does the same for a
+    user-configured (custom) base URL, which cannot be recognised by prefix.
     """
     headers = {'Content-Type': 'application/json', 'User-Agent': ONLINE_USER_AGENT}
-    if url.startswith((OPENAI_BASE, CODECRAFT_BASE)):
-        headers['Authorization'] = f'Bearer {key}'
+    if force_auth or url.startswith((OPENAI_BASE, CODECRAFT_BASE)):
+        if key:
+            headers['Authorization'] = f'Bearer {key}'
     return headers
 
 
@@ -313,11 +315,12 @@ def _tls_error_hint(error: BaseException) -> str | None:
     return None
 
 
-def _request_json(url: str, key: str, body: dict | None = None, timeout: int = 60) -> dict:
+def _request_json(url: str, key: str, body: dict | None = None, timeout: int = 60,
+                  force_auth: bool = False) -> dict:
     request = urllib.request.Request(
         url,
         data=json.dumps(body).encode('utf-8') if body is not None else None,
-        headers=_auth_headers(url, key),
+        headers=_auth_headers(url, key, force_auth=force_auth),
         method='POST' if body is not None else 'GET',
     )
     try:

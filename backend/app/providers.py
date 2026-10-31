@@ -899,9 +899,39 @@ class CodeCraftTranslationProvider(OnlineLLMTranslationProvider):
         return api_keys.has_key('codecraft')
 
 
+class CustomAPITranslationProvider(OnlineLLMTranslationProvider):
+    """Any OpenAI-compatible endpoint the user configures (base URL + model).
+
+    Translation only: the app cannot know whether a custom endpoint has a speech
+    API, so it never appears in the TTS picker. The key is optional because local
+    servers (LM Studio, vLLM, Ollama) usually accept requests without one.
+    """
+
+    ENGINE = 'custom'
+
+    def _provider_label(self) -> str:
+        return 'Custom API'
+
+    def _key(self) -> str:
+        from . import api_keys
+
+        return api_keys.get_key('custom') or ''
+
+    def _complete(self, messages: list[dict], key: str) -> str:
+        from . import custom_api
+
+        return custom_api.chat(key, messages)
+
+    @staticmethod
+    def is_available() -> bool:
+        from . import custom_api
+
+        return custom_api.is_configured()
+
+
 # Every language the app offers is supported by the hosted LLMs (unlike their TTS
 # voices, which do not officially list Khmer).
-ONLINE_TRANSLATION_ENGINES = ('gemini', 'openai', 'codecraft')
+ONLINE_TRANSLATION_ENGINES = ('gemini', 'openai', 'codecraft', 'custom')
 
 
 class HybridTranslationProvider(TranslationProvider):
@@ -923,6 +953,7 @@ class HybridTranslationProvider(TranslationProvider):
         self._gemini: TranslationProvider | None = None
         self._openai: TranslationProvider | None = None
         self._codecraft: TranslationProvider | None = None
+        self._custom: TranslationProvider | None = None
         self._mode: str = 'online'
         self._preference = preference if preference in (
             'qwen', 'nllb', 'argos', 'google', *ONLINE_TRANSLATION_ENGINES,
@@ -945,6 +976,12 @@ class HybridTranslationProvider(TranslationProvider):
                 self._codecraft = CodeCraftTranslationProvider(style_hint)
         except Exception as error:
             logger.info('CodeCraft translation unavailable: %s', error)
+
+        try:
+            if CustomAPITranslationProvider.is_available():
+                self._custom = CustomAPITranslationProvider(style_hint)
+        except Exception as error:
+            logger.info('Custom API translation unavailable: %s', error)
 
         try:
             from . import qwen_local
@@ -1004,6 +1041,7 @@ class HybridTranslationProvider(TranslationProvider):
             'gemini': self._gemini,
             'openai': self._openai,
             'codecraft': self._codecraft,
+            'custom': self._custom,
         }
         chain: list[tuple[str, TranslationProvider]] = []
         for key in order:
@@ -1013,7 +1051,7 @@ class HybridTranslationProvider(TranslationProvider):
         return chain
 
     def first_engine(self) -> str | None:
-        """Key of the first engine tried ('qwen', 'nllb', 'argos', 'google', 'gemini', 'openai', 'codecraft')."""
+        """Key of the first engine tried ('qwen', 'nllb', 'argos', 'google', 'gemini', 'openai', 'codecraft', 'custom')."""
         chain = self._chain()
         return chain[0][0] if chain else None
 
@@ -1023,9 +1061,15 @@ class HybridTranslationProvider(TranslationProvider):
         Only a paid keyed engine benefits from a pool. Google's free endpoint
         throttles parallel callers (parallel requests are what earns a 429), and
         local engines run one generation at a time, so they stay serial — Auto
-        included, whatever its first engine happens to be.
+        included, whatever its first engine happens to be. A custom endpoint on
+        this machine/LAN stays serial too: four workers would fight the UI.
         """
-        return 4 if self.first_engine() in ONLINE_TRANSLATION_ENGINES else 1
+        first = self.first_engine()
+        if first == 'custom':
+            from . import custom_api
+
+            return 1 if custom_api.is_local() else 4
+        return 4 if first in ONLINE_TRANSLATION_ENGINES else 1
 
     def check_preferred_engine(self, target_language: str, source_language: str = 'en') -> None:
         """Raise before any translation if the engine the user chose cannot handle the language.
@@ -1040,9 +1084,15 @@ class HybridTranslationProvider(TranslationProvider):
                 'gemini': (self._gemini, 'Gemini'),
                 'openai': (self._openai, 'OpenAI'),
                 'codecraft': (self._codecraft, 'CodeCraft'),
+                'custom': (self._custom, 'Custom API'),
             }
             provider, label = online[self._preference]
             if provider is None:
+                if self._preference == 'custom':
+                    raise RuntimeError(
+                        'Custom API is not configured. Set its base URL and model in '
+                        'API Settings, or choose another engine.'
+                    )
                 raise RuntimeError(
                     f'{label} API key is not configured. Add it in API Settings or choose another engine.'
                 )
@@ -1087,6 +1137,7 @@ class HybridTranslationProvider(TranslationProvider):
         modes = {
             'qwen': 'qwen', 'nllb': 'nllb', 'argos': 'offline', 'google': 'online',
             'gemini': 'gemini', 'openai': 'openai', 'codecraft': 'codecraft',
+            'custom': 'custom',
         }
         last_error: Exception | None = None
         for key, provider in self._chain():
@@ -1666,6 +1717,14 @@ def get_provider_status() -> list[dict]:
             'connected': CodeCraftTranslationProvider.is_available(),
             'primary': False,
             'fallback': CodeCraftTranslationProvider.is_available(),
+        },
+        {
+            'id': 'custom',
+            'name': 'Custom API (translation)',
+            'mode': 'CUSTOM API',
+            'connected': CustomAPITranslationProvider.is_available(),
+            'primary': False,
+            'fallback': CustomAPITranslationProvider.is_available(),
         },
         {
             'id': 'speaker-diarization',
