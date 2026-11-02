@@ -332,7 +332,6 @@ function App() {
   const [dubbedPlaying, setDubbedPlaying] = useState(false);
   const [selectedSegmentId, setSelectedSegmentId] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const dubAudioRefs = useRef<Map<string, HTMLAudioElement>>(new Map());
   const logScrollRef = useRef<HTMLDivElement>(null);
   const [trackStates, setTrackStates] = useState<Record<string, { muted: boolean; hidden: boolean; locked: boolean }>>({
     'Video': { muted: false, hidden: false, locked: false },
@@ -456,64 +455,16 @@ function App() {
     }
   };
 
-  const stopDubAudio = () => {
-    dubAudioRefs.current.forEach((audio) => {
-      audio.pause();
-      audio.currentTime = 0;
-    });
-  };
-
-  const clearDubAudio = () => {
-    stopDubAudio();
-    dubAudioRefs.current.clear();
-  };
-
-  const syncDubAudio = () => {
+  // The Preview player is the untouched source: picture and original audio.
+  // Dubbed speech is heard in the "Dubbed preview" player, which plays the
+  // exported mix. Keeping the two separate means a preview never stacks the
+  // original and the dub on top of each other.
+  const stopPreviewAudio = () => {
     const video = videoRef.current;
-    if (!video || video.paused || trackStates['Dubbed Voice']?.muted) {
-      stopDubAudio();
-      return;
-    }
-    const time = video.currentTime;
-    const activeIndex = dubAudioSegments.findIndex((segment, index) => {
-      const clip = dubAudioRefs.current.get(`${project.id}:${index}`);
-      const spoken = (clip && Number.isFinite(clip.duration) && clip.duration > 0)
-        ? clip.duration
-        : Math.max(segment.end - segment.start, 0.25);
-      return time >= segment.start && time < segment.start + spoken;
-    });
-    const activeKey = activeIndex === -1 ? '' : `${project.id}:${activeIndex}`;
-    dubAudioRefs.current.forEach((audio, key) => {
-      if (key !== activeKey) {
-        audio.pause();
-      }
-    });
-    if (activeIndex === -1 || !dubAudioSegments[activeIndex].path) {
-      return;
-    }
-    const key = activeKey;
-    let audio = dubAudioRefs.current.get(key);
-    if (!audio) {
-      // The version query busts the cached clip after a line is regenerated,
-      // an overlap fix is applied/undone, or an export re-fits the audio.
-      audio = new Audio(`${apiBaseUrl}/api/projects/${project.id}/dub-audio/${activeIndex + 1}?v=${dubAudioVersion}`);
-      audio.preload = 'auto';
-      dubAudioRefs.current.set(key, audio);
-    }
-    const offset = Math.max(0, time - dubAudioSegments[activeIndex].start);
-    if (audio.paused) {
-      audio.currentTime = offset;
-      void audio.play().catch(() => { });
-    } else if (Math.abs(audio.currentTime - offset) > 0.25) {
-      // Seeking inside the same line leaves the clip running from its old position.
-      audio.currentTime = offset;
-    }
+    if (!video) return;
+    video.muted = false;
+    video.volume = 1;
   };
-
-  // Drop cached dub audio elements when the project or its dub track changes.
-  useEffect(() => {
-    clearDubAudio();
-  }, [project.id, dubAudioSegments.length, dubAudioVersion]);
 
   const handleCutRange = async (range: { start: number; end: number }, cutMode: 'remove' | 'keep'): Promise<boolean> => {
     if (!range || !project.id) return false;
@@ -684,7 +635,7 @@ function App() {
     setVideoDuration(0);
     setIsPlaying(false);
     setSelectedSegmentId(null);
-    clearDubAudio();
+    stopPreviewAudio();
     if (videoRef.current) {
       videoRef.current.pause();
       videoRef.current.currentTime = 0;
@@ -706,7 +657,7 @@ function App() {
     setIsPlaying(false);
     setSelectedSegmentId(null);
     setExportFiles(null);
-    clearDubAudio();
+    stopPreviewAudio();
     setImportedFile(file);
     setProjectName(file.name.replace(/\.[^.]+$/, ''));
     setNotice(`Uploading ${file.name} to the local processing service...`);
@@ -1209,7 +1160,7 @@ function App() {
     setVideoDuration(0);
     setIsPlaying(false);
     setSelectedSegmentId(null);
-    clearDubAudio();
+    stopPreviewAudio();
   };
 
   const handleSwitchProject = async (projectId: string) => {
@@ -1594,11 +1545,10 @@ function App() {
                       <video
                         ref={videoRef}
                         src={previewUrl}
-                        onTimeUpdate={(e) => { setCurrentTime(e.currentTarget.currentTime); syncDubAudio(); }}
+                        onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
                         onLoadedMetadata={(e) => setVideoDuration(e.currentTarget.duration)}
-                        onPlay={() => { setIsPlaying(true); syncDubAudio(); }}
-                        onPause={() => { setIsPlaying(false); stopDubAudio(); }}
-                        onSeeked={() => syncDubAudio()}
+                        onPlay={() => { setIsPlaying(true); dubbedVideoRef.current?.pause(); stopPreviewAudio(); }}
+                        onPause={() => setIsPlaying(false)}
                         className="h-full w-full object-contain"
                       />
                     ) : (
@@ -1669,7 +1619,7 @@ function App() {
                         src={dubbedPreviewUrl}
                         onTimeUpdate={(e) => setDubbedTime(e.currentTarget.currentTime)}
                         onLoadedMetadata={(e) => setDubbedDuration(e.currentTarget.duration || 0)}
-                        onPlay={() => setDubbedPlaying(true)}
+                        onPlay={() => { setDubbedPlaying(true); videoRef.current?.pause(); }}
                         onPause={() => setDubbedPlaying(false)}
                         className="h-full w-full object-contain"
                       />
