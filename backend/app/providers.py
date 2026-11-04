@@ -805,6 +805,37 @@ class OnlineLLMTranslationProvider(TranslationProvider):
     def _complete(self, messages: list[dict], key: str) -> str:  # pragma: no cover - overridden
         raise NotImplementedError
 
+    def _stored_key_missing(self) -> bool:
+        """True when no single stored credential exists either."""
+        try:
+            return not self._key()
+        except RuntimeError:
+            return True
+
+    def _invoke(self, messages: list[dict]) -> str:
+        """One completion: the API pool when this engine has pool entries.
+
+        Without pool configurations the call goes through the single stored key,
+        exactly as before. When the pool exists but every configuration is parked
+        (quota, cooldown, a rejected key), a stored single key is still tried as
+        the last resort instead of failing the whole run.
+        """
+        from . import api_pool
+
+        if api_pool.has_entries(self.ENGINE):
+            try:
+                return api_pool.chat(self.ENGINE, messages)
+            except api_pool.PoolUnavailable as pool_error:
+                if self._stored_key_missing():
+                    raise RuntimeError(
+                        f'{self._provider_label()} pool is unavailable: {pool_error}'
+                    ) from pool_error
+                logger.info(
+                    'API pool unavailable for %s (%s); using the single stored key.',
+                    self.ENGINE, pool_error,
+                )
+        return self._complete(messages, self._key())
+
     @staticmethod
     def _clean_result(result: object) -> str:
         return str(result or '').strip().strip('"“”').strip()
@@ -818,27 +849,44 @@ class OnlineLLMTranslationProvider(TranslationProvider):
     def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
         if not str(text or '').strip():
             return ''
+        from . import api_pool
+
+        # A line with this exact source text keeps the wording that already passed
+        # validation while the pool serves this engine: repeated dialogue stays
+        # consistent, and it is never paid for twice.
+        use_cache = api_pool.cache_enabled_for(self.ENGINE)
+        if use_cache:
+            cached = api_pool.cached_translation(text, source_language, target_language, self.style_hint)
+            if cached:
+                return cached
         # Exactly ONE engine call per line (the normal cost): cleanup and
         # salvage below are local string work and never spend tokens or time.
-        raw = self._complete(self._messages(text, target_language, source_language), self._key())
+        raw = self._invoke(self._messages(text, target_language, source_language))
         cleaned = self._clean_result(_strip_reasoning(raw))
         if not cleaned:
             raise RuntimeError(f'{self._provider_label()} returned an empty translation')
         if self._accepts(cleaned, text, source_language, target_language):
-            return cleaned
-        # Reasoning-style engines sometimes answer with their whole analysis
-        # ("Source text... Meaning... Option 1... Selected Translation...") or
-        # the line doubled. Salvage the last line that actually reads like the
-        # translation — free, same single answer, no second request.
-        salvaged = _extract_subtitle_answer(raw, text, source_language, target_language)
-        if salvaged:
-            return salvaged
-        # Nothing usable in the answer: fail over immediately (as any provider
-        # error always has), never by paying for another completion.
-        raise RuntimeError(
-            f'{self._provider_label()} did not return {target_language} text'
-            + (f' (got: {cleaned[:60]})' if cleaned else '')
-        )
+            result = cleaned
+        else:
+            # Reasoning-style engines sometimes answer with their whole analysis
+            # ("Source text... Meaning... Option 1... Selected Translation...") or
+            # the line doubled. Salvage the last line that actually reads like the
+            # translation — free, same single answer, no second request.
+            result = _extract_subtitle_answer(raw, text, source_language, target_language) or ''
+            if not result:
+                # Nothing usable in the answer: fail over immediately (as any
+                # provider error always has), never by paying for another
+                # completion.
+                raise RuntimeError(
+                    f'{self._provider_label()} did not return {target_language} text'
+                    + (f' (got: {cleaned[:60]})' if cleaned else '')
+                )
+        if use_cache:
+            api_pool.remember_translation(
+                text, result, source_language, target_language,
+                self.style_hint, provider=self.ENGINE,
+            )
+        return result
 
 
 class GeminiTranslationProvider(OnlineLLMTranslationProvider):
@@ -853,9 +901,9 @@ class GeminiTranslationProvider(OnlineLLMTranslationProvider):
 
     @staticmethod
     def is_available() -> bool:
-        from . import api_keys
+        from . import api_keys, api_pool
 
-        return api_keys.has_key('gemini')
+        return api_keys.has_key('gemini') or api_pool.has_entries('gemini')
 
 
 class OpenAITranslationProvider(OnlineLLMTranslationProvider):
@@ -870,9 +918,9 @@ class OpenAITranslationProvider(OnlineLLMTranslationProvider):
 
     @staticmethod
     def is_available() -> bool:
-        from . import api_keys
+        from . import api_keys, api_pool
 
-        return api_keys.has_key('openai')
+        return api_keys.has_key('openai') or api_pool.has_entries('openai')
 
 
 class CodeCraftTranslationProvider(OnlineLLMTranslationProvider):
@@ -894,9 +942,9 @@ class CodeCraftTranslationProvider(OnlineLLMTranslationProvider):
 
     @staticmethod
     def is_available() -> bool:
-        from . import api_keys
+        from . import api_keys, api_pool
 
-        return api_keys.has_key('codecraft')
+        return api_keys.has_key('codecraft') or api_pool.has_entries('codecraft')
 
 
 class CustomAPITranslationProvider(OnlineLLMTranslationProvider):
@@ -924,9 +972,15 @@ class CustomAPITranslationProvider(OnlineLLMTranslationProvider):
 
     @staticmethod
     def is_available() -> bool:
+        from . import api_pool, custom_api
+
+        return custom_api.is_configured() or api_pool.has_entries('custom')
+
+    def _stored_key_missing(self) -> bool:
+        """A local custom endpoint is configured even when it needs no key."""
         from . import custom_api
 
-        return custom_api.is_configured()
+        return not custom_api.is_configured()
 
 
 # Every language the app offers is supported by the hosted LLMs (unlike their TTS
@@ -1065,11 +1119,29 @@ class HybridTranslationProvider(TranslationProvider):
         this machine/LAN stays serial too: four workers would fight the UI.
         """
         first = self.first_engine()
+        from . import api_pool
+
+        local_custom = False
         if first == 'custom':
             from . import custom_api
 
-            return 1 if custom_api.is_local() else 4
-        return 4 if first in ONLINE_TRANSLATION_ENGINES else 1
+            local_custom = (
+                api_pool.custom_endpoints_are_local()
+                if api_pool.has_entries('custom')
+                else custom_api.is_local()
+            )
+            limit = 1 if local_custom else 4
+        else:
+            limit = 4 if first in ONLINE_TRANSLATION_ENGINES else 1
+        if first in ONLINE_TRANSLATION_ENGINES and not local_custom:
+            # Several pool configurations are independent allowances, so the run
+            # may go wider than one key allows — never past the ceiling the user
+            # chose in the API Pool panel.
+            entries = api_pool.usable_count(first)
+            if entries >= 2:
+                ceiling = int(api_pool.settings().get('max_parallel') or 4)
+                limit = min(ceiling, max(limit, entries * 2))
+        return limit
 
     def check_preferred_engine(self, target_language: str, source_language: str = 'en') -> None:
         """Raise before any translation if the engine the user chose cannot handle the language.

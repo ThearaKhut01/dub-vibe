@@ -27,6 +27,7 @@ import {
   Wand2,
 } from 'lucide-react';
 import { useStudioStore } from './store/useStudioStore';
+import ApiPoolManager from './components/ApiPoolManager';
 import { DubbingTrackEditor } from './components/DubbingTrackEditor';
 import { TimelineEditor } from './components/TimelineEditor';
 import type { ProjectSummary, OverlapProposal, FixOverlapsResponse } from './types';
@@ -88,6 +89,11 @@ const VOICE_ENGINE_LABELS: Record<string, string> = {
   voxcpm_clone: 'VoxCPM2 Voice Clone',
   sapi5: 'System TTS',
 };
+
+/** Engines that can be served by the multi-provider API pool. */
+const POOL_ENGINES = ['gemini', 'openai', 'codecraft', 'custom'] as const;
+const isPoolEngine = (value: string): value is (typeof POOL_ENGINES)[number] =>
+  (POOL_ENGINES as readonly string[]).includes(value);
 
 /** Map the backend's audio_segments rows to the timeline's dub segments. */
 const toDubSegments = (rows: Array<Record<string, unknown>>): import('./types').TimelineSegment[] =>
@@ -228,6 +234,9 @@ function App() {
   const [deleteTarget, setDeleteTarget] = useState<ProjectSummary | null>(null);
   const [showClearAllConfirm, setShowClearAllConfirm] = useState(false);
   const [showApiKeys, setShowApiKeys] = useState(false);
+  // The API modal has two views: the single keys from API Settings, and the
+  // multi-configuration pool that sits behind online translation.
+  const [apiSettingsTab, setApiSettingsTab] = useState<'keys' | 'pool'>('keys');
   const [geminiKeyInput, setGeminiKeyInput] = useState('');
   const [openaiKeyInput, setOpenaiKeyInput] = useState('');
   const [codecraftKeyInput, setCodecraftKeyInput] = useState('');
@@ -606,6 +615,15 @@ function App() {
   }, [exportFiles]);
 
   const hasMedia = Boolean(importedFile || project.hasMedia);
+  // A provider can translate through its single saved key or through its API
+  // pool; the engine picker must offer it when either path can serve.
+  const poolUsable = (provider: 'gemini' | 'openai' | 'codecraft' | 'custom'): number => providerKeys[provider]?.pool_usable ?? 0;
+  const engineReady = (provider: 'gemini' | 'openai' | 'codecraft'): boolean => Boolean(providerKeys[provider]?.has_key) || poolUsable(provider) > 0;
+  const engineSuffix = (provider: 'gemini' | 'openai' | 'codecraft'): string => {
+    const pool = poolUsable(provider);
+    if (pool > 0) return ` — pool: ${pool} ready`;
+    return providerKeys[provider]?.has_key ? ' — key configured' : ' — add a key in API Settings';
+  };
   // mediaVersion busts the browser cache after a cut rewrites the media file.
   const previewUrl = videoUrl || (project.hasMedia && project.id
     ? `${apiBaseUrl}/api/projects/${project.id}/media?v=${mediaVersion}`
@@ -2078,21 +2096,30 @@ function App() {
                   </option>
                   <option value="argos">Argos Translate (offline)</option>
                   <option value="google">Google Translate (online)</option>
-                  <option value="gemini" disabled={!providerKeys.gemini.has_key}>
-                    Google Gemini (online){providerKeys.gemini.has_key ? ' — key configured' : ' — add a key in API Settings'}
+                  <option value="gemini" disabled={!engineReady('gemini')}>
+                    Google Gemini (online){engineSuffix('gemini')}
                   </option>
-                  <option value="openai" disabled={!providerKeys.openai.has_key}>
-                    OpenAI (online){providerKeys.openai.has_key ? ' — key configured' : ' — add a key in API Settings'}
+                  <option value="openai" disabled={!engineReady('openai')}>
+                    OpenAI (online){engineSuffix('openai')}
                   </option>
-                  <option value="codecraft" disabled={!providerKeys.codecraft.has_key}>
-                    CodeCraft (online){providerKeys.codecraft.has_key ? ' — key configured' : ' — add a key in API Settings'}
+                  <option value="codecraft" disabled={!engineReady('codecraft')}>
+                    CodeCraft (online){engineSuffix('codecraft')}
                   </option>
-                  <option value="custom" disabled={!customApi?.configured}>
+                  <option value="custom" disabled={!customApi?.configured && poolUsable('custom') === 0}>
                     Custom API (online){customApi?.configured
                       ? ` — ${customApi.primary || customApi.model}${customApi.models.length > 1 ? ` +${customApi.models.length - 1} fallback` : ''}`
-                      : ' — configure in API Settings'}
+                      : poolUsable('custom') > 0
+                        ? ` — pool: ${poolUsable('custom')} ready`
+                        : ' — configure in API Settings'}
                   </option>
                 </select>
+                {isPoolEngine(translationProvider) && poolUsable(translationProvider) > 0 && (
+                  <p className="mt-1 text-[10px] leading-4 text-sky-300/80">
+                    {`API pool: ${poolUsable(translationProvider)} configuration(s) ready. `}
+                    Lines rotate between them; a configuration that is rate-limited, out of allowance, or failing is skipped for the next one.
+                    Manage them in <span className="text-sky-200">API Keys → API Pool Manager</span>.
+                  </p>
+                )}
                 <p className="mt-1 text-[10px] leading-4 text-slate-500">
                   {translationProvider === 'gemini' || translationProvider === 'openai'
                     ? 'Paid engine: every translated line is a billed API request. Uses the same key as the voice engine.'
@@ -2606,23 +2633,49 @@ function App() {
       {showApiKeys && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={() => setShowApiKeys(false)}>
           <div
-            className="flex max-h-[85vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-950 shadow-2xl"
+            className={`flex max-h-[85vh] w-full flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-950 shadow-2xl ${apiSettingsTab === 'pool' ? 'max-w-3xl' : 'max-w-lg'}`}
             onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
               <div>
                 <h2 className="text-lg font-semibold">Online AI Providers</h2>
                 <p className="text-xs text-slate-500">
-                  Keys are stored in Windows Credential Manager — never in the browser. Gemini and OpenAI keys enable
-                  <span className="text-slate-300"> dubbing (TTS)</span> and
-                  <span className="text-slate-300"> translation</span>; the CodeCraft key adds
-                  <span className="text-slate-300"> free-tier translation</span>, and a custom endpoint adds
-                  <span className="text-slate-300"> your own OpenAI-compatible API</span>.
+                  {apiSettingsTab === 'pool' ? (
+                    <>
+                      Several API configurations per provider, scheduled and failed over automatically.
+                      Keys stay in Windows Credential Manager and are{' '}
+                      <span className="text-slate-300">never sent to the browser</span>.
+                    </>
+                  ) : (
+                    <>
+                      Keys are stored in Windows Credential Manager — never in the browser. Gemini and OpenAI keys enable
+                      <span className="text-slate-300"> dubbing (TTS)</span> and
+                      <span className="text-slate-300"> translation</span>; the CodeCraft key adds
+                      <span className="text-slate-300"> free-tier translation</span>, and a custom endpoint adds
+                      <span className="text-slate-300"> your own OpenAI-compatible API</span>.
+                    </>
+                  )}
                 </p>
               </div>
               <button onClick={() => setShowApiKeys(false)} className="rounded p-1 text-slate-500 hover:text-white transition">✕</button>
             </div>
-            <div className="flex-1 overflow-y-auto px-5 py-4">
+            <div className="flex gap-1 border-b border-white/10 px-5 py-2">
+              {([
+                { id: 'keys', label: 'Keys & endpoints' },
+                { id: 'pool', label: 'API Pool Manager' },
+              ] as const).map((tab) => (
+                <button
+                  key={tab.id}
+                  onClick={() => setApiSettingsTab(tab.id)}
+                  className={`rounded-lg px-3 py-1.5 text-xs font-medium transition ${
+                    apiSettingsTab === tab.id ? 'bg-slate-800 text-white' : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+            <div className={`flex-1 overflow-y-auto px-5 py-4 ${apiSettingsTab === 'keys' ? '' : 'hidden'}`}>
               {([
                 {
                   id: 'gemini', label: 'Google Gemini',
@@ -2779,6 +2832,11 @@ function App() {
                 </p>
               )}
             </div>
+            {apiSettingsTab === 'pool' && (
+              <div className="flex-1 overflow-y-auto px-5 py-4">
+                <ApiPoolManager />
+              </div>
+            )}
           </div>
         </div>
       )}

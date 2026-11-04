@@ -119,9 +119,9 @@ def is_configured() -> bool:
     return bool(get_config()['configured'])
 
 
-def is_local() -> bool:
+def is_local_url(url: str) -> bool:
     """True for an endpoint on this machine or the local network."""
-    host = (urlparse(get_config()['base_url']).hostname or '').lower()
+    host = (urlparse(str(url or '')).hostname or '').lower()
     if host in _LOCAL_HOSTS or host.endswith('.local'):
         return True
     if host.startswith(('10.', '192.168.')):
@@ -133,6 +133,11 @@ def is_local() -> bool:
             return False
         return 16 <= second <= 31
     return False
+
+
+def is_local() -> bool:
+    """True for an endpoint on this machine or the local network."""
+    return is_local_url(get_config()['base_url'])
 
 
 class _NoCompletion(RuntimeError):

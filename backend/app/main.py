@@ -58,7 +58,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from urllib.parse import quote
 
 from backend.app.chunking import SmartChunkEngine, format_timestamp, split_subtitle_cues
-from backend.app import acting, api_keys, cuda_pack, model_manager, online_providers, speaker_diarization, tts_service, voxcpm_local
+from backend.app import acting, api_keys, api_pool, cuda_pack, model_manager, online_providers, speaker_diarization, tts_service, voxcpm_local
 from backend.app import segment_tts
 from backend.app.models import ProjectRequest, ProjectSummary, ProviderSettings, ProcessingRequest, SegmentSplit, SegmentUpdate, WorkflowProgress
 from backend.app.providers import (
@@ -135,6 +135,10 @@ DATA_ROOT.mkdir(parents=True, exist_ok=True)
 with sqlite3.connect(PROJECT_DB) as connection:
     connection.execute('CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
 load_projects()
+# API pool: turn requests a crash left in flight into retryable failures and
+# keep its journal/cache bounded. Best-effort — a broken journal must never stop
+# the app from starting.
+api_pool.startup()
 # One-time: move models from the old per-install locations into the shared
 # %LOCALAPPDATA%\DubVibe Studio\models store used by web + desktop.
 model_manager.migrate_legacy_models()
@@ -607,10 +611,20 @@ async def delete_voxcpm_model() -> dict[str, str]:
 
 @app.get('/api/providers/keys')
 async def provider_keys_status() -> dict[str, Any]:
-    return {
-        provider: {'has_key': api_keys.has_key(provider)}
-        for provider in api_keys.PROVIDERS
-    }
+    """Which providers can translate, and whether an API pool backs them.
+
+    The translation-engine picker uses this: a provider is usable when it has a
+    single stored key *or* at least one pool configuration that can serve right
+    now, so a pool-only setup is not shown as "add a key".
+    """
+    status: dict[str, Any] = {}
+    for provider in api_keys.PROVIDERS:
+        status[provider] = {
+            'has_key': api_keys.has_key(provider),
+            'pool_entries': api_pool.entry_count(provider),
+            'pool_usable': api_pool.usable_count(provider),
+        }
+    return status
 
 
 @app.get('/api/providers/custom/config')
@@ -704,6 +718,89 @@ async def test_provider(provider: str) -> dict[str, Any]:
         # The same key drives translation, so report the text models too.
         'translation_models': text.get('models', []),
     }
+
+
+# --- Multi-provider API pool -------------------------------------------------
+# Configurations live in backend/app/api_pool; these routes are the panel's only
+# way in. A pool key is written to Windows Credential Manager and never comes
+# back to the browser — only whether one exists and its last four characters.
+
+@app.get('/api/api-pool/status')
+async def api_pool_status() -> dict[str, Any]:
+    """Configurations, health, measured usage, cache and request journal."""
+    return await run_in_threadpool(api_pool.status)
+
+
+@app.post('/api/api-pool/entries')
+async def save_api_pool_entry(payload: dict[str, Any]) -> dict[str, Any]:
+    """Create or update one pool configuration (send an id to edit)."""
+    try:
+        entry = await run_in_threadpool(api_pool.upsert_entry, payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {
+        'status': 'ok',
+        'entry': entry,
+        'pool': await run_in_threadpool(api_pool.status),
+    }
+
+
+@app.delete('/api/api-pool/entries/{entry_id}')
+async def delete_api_pool_entry(entry_id: str) -> dict[str, Any]:
+    try:
+        result = await run_in_threadpool(api_pool.delete_entry, entry_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return {**result, 'pool': await run_in_threadpool(api_pool.status)}
+
+
+@app.post('/api/api-pool/entries/{entry_id}/test')
+async def test_api_pool_entry(entry_id: str) -> dict[str, Any]:
+    """One tiny real request, so the test proves the model and key work."""
+    try:
+        result = await run_in_threadpool(api_pool.test_entry, entry_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except Exception as error:
+        # The failure is already recorded against the entry's health/usage.
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    return {**result, 'pool': await run_in_threadpool(api_pool.status)}
+
+
+@app.post('/api/api-pool/settings')
+async def save_api_pool_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        saved = await run_in_threadpool(api_pool.save_settings, payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {'status': 'ok', 'settings': saved, 'pool': await run_in_threadpool(api_pool.status)}
+
+
+@app.post('/api/api-pool/import-legacy')
+async def import_api_pool_legacy() -> dict[str, Any]:
+    """Create pool entries that reuse the keys already saved in API Settings."""
+    return await run_in_threadpool(api_pool.import_legacy)
+
+
+@app.post('/api/api-pool/queue/retry')
+async def retry_api_pool_queue() -> dict[str, Any]:
+    """Re-send the requests the journal left failed (bounded per call)."""
+    result = await run_in_threadpool(api_pool.retry_failed)
+    return {'status': 'ok', 'result': result, 'pool': await run_in_threadpool(api_pool.status)}
+
+
+@app.post('/api/api-pool/cache/clear')
+async def clear_api_pool_cache() -> dict[str, Any]:
+    result = await run_in_threadpool(api_pool.clear_cache)
+    return {**result, 'pool': await run_in_threadpool(api_pool.status)}
+
+
+@app.post('/api/api-pool/health/reset')
+async def reset_api_pool_health(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Drop cooldowns: everything, or one entry when an id is sent."""
+    entry_id = str((payload or {}).get('entry_id') or '')
+    await run_in_threadpool(api_pool.reset_health, entry_id)
+    return {'status': 'ok', 'pool': await run_in_threadpool(api_pool.status)}
 
 
 @app.get('/api/tts/capabilities')

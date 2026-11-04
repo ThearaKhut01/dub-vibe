@@ -86,6 +86,19 @@ Open **AI Models** in the header to manage Faster-Whisper transcription models �
 
 **Khmer offline voice (optional):** the fine-tuned `khmerttsopensource/khmer-tts` model (MMS-VITS, about 320 MB) is stored under `models\mms-tts\mms-tts-khm`. It is used only for Khmer, only after Edge TTS fails, and runs fully offline. Its license is **cc-by-nc-4.0 (non-commercial)**, so do not use it in commercial deployments.
 
+## API Pool Manager
+
+**API Keys → API Pool Manager** holds several API configurations per provider (Gemini, OpenAI, CodeCraft, and any OpenAI-compatible endpoint) and schedules subtitle translation across them.
+
+- **Scheduling** — round robin (one request per configuration, in order), least used (fewest requests today first), or smart hybrid (healthy, allowance left, little recent load).
+- **Failover** — a configuration that answers 401/402/429/5xx or times out is parked and the next one translates the same line. A 429 honours the provider's own `Retry-After`; a rejection that is about the request itself (400/422) is not retried anywhere. When the whole pool is parked, the single key from **API Keys** is still the last resort.
+- **Measured usage, no invented quotas** — the panel reports requests, failures, and the token counts the provider returned (characters sent when it returned none). A daily or monthly limit exists only when you type one in; leaving it empty means “no limit known”, not “unlimited”.
+- **Persistent queue** — every pooled request is written to SQLite before it is sent. A crash leaves a retryable entry instead of a silently lost line, and **Retry failed** re-sends them.
+- **Translation cache** — a line that already passed the script/size checks is reused for the identical source text and language pair while the pool serves that provider, so repeated dialogue keeps one wording and is never paid for twice.
+- **Credentials** — pool keys go to Windows Credential Manager (service `DubVibe Studio`, one account per configuration). An entry can instead point at the key saved in **API Keys**, so importing never duplicates a secret.
+
+Only chat completions are pooled. Translation prompts, subtitle batching, SRT timestamps, and the translation-engine picker are unchanged, and voice dubbing still uses the provider key from **API Keys**. Pool state (journal, cache, cooldowns) lives in `<app data>\api_pool`.
+
 ## Settings
 
 | Variable | Purpose |
@@ -94,6 +107,7 @@ Open **AI Models** in the header to manage Faster-Whisper transcription models �
 | `DUBVIBE_WHISPER_MODEL` | Whisper model size (`base` default) |
 | `DUBVIBE_ALLOWED_ORIGINS` | Extra browser origins allowed to call the local API |
 | `DUBVIBE_CA_BUNDLE` | Extra PEM file of trusted root CAs, added on top of the Windows store (for corporate TLS inspection) |
+| `DUBVIBE_API_POOL_DIR` | Where the API pool keeps its journal, cache and cooldowns (default `<app data>\api_pool`; the test suite points it at a temporary folder) |
 
 ### Corporate networks and SSL inspection
 

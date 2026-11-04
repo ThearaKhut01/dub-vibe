@@ -152,3 +152,124 @@ export interface FixOverlapsResponse {
   overlaps_found: number;
   proposals: OverlapProposal[];
 }
+
+// --- Multi-provider API pool ------------------------------------------------
+
+export type ApiPoolProviderId = 'gemini' | 'openai' | 'codecraft' | 'custom';
+export type ApiPoolStrategy = 'round_robin' | 'least_used' | 'hybrid';
+export type ApiPoolHealthState = 'cooling' | 'degraded' | 'healthy' | 'unknown';
+
+export interface ApiPoolUsageLimits {
+  requests_today: number;
+  requests_month: number;
+  /** null = no limit configured; the pool never invents one. */
+  daily_limit: number | null;
+  monthly_limit: number | null;
+  daily_remaining: number | null;
+  monthly_remaining: number | null;
+  allowed: boolean;
+  reason: string | null;
+}
+
+export interface ApiPoolHealth {
+  state: ApiPoolHealthState;
+  cooldown_remaining: number;
+  cooldown_reason: string;
+  consecutive_failures: number;
+  last_error: string;
+  last_error_at: number | null;
+  last_success_at: number | null;
+  last_latency_ms: number;
+  total_requests: number;
+  total_failures: number;
+}
+
+export interface ApiPoolEntry {
+  id: string;
+  provider: ApiPoolProviderId;
+  provider_label: string;
+  model: string;
+  label: string;
+  display_name: string;
+  base_url: string;
+  enabled: boolean;
+  weight: number;
+  daily_limit: number | null;
+  monthly_limit: number | null;
+  key_source: 'pool' | 'legacy';
+  has_key: boolean;
+  /** Last four characters only — the key itself never leaves the backend. */
+  key_hint: string;
+  notes: string;
+  created_at: number;
+  health: ApiPoolHealth;
+  usage: ApiPoolUsageLimits;
+  usable: boolean;
+  unavailable_reason: string;
+}
+
+export interface ApiPoolUsageTotals {
+  requests: number;
+  successes: number;
+  failures: number;
+  tokens_in: number;
+  tokens_out: number;
+  chars_in: number;
+  chars_out: number;
+}
+
+export interface ApiPoolQueueItem {
+  id: number;
+  provider: string;
+  entry_id: string | null;
+  model: string | null;
+  status: string;
+  attempts: number;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ApiPoolStatus {
+  settings: {
+    strategy: ApiPoolStrategy;
+    cache_enabled: boolean;
+    cache_ttl_days: number;
+    max_attempts: number;
+    request_timeout: number;
+    max_parallel: number;
+    strategies: ApiPoolStrategy[];
+  };
+  providers: Record<string, {
+    label: string;
+    entries: number;
+    usable: number;
+    has_legacy_credential: boolean;
+  }>;
+  entries: ApiPoolEntry[];
+  usage: {
+    totals: { today: ApiPoolUsageTotals; month: ApiPoolUsageTotals };
+    daily: Array<{ day: string; requests: number; failures: number; tokens_in: number; tokens_out: number }>;
+  };
+  queue: {
+    pending: number;
+    in_flight: number;
+    done: number;
+    failed: number;
+    total: number;
+    oldest_failed_at: number | null;
+    last_24h: { total: number; ok: number };
+    failed_items: ApiPoolQueueItem[];
+  };
+  cache: { entries: number; hits: number; newest_at: number | null };
+  plan: Record<string, string[]>;
+}
+
+/** One provider's credential state, as the translation-engine picker needs it. */
+export interface ProviderKeyStatus {
+  has_key: boolean;
+  /** How many API-pool configurations exist for this provider. */
+  pool_entries?: number;
+  /** How many can serve right now (enabled, not parked, within their limits). */
+  pool_usable?: number;
+}
