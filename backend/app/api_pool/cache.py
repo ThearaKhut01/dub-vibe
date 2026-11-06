@@ -21,7 +21,7 @@ from .models import connect
 
 # Bump when the translation prompt changes, so old answers are not reused with
 # instructions they were never written for.
-PROMPT_VERSION = 'v1'
+PROMPT_VERSION = 'v2'
 
 _WRITE_LOCK = threading.Lock()
 

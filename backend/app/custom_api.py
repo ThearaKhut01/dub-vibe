@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 from urllib.parse import urlparse
 
@@ -162,7 +163,8 @@ def _failure_message(failures: list[str]) -> str:
 
 
 def _attempt(key: str, base_url: str, model: str, messages: list[dict],
-             timeout: int, max_tokens: int | None) -> str:
+             timeout: int, max_tokens: int | None,
+             usage_out: dict | None = None) -> str:
     """One request for one model. Raises the raw HTTP/transport error."""
     from .online_providers import _request_json
 
@@ -178,11 +180,53 @@ def _attempt(key: str, base_url: str, model: str, messages: list[dict],
         raise _NoCompletion(
             f'returned no completion: {json.dumps(payload)[:160]}'
         ) from error
+    if usage_out is not None:
+        usage = payload.get('usage') or {}
+        usage_out['prompt_tokens'] = int(usage.get('prompt_tokens') or 0)
+        usage_out['candidates_tokens'] = int(usage.get('completion_tokens') or 0)
+        usage_out['thoughts_tokens'] = int(
+            (usage.get('completion_tokens_details') or {}).get('reasoning_tokens') or 0
+        )
     return str(content or '')
 
 
+def _live_start(meta: dict, model: str) -> str:
+    try:
+        from . import api_events
+
+        return api_events.start(
+            str(meta.get('node_id') or 'legacy:custom'), provider='custom', model=model,
+            lines=int(meta.get('lines') or 0), key_hint=str(meta.get('key_hint') or ''),
+        )
+    except Exception:
+        return ''
+
+
+def _live_finish(meta: dict, request_id: str, model: str, *, ok: bool,
+                 latency_ms: int = 0, prompt_tokens: int = 0, output_tokens: int = 0,
+                 thoughts_tokens: int = 0,
+                 http_status: int = 0, error: object = '', retry: bool = False) -> None:
+    if not request_id:
+        return
+    try:
+        from . import api_events
+
+        api_events.finish(
+            request_id, str(meta.get('node_id') or 'legacy:custom'), ok=ok,
+            provider='custom', model=model, lines=int(meta.get('lines') or 0),
+            latency_ms=latency_ms,
+            prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+            thoughts_tokens=thoughts_tokens,
+            http_status=http_status, error=error, retry=retry,
+            key_hint=str(meta.get('key_hint') or ''),
+        )
+    except Exception:
+        pass
+
+
 def chat(key: str, messages: list[dict], model: str | None = None,
-         timeout: int = DEFAULT_TIMEOUT, max_tokens: int | None = None) -> str:
+         timeout: int = DEFAULT_TIMEOUT, max_tokens: int | None = None,
+         usage_out: dict | None = None, api_meta: dict | None = None) -> str:
     """One chat completion, walking the configured model list on congestion.
 
     ``model`` overrides the configured chain for a single call. The model that
@@ -199,20 +243,34 @@ def chat(key: str, messages: list[dict], model: str | None = None,
         raise RuntimeError('Custom API model is not configured (add it in API Settings).')
 
     failures: list[str] = []
+    meta = api_meta or {}
     for candidate in _ordered_models(base_url, candidates):
+        request_id = _live_start(meta, candidate)
+        t0 = time.monotonic()
         try:
-            content = _attempt(key, base_url, candidate, messages, timeout, max_tokens)
+            content = _attempt(key, base_url, candidate, messages, timeout, max_tokens, usage_out)
         except urllib.error.HTTPError as error:
             detail = _http_error_detail(error)
+            _live_finish(meta, request_id, candidate, ok=False, latency_ms=int((time.monotonic() - t0) * 1000), http_status=error.code,
+                         error=detail, retry=error.code in FALLBACK_STATUS)
             if error.code in FALLBACK_STATUS:
                 failures.append(f'{candidate}: {detail}')
                 continue
             raise RuntimeError(f'Custom API request failed ({detail})') from error
         except _NoCompletion as error:
+            _live_finish(meta, request_id, candidate, ok=False, error=error, retry=True, latency_ms=int((time.monotonic() - t0) * 1000))
             failures.append(f'{candidate}: {error}')
             continue
         except (TimeoutError, OSError) as error:
+            _live_finish(meta, request_id, candidate, ok=False, error=error, retry=True, latency_ms=int((time.monotonic() - t0) * 1000))
             raise RuntimeError(f'Custom API is unreachable at {base_url}: {error}') from error
+        _live_finish(
+            meta, request_id, candidate, ok=True,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            prompt_tokens=int((usage_out or {}).get('prompt_tokens') or 0),
+            output_tokens=int((usage_out or {}).get('candidates_tokens') or 0),
+            thoughts_tokens=int((usage_out or {}).get('thoughts_tokens') or 0),
+        )
         _STICKY[base_url] = candidate
         return content
 

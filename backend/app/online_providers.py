@@ -204,12 +204,17 @@ def gemini_text_model_catalog(key: str) -> list[str]:
     return listed
 
 
-def gemini_text_model_candidates(key: str, preferred: str = GEMINI_DEFAULT_CHAT_MODEL) -> list[str]:
+def gemini_text_model_candidates(key: str, preferred: str = GEMINI_DEFAULT_CHAT_MODEL,
+                                 prefer_requested: bool = False) -> list[str]:
     """Models to try for translation, best guess first.
 
     Order: the model that already worked for this key, then the newest concrete
     models, then the requested (possibly alias) name. Attempts are capped so a run
     degrades gracefully instead of hanging on one unlucky model.
+
+    ``prefer_requested`` puts the explicitly configured model first (the user
+    picked it in settings, so it must be the one actually used while it works);
+    the rest of the list stays as the fallback sweep.
     """
     candidates: list[str] = []
 
@@ -217,9 +222,12 @@ def gemini_text_model_candidates(key: str, preferred: str = GEMINI_DEFAULT_CHAT_
         if name and name not in candidates:
             candidates.append(name)
 
-    add(_gemini_text_model_cache.get(_model_cache_key(key)))
-    listed = gemini_text_model_catalog(key)
     dead = _gemini_dead_models.get(key, set())
+    if prefer_requested and preferred not in dead:
+        add(preferred)
+    else:
+        add(_gemini_text_model_cache.get(_model_cache_key(key)))
+    listed = gemini_text_model_catalog(key)
     concrete = [name for name in listed if 'latest' not in name.lower() and name not in dead]
     for name in sorted(concrete, key=_model_rank, reverse=True):
         add(name)
@@ -490,16 +498,82 @@ def _http_error_detail(error: urllib.error.HTTPError) -> str:
     return f'HTTP {error.code}: {message[:200]}' if message else f'HTTP {error.code}'
 
 
+# ---------------------------------------------------------------------------
+# Live activity hooks (see backend/app/api_events.py)
+# ---------------------------------------------------------------------------
+
+def _live_start(node_id: str, provider: str, model: str, lines: int, hint: str) -> str:
+    """Begin one live request (empty string when the bus is unavailable)."""
+    try:
+        from . import api_events
+
+        return api_events.start(
+            node_id, provider=provider, model=model, lines=lines, key_hint=hint,
+        )
+    except Exception:
+        return ''
+
+
+def _live_ok(request_id: str, meta: dict, model: str, started: float, usage: dict) -> None:
+    """Record one answered request for the Live tab (never raises)."""
+    if not request_id:
+        return
+    try:
+        from . import api_events
+
+        api_events.finish(
+            request_id, str(meta.get('node_id') or 'legacy:gemini'), ok=True,
+            provider='gemini', model=model, lines=int(meta.get('lines') or 0),
+            latency_ms=int((time.monotonic() - started) * 1000),
+            prompt_tokens=int(usage.get('promptTokenCount') or 0),
+            output_tokens=int(usage.get('candidatesTokenCount') or 0),
+            thoughts_tokens=int(usage.get('thoughtsTokenCount') or 0),
+            key_hint=str(meta.get('key_hint') or ''),
+        )
+    except Exception:
+        pass
+
+
+def _live_fail(request_id: str, meta: dict, model: str, started: float, *,
+               http_status: int = 0, error: object = '', retry: bool = False) -> None:
+    """Record one failed request for the Live tab (never raises)."""
+    if not request_id:
+        return
+    try:
+        from . import api_events
+
+        api_events.finish(
+            request_id, str(meta.get('node_id') or 'legacy:gemini'), ok=False,
+            provider='gemini', model=model, lines=int(meta.get('lines') or 0),
+            latency_ms=int((time.monotonic() - started) * 1000),
+            http_status=http_status, error=error, retry=retry,
+            key_hint=str(meta.get('key_hint') or ''),
+        )
+    except Exception:
+        pass
+
+
 def gemini_chat(key: str, messages: list[dict], model: str = GEMINI_DEFAULT_CHAT_MODEL,
-                timeout: int = 90) -> str:
+                timeout: int = 90, generation_config: dict | None = None,
+                system_instruction: str | None = None,
+                want_usage: bool = False,
+                prefer_requested: bool = False,
+                api_meta: dict | None = None) -> str | tuple[str, dict]:
     """One-shot text completion via generateContent.
 
     Used for translation (and the optional translation review); the TTS path stays
     on `gemini_synthesize`, which asks for audio instead of text. A retired model
     name (404) retries once with the newest text model the key can use.
+
+    ``system_instruction`` replaces the system turns taken from ``messages`` (set
+    once per request, never repeated inside ``contents``); ``generation_config``
+    is passed through verbatim (temperature, thinkingConfig, maxOutputTokens).
+    ``want_usage`` returns ``(text, meta)`` where meta carries ``usage`` and
+    ``finish_reason`` so the caller can log tokens and detect truncation.
     """
-    system = '\n'.join(str(message.get('content') or '') for message in messages
-                       if message.get('role') == 'system').strip()
+    system = (system_instruction or '\n'.join(
+        str(message.get('content') or '') for message in messages
+        if message.get('role') == 'system')).strip()
     contents = [
         {
             'role': 'model' if message.get('role') == 'assistant' else 'user',
@@ -508,14 +582,35 @@ def gemini_chat(key: str, messages: list[dict], model: str = GEMINI_DEFAULT_CHAT
         for message in messages
         if message.get('role') != 'system'
     ]
-    body: dict = {'contents': contents}
-    if system:
-        body['systemInstruction'] = {'parts': [{'text': system}]}
+    # Two model-specific fallbacks, both triggered by a 400 and both keeping the
+    # same single request path:
+    #   * some models reject a separate system instruction ("Developer instruction
+    #     is not enabled for this model") -> fold it into the first user turn;
+    #   * some reject thinkingConfig.thinkingBudget 0 ("Thinking is not enabled
+    #     for this model") -> send the request without it.
+    inline_system = False
+    strip_thinking = False
 
     def request(model_name: str) -> dict:
         # A short per-attempt timeout keeps one slow model from stalling the run.
+        config = dict(generation_config or {})
+        if strip_thinking:
+            config.pop('thinkingConfig', None)
+        request_contents = [dict(entry) for entry in contents]
+        request_body: dict = {'contents': request_contents}
+        if system and inline_system:
+            if request_contents:
+                first = dict(request_contents[0])
+                first['parts'] = [{'text': system}] + list(first.get('parts') or [])
+                request_contents[0] = first
+            else:
+                request_contents.append({'role': 'user', 'parts': [{'text': system}]})
+        elif system:
+            request_body['systemInstruction'] = {'parts': [{'text': system}]}
+        if config:
+            request_body['generationConfig'] = config
         return _request_json(f'{GEMINI_BASE}/models/{model_name}:generateContent?key={key}',
-                             key, body, timeout=min(timeout, _GEMINI_TEXT_ATTEMPT_TIMEOUT))
+                             key, request_body, timeout=min(timeout, _GEMINI_TEXT_ATTEMPT_TIMEOUT))
 
     last_error: Exception | None = None
     payload: dict | None = None
@@ -534,13 +629,31 @@ def gemini_chat(key: str, messages: list[dict], model: str = GEMINI_DEFAULT_CHAT
 
     quota_hits = 0
     attempted = 0
-    for model_name in gemini_text_model_candidates(key, model):
+    meta = api_meta or {}
+    node_id = str(meta.get('node_id') or 'legacy:gemini')
+    batch_lines = int(meta.get('lines') or 0)
+    hint = str(meta.get('key_hint') or '')
+    for model_name in gemini_text_model_candidates(key, model, prefer_requested=prefer_requested):
         attempted += 1
         for attempt in range(_GEMINI_TEXT_TRANSIENT_RETRIES + 1):
+            started = time.monotonic()
+            rid = _live_start(node_id, 'gemini', model_name, batch_lines, hint)
             try:
                 payload = request(model_name)
             except urllib.error.HTTPError as error:
-                last_error = RuntimeError(_http_error_detail(error))
+                # Read the body once: _http_error_detail consumes the stream.
+                detail = _http_error_detail(error)
+                last_error = RuntimeError(detail)
+                _live_fail(rid, meta, model_name, started, http_status=error.code, error=detail,
+                           retry=error.code in (404, 429) or 500 <= error.code < 600)
+                if error.code == 400 and not inline_system and 'instruction' in detail.lower():
+                    # Retry this model with the instruction folded into the turn.
+                    inline_system = True
+                    continue
+                if error.code == 400 and not strip_thinking and 'thinking' in detail.lower():
+                    # Retry this model without thinkingConfig.
+                    strip_thinking = True
+                    continue
                 if error.code == 404:
                     # Retired model: never try it again for this key.
                     dead.add(model_name)
@@ -565,10 +678,13 @@ def gemini_chat(key: str, messages: list[dict], model: str = GEMINI_DEFAULT_CHAT
             except (TimeoutError, OSError) as error:
                 # Unresponsive model: skip it for this process, try the next one.
                 last_error = error
+                _live_fail(rid, meta, model_name, started, error=str(error), retry=True)
                 dead.add(model_name)
                 _gemini_text_model_cache.pop(cache_key, None)
                 break
             else:
+                usage = payload.get('usageMetadata') or {}
+                _live_ok(rid, meta, model_name, started, usage)
                 # Only touch the cache file when the winning model changed: a
                 # rewrite per subtitle line is pointless disk churn with four
                 # translation threads running.
@@ -600,7 +716,18 @@ def gemini_chat(key: str, messages: list[dict], model: str = GEMINI_DEFAULT_CHAT
     text = ''.join(str(part.get('text') or '') for part in parts).strip()
     if not text:
         raise RuntimeError('Gemini returned an empty completion')
-    return text
+    if not want_usage:
+        return text
+    usage = payload.get('usageMetadata') or {}
+    return text, {
+        'usage': {
+            'prompt_tokens': int(usage.get('promptTokenCount') or 0),
+            'candidates_tokens': int(usage.get('candidatesTokenCount') or 0),
+            'thoughts_tokens': int(usage.get('thoughtsTokenCount') or 0),
+        },
+        'finish_reason': str(candidates[0].get('finishReason') or ''),
+        'model': model_name,
+    }
 
 
 def gemini_text_test(key: str) -> dict:

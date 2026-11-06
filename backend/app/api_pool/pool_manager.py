@@ -126,8 +126,16 @@ def _base_url(entry: PoolEntry) -> str:
     return str(configured).rstrip('/')
 
 
-def _request_shape(entry: PoolEntry, messages: list[dict], max_tokens: int | None) -> tuple[str, dict, bool]:
-    """(url, body, needs_auth_header) for this provider's chat shape."""
+def _request_shape(entry: PoolEntry, messages: list[dict], max_tokens: int | None,
+                   generation_config: dict[str, Any] | None = None
+                   ) -> tuple[str, dict, bool]:
+    """(url, body, needs_auth_header) for this provider's chat shape.
+
+    ``generation_config`` lets a caller keep its own sampling settings (the batch
+    translator sends ``temperature`` and, for Gemini, ``thinkingConfig``) without
+    giving up scheduler, failover and quota accounting. ``max_tokens`` always wins
+    over an ``maxOutputTokens`` in the config, so one source of truth remains.
+    """
     if entry.provider == 'gemini':
         system = '\n'.join(
             str(message.get('content') or '') for message in messages
@@ -144,14 +152,20 @@ def _request_shape(entry: PoolEntry, messages: list[dict], max_tokens: int | Non
         body: dict[str, Any] = {'contents': contents}
         if system:
             body['systemInstruction'] = {'parts': [{'text': system}]}
+        config = dict(generation_config or {})
         if max_tokens:
-            body['generationConfig'] = {'maxOutputTokens': int(max_tokens)}
+            config['maxOutputTokens'] = int(max_tokens)
+        if config:
+            body['generationConfig'] = config
         url = f'{_base_url(entry)}/models/{entry.model}:generateContent'
         return url, body, False
 
     body = {'model': entry.model, 'messages': messages}
     if max_tokens:
         body['max_tokens'] = int(max_tokens)
+    temperature = (generation_config or {}).get('temperature')
+    if temperature is not None:
+        body['temperature'] = float(temperature)
     return f'{_base_url(entry)}/chat/completions', body, True
 
 
@@ -172,6 +186,7 @@ def _parse_reply(entry: PoolEntry, payload: dict) -> tuple[str, dict[str, Any]]:
         usage = {
             'tokens_in': int(meta.get('promptTokenCount') or 0),
             'tokens_out': int(meta.get('candidatesTokenCount') or 0),
+            'thoughts': int(meta.get('thoughtsTokenCount') or 0),
         }
     else:
         choices = payload.get('choices') or []
@@ -193,16 +208,37 @@ def _parse_reply(entry: PoolEntry, payload: dict) -> tuple[str, dict[str, Any]]:
 
 
 def _call_entry(entry: PoolEntry, messages: list[dict], *, max_tokens: int | None,
-                timeout: int) -> tuple[str, dict[str, Any]]:
+                timeout: int, generation_config: dict[str, Any] | None = None,
+                api_meta: dict[str, Any] | None = None
+                ) -> tuple[str, dict[str, Any]]:
     """One HTTP call to one pool entry. Raises ProviderCallError on failure."""
     from ..online_providers import _http_error_detail, _request_json
+    from .. import api_events
 
     credential = _credential(entry)
     label = PROVIDER_LABELS.get(entry.provider, entry.provider)
+    meta = api_meta or {}
+    hint = api_events.hint_for(credential)
+    started = time.monotonic()
+    request_id = api_events.start(
+        entry.id, provider=entry.provider, model=entry.model,
+        lines=int(meta.get('lines') or 0), key_hint=hint,
+    )
+
+    def failed(error: ProviderCallError) -> ProviderCallError:
+        api_events.finish(
+            request_id, entry.id, ok=False, provider=entry.provider, model=entry.model,
+            lines=int(meta.get('lines') or 0), latency_ms=int((time.monotonic() - started) * 1000),
+            http_status=int(getattr(error, 'status', 0) or 0), error=str(error),
+            retry=bool(getattr(error, 'cooldown', 0) or getattr(error, 'kind', '') == 'transient'),
+            key_hint=hint,
+        )
+        return error
+
     try:
-        url, body, needs_auth = _request_shape(entry, messages, max_tokens)
-    except ProviderCallError:
-        raise
+        url, body, needs_auth = _request_shape(entry, messages, max_tokens, generation_config)
+    except ProviderCallError as error:
+        raise failed(error)
     if entry.provider == 'gemini':
         url = f'{url}?key={urllib.parse.quote(credential, safe="")}'
     try:
@@ -210,18 +246,27 @@ def _call_entry(entry: PoolEntry, messages: list[dict], *, max_tokens: int | Non
     except urllib.error.HTTPError as error:
         # Read the body once, here: the classifier must not re-read a consumed
         # stream. Retry-After is carried over so a 429 is honoured exactly.
-        raise ProviderCallError(
+        raise failed(ProviderCallError(
             _http_error_detail(error), status=error.code,
             retry_after=failover.parse_retry_after(error.headers),
-        ) from error
+        )) from error
     except urllib.error.URLError as error:
-        raise ProviderCallError(f'{label} is unreachable: {error}', kind='network') from error
+        raise failed(ProviderCallError(f'{label} is unreachable: {error}', kind='network')) from error
     except (TimeoutError, OSError) as error:
-        raise ProviderCallError(f'{label} request failed: {error}', kind='network') from error
+        raise failed(ProviderCallError(f'{label} request failed: {error}', kind='network')) from error
     except RuntimeError as error:
         # _request_json turns a TLS verification failure into an explanation.
-        raise ProviderCallError(str(error), kind='network') from error
-    return _parse_reply(entry, payload)
+        raise failed(ProviderCallError(str(error), kind='network')) from error
+    text, usage = _parse_reply(entry, payload)
+    api_events.finish(
+        request_id, entry.id, ok=True, provider=entry.provider, model=entry.model,
+        lines=int(meta.get('lines') or 0), latency_ms=int((time.monotonic() - started) * 1000),
+        prompt_tokens=int(usage.get('tokens_in') or 0),
+        output_tokens=int(usage.get('tokens_out') or 0),
+        thoughts_tokens=int(usage.get('thoughts') or 0),
+        key_hint=hint,
+    )
+    return text, usage
 
 
 # ---------------------------------------------------------------------------
@@ -325,11 +370,23 @@ def chat(
     *,
     max_tokens: int | None = None,
     timeout: int | None = None,
+    max_attempts: int | None = None,
+    generation_config: dict[str, Any] | None = None,
+    usage_out: dict[str, int] | None = None,
+    served_out: dict[str, Any] | None = None,
+    api_meta: dict[str, Any] | None = None,
 ) -> str:
     """One completion from the provider's pool, with scheduling and failover.
 
     Raises :class:`PoolUnavailable` when nothing could serve the request; the
     per-attempt errors are included so the caller can explain why.
+
+    ``generation_config`` is forwarded to the provider body (temperature, and the
+    Gemini thinking switch), and ``usage_out`` receives the token counts the pool
+    already parses, so a caller can log usage without a second code path.
+
+    ``max_attempts`` overrides the stored retry policy for this call only — a big
+    batch or a connection test wants one try per configuration, not three.
     """
     settings = store().settings()
     ordered = plan(provider)
@@ -343,6 +400,7 @@ def chat(
             'messages': messages,
             'max_tokens': max_tokens,
             'timeout': timeout,
+            'generation_config': generation_config,
             'provider': provider,
         },
         provider,
@@ -352,7 +410,10 @@ def chat(
 
     def attempt(entry: PoolEntry) -> tuple[str, dict[str, Any]]:
         queue.mark_in_flight(request_id, entry_id=entry.id, model=entry.model)
-        return _call_entry(entry, messages, max_tokens=max_tokens, timeout=timeout)
+        return _call_entry(
+            entry, messages, max_tokens=max_tokens, timeout=timeout,
+            generation_config=generation_config, api_meta=api_meta,
+        )
 
     def on_success(entry: PoolEntry, usage: dict[str, Any], latency_ms: int) -> None:
         health.record_success(entry.id, latency_ms)
@@ -364,6 +425,14 @@ def chat(
             chars_out=int(usage.get('chars_out') or 0),
             latency_ms=latency_ms,
         )
+        if usage_out is not None:
+            usage_out['prompt_tokens'] = int(usage.get('tokens_in') or 0)
+            usage_out['candidates_tokens'] = int(usage.get('tokens_out') or 0)
+            usage_out['thoughts_tokens'] = int(usage.get('thoughts') or 0)
+        if served_out is not None:
+            served_out.update({
+                'entry_id': entry.id, 'model': entry.model, 'label': entry.display_name,
+            })
 
     def on_failure(entry: PoolEntry, failure: failover.Failure) -> None:
         seen.append(f'{entry.display_name}: {failure.message}')
@@ -376,7 +445,7 @@ def chat(
     outcome = failover.execute(
         # The scheduler works in candidates; the failover loop only needs entries.
         [candidate.entry for candidate in ordered], attempt,
-        max_attempts=int(settings.get('max_attempts') or 3),
+        max_attempts=int(max_attempts or settings.get('max_attempts') or 3),
         on_success=on_success,
         on_failure=on_failure,
     )
@@ -594,19 +663,19 @@ def test_entry(entry_id: str) -> dict[str, Any]:
         entry.provider,
     )
     queue.mark_in_flight(request_id, entry_id=entry.id, model=entry.model)
-    started = time.perf_counter()
+    started = time.monotonic()
     try:
         text, usage = _call_entry(entry, messages, max_tokens=8, timeout=45)
     except Exception as error:
         failure = failover.classify(error)
-        latency_ms = int((time.perf_counter() - started) * 1000)
+        latency_ms = int((time.monotonic() - started) * 1000)
         health.record_failure(entry.id, message=failure.message,
                               cooldown=failure.cooldown, reason=failure.park_reason)
         quota.record(entry.id, ok=False, chars_in=chars_in)
         queue.fail(request_id, entry_id=entry.id, model=entry.model,
                    error=failure.message, attempts=1)
         raise RuntimeError(failure.message) from error
-    latency_ms = int((time.perf_counter() - started) * 1000)
+    latency_ms = int((time.monotonic() - started) * 1000)
     health.record_success(entry.id, latency_ms)
     quota.record(
         entry.id, ok=True,
@@ -675,6 +744,7 @@ def retry_failed(limit: int = 20) -> dict[str, Any]:
                 messages,
                 max_tokens=payload.get('max_tokens'),
                 timeout=payload.get('timeout'),
+                generation_config=payload.get('generation_config') or None,
             )
         except Exception as error:
             # The re-sent request has its own journal row; this one records the

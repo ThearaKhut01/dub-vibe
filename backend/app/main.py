@@ -58,19 +58,21 @@ from fastapi.responses import FileResponse, StreamingResponse
 from urllib.parse import quote
 
 from backend.app.chunking import SmartChunkEngine, format_timestamp, split_subtitle_cues
-from backend.app import acting, api_keys, api_pool, cuda_pack, export_design, model_manager, online_providers, speaker_diarization, tts_service, voxcpm_local
+from backend.app import acting, api_events, api_keys, api_pool, cuda_pack, export_design, model_manager, online_providers, speaker_diarization, translation_memory, tts_service, voxcpm_local
 from backend.app import segment_tts
 from backend.app.models import ProjectRequest, ProjectSummary, ProviderSettings, ProcessingRequest, SegmentSplit, SegmentUpdate, WorkflowProgress
 from backend.app.providers import (
     EDGE_LANGUAGE_VOICES,
     FasterWhisperProvider,
     HybridTranslationProvider,
+    TRANSLATION_CONTEXT_LINES,
     _resolve_lang_code,
     edge_gender_voice,
     edge_voice_options,
     get_app_root,
     get_provider_status,
     get_storage_dir,
+    split_translation_batches,
 )
 
 app = FastAPI(title='DubVibe Studio API', version='0.1.0')
@@ -220,6 +222,31 @@ async def emit_progress(project_id: str, stage: str, progress: int, message: str
         except Exception:
             if connection in active_connections:
                 active_connections.remove(connection)
+
+
+# --- Live API activity -------------------------------------------------------
+# api_events runs in worker threads (translation batches), so its publisher hops
+# back onto the event loop before touching the WebSocket list.
+_LIVE_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+async def _send_api_event(event: dict[str, Any]) -> None:
+    for connection in list(active_connections):
+        try:
+            await connection.send_json(event)
+        except Exception:
+            if connection in active_connections:
+                active_connections.remove(connection)
+
+
+def _publish_api_event(event: dict[str, Any]) -> None:
+    loop = _LIVE_LOOP
+    if loop is None or loop.is_closed():
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_send_api_event(event), loop)
+    except RuntimeError:
+        pass
 
 
 @app.get('/health')
@@ -463,7 +490,7 @@ async def unload_whisper_model(model_id: str) -> dict[str, str]:
 
 @app.post('/api/models/settings')
 async def save_model_settings(payload: dict[str, Any]) -> dict[str, Any]:
-    allowed = {key: payload[key] for key in ('selected_whisper_model', 'device', 'compute') if key in payload}
+    allowed = {key: payload[key] for key in ('selected_whisper_model', 'device', 'compute', 'gemini_translation_model') if key in payload}
     settings = model_manager.save_settings(allowed)
     return {'status': 'ok', 'settings': settings}
 
@@ -609,6 +636,47 @@ async def delete_voxcpm_model() -> dict[str, str]:
 # --- Online provider keys (stored in Windows Credential Manager, never sent
 # back to the browser) --------------------------------------------------------
 
+def _pool_probe(provider: str) -> dict[str, Any]:
+    """One tiny real request through the pool; returns the model that served it."""
+    served: dict[str, Any] = {}
+    text = api_pool.chat(
+        provider,
+        [
+            {'role': 'system', 'content': 'Reply with the single word OK.'},
+            {'role': 'user', 'content': 'ping'},
+        ],
+        max_tokens=8,
+        # A test must answer quickly: one try per configuration, short timeout.
+        timeout=20,
+        max_attempts=1,
+        served_out=served,
+    )
+    return {'model': served.get('model') or '', 'sample': str(text or '').strip()[:80]}
+
+
+async def _provider_model_lists(provider: str, key: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """TTS and text model lists for a stored key (never raises)."""
+    try:
+        if provider == 'gemini':
+            from backend.app.online_providers import gemini_test, gemini_text_test
+
+            return (
+                await run_in_threadpool(gemini_test, key),
+                await run_in_threadpool(gemini_text_test, key),
+            )
+        if provider == 'codecraft':
+            from backend.app.online_providers import codecraft_text_test
+
+            return {'models': []}, await run_in_threadpool(codecraft_text_test, key)
+        from backend.app.online_providers import openai_test, openai_text_test
+
+        return (
+            await run_in_threadpool(openai_test, key),
+            await run_in_threadpool(openai_text_test, key),
+        )
+    except Exception:
+        return {'models': []}, {'models': []}
+
 @app.get('/api/providers/keys')
 async def provider_keys_status() -> dict[str, Any]:
     """Which providers can translate, and whether an API pool backs them.
@@ -662,9 +730,40 @@ async def remove_provider_key(provider: str) -> dict[str, Any]:
 
 @app.post('/api/providers/{provider}/test')
 async def test_provider(provider: str) -> dict[str, Any]:
-    """Live connection test: lists the provider's real TTS and translation models."""
+    """Live connection test through the path that will actually run.
+
+    The pool serves an engine before its single key, so the test asks the pool
+    first and only then the stored key. Otherwise a pool-only setup reports "no
+    key stored" and a working pool can look broken when its model is unavailable.
+    """
     if provider not in api_keys.PROVIDERS:
         raise HTTPException(status_code=404, detail=f'Unknown provider: {provider}')
+
+    pool_errors: list[str] = []
+    if api_pool.entry_count(provider):
+        try:
+            probe = await run_in_threadpool(_pool_probe, provider)
+        except Exception as error:
+            pool_errors.append(str(error))
+        else:
+            tts: dict[str, Any] = {'models': []}
+            text: dict[str, Any] = {'models': []}
+            key = api_keys.get_key(provider)
+            if key:
+                # The probe proves the pool works; the model lists are a bonus that
+                # only a stored key can fetch, so a failure there is not a failure.
+                tts, text = await _provider_model_lists(provider, key)
+            return {
+                'status': 'ok',
+                'connected': True,
+                'provider': provider,
+                'via': 'pool',
+                'model': probe.get('model'),
+                'sample': probe.get('sample'),
+                'tts_models': tts.get('models', []),
+                'translation_models': text.get('models', []),
+            }
+
     key = api_keys.get_key(provider)
     if provider == 'custom':
         # A custom endpoint may be local and need no key, so it is tested
@@ -684,13 +783,18 @@ async def test_provider(provider: str) -> dict[str, Any]:
             'status': 'ok',
             'connected': True,
             'provider': 'custom',
+            'via': 'key',
             'tts_models': [],
             'translation_models': result.get('models', []),
             'model': result.get('model'),
             'sample': result.get('sample'),
         }
     if not key:
-        raise HTTPException(status_code=400, detail=f'No API key stored for {provider}. Save a key first.')
+        detail = f'No API key stored for {provider}. Save a key first.'
+        if pool_errors:
+            detail = f'{detail} Pool error: {pool_errors[0]}'
+            raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(status_code=400, detail=detail)
     try:
         if provider == 'gemini':
             from backend.app.online_providers import gemini_test, gemini_text_test
@@ -714,9 +818,11 @@ async def test_provider(provider: str) -> dict[str, Any]:
         'status': 'ok',
         'connected': True,
         'provider': provider,
+        'via': 'key',
         'tts_models': result.get('models', []),
         # The same key drives translation, so report the text models too.
         'translation_models': text.get('models', []),
+        'pool_error': pool_errors[0] if pool_errors else None,
     }
 
 
@@ -724,6 +830,94 @@ async def test_provider(provider: str) -> dict[str, Any]:
 # Configurations live in backend/app/api_pool; these routes are the panel's only
 # way in. A pool key is written to Windows Credential Manager and never comes
 # back to the browser — only whether one exists and its last four characters.
+
+# --- Live API activity --------------------------------------------------------
+
+_PROVIDER_LABELS = {'gemini': 'Gemini', 'openai': 'OpenAI', 'codecraft': 'CodeCraft', 'custom': 'Custom API'}
+
+
+def _live_snapshot() -> dict[str, Any]:
+    """Register the nodes that exist right now, then read the counters."""
+    valid: set[str] = set()
+    try:
+        entries = api_pool.status().get('entries') or []
+    except Exception:
+        # The live view must never 500 because the pool database is busy.
+        entries = []
+    for entry in entries:
+        try:
+            cooldown = float((entry.get('health') or {}).get('cooldown_remaining') or 0)
+            valid.add(str(entry['id']))
+            api_events.register_node(
+                str(entry['id']),
+                label=str(entry.get('display_name') or entry.get('label') or entry['id']),
+                provider=str(entry.get('provider') or ''), model=str(entry.get('model') or ''),
+                key_hint=str(entry.get('key_hint') or ''), enabled=bool(entry.get('enabled')),
+                cooldown_until=(time.time() + cooldown) if cooldown > 0 else None,
+            )
+        except Exception:
+            continue
+    for provider in api_keys.PROVIDERS:
+        if not api_keys.has_key(provider):
+            continue
+        node_id = f'legacy:{provider}'
+        valid.add(node_id)
+        api_events.register_node(
+            node_id, label=f"{_PROVIDER_LABELS.get(provider, provider)} · saved key",
+            provider=provider, model=_translation_model_hint(provider) or '',
+            key_hint=api_events.hint_for(api_keys.get_key(provider)),
+        )
+    api_events.prune(valid)
+    snapshot = api_events.snapshot()
+    snapshot['nodes'].sort(key=lambda node: (node['provider'], node['label']))
+    return snapshot
+
+
+@app.get('/api/api-live/snapshot')
+async def api_live_snapshot() -> dict[str, Any]:
+    """Nodes, counters and the last events, for the Live tab's first paint."""
+    return await run_in_threadpool(_live_snapshot)
+
+
+@app.post('/api/api-live/test')
+async def api_live_test(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A tiny 3-line batch through the real path, so the Live view has traffic."""
+    body = payload or {}
+    provider = str(body.get('provider') or 'gemini').strip().lower()
+    if provider not in api_keys.PROVIDERS:
+        raise HTTPException(status_code=404, detail=f'Unknown provider: {provider}')
+    if not (api_keys.has_key(provider) or api_pool.entry_count(provider)):
+        raise HTTPException(status_code=400, detail=f'No key or pool configuration for {provider}.')
+    raw_lines = body.get('lines')
+    lines = [str(item)[:200] for item in raw_lines][:5] if isinstance(raw_lines, list) else []
+    if not lines:
+        lines = ['Where were you last night?', 'I was at the office.', 'Wang Ming, sit down.']
+    translator = HybridTranslationProvider(preference=provider)
+    usage: dict[str, int] = {}
+    target = str(body.get('target_language') or 'Khmer')
+
+    def run() -> list[str | None]:
+        return translator.translate_batch(
+            lines, context=[], glossary='', source_language='auto',
+            target_language=target, tone='test', usage=usage,
+        )
+
+    try:
+        result = await run_in_threadpool(run)
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f'test request failed: {api_events.sanitize_error(error, 160)}',
+        ) from error
+    return {
+        'status': 'ok',
+        'provider': provider,
+        'lines': len(lines),
+        'translations': [item or '' for item in result],
+        'usage': usage,
+        'ok': any(item for item in result),
+    }
+
 
 @app.get('/api/api-pool/status')
 async def api_pool_status() -> dict[str, Any]:
@@ -800,6 +994,11 @@ async def reset_api_pool_health(payload: dict[str, Any] | None = None) -> dict[s
     """Drop cooldowns: everything, or one entry when an id is sent."""
     entry_id = str((payload or {}).get('entry_id') or '')
     await run_in_threadpool(api_pool.reset_health, entry_id)
+    # The batch path keeps its own short "pool is down" breaker; clearing
+    # cooldowns must clear that too, or a fixed pool stays skipped for minutes.
+    from backend.app.providers import clear_pool_breaker
+
+    clear_pool_breaker()
     return {'status': 'ok', 'pool': await run_in_threadpool(api_pool.status)}
 
 
@@ -1205,6 +1404,26 @@ async def get_project(project_id: str) -> ProjectSummary:
     return ProjectSummary(**project)
 
 
+@app.get('/api/projects/{project_id}/glossary')
+async def get_project_glossary(project_id: str) -> dict[str, str]:
+    """The project's term list used by the translation prompt."""
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f'Project {project_id} not found')
+    return {'glossary': str(project.get('glossary') or '')}
+
+
+@app.post('/api/projects/{project_id}/glossary')
+async def set_project_glossary(project_id: str, payload: dict[str, Any]) -> dict[str, str]:
+    """Replace the term list: one ``source=translation`` entry per line."""
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f'Project {project_id} not found')
+    project['glossary'] = str(payload.get('glossary') or '')[:8000]
+    persist_project(project_id)
+    return {'status': 'ok', 'glossary': project['glossary']}
+
+
 @app.delete('/api/projects/{project_id}')
 async def delete_project(project_id: str) -> dict[str, str]:
     if project_id not in projects:
@@ -1245,6 +1464,7 @@ async def get_project_workspace(project_id: str) -> dict[str, Any]:
             if project.get('parts_dir') and Path(str(project['parts_dir'])).is_dir() else 0
         ),
         'export_folder': project.get('export_folder'),
+        'glossary': str(project.get('glossary') or ''),
         # The Undo banner survives a reload because the backup lives on disk.
         'can_undo_overlaps': (_overlap_backup_dir(project_id) / 'audio_segments.json').is_file(),
         'separated': bool(
@@ -1554,7 +1774,11 @@ async def create_project(payload: ProjectRequest) -> ProjectSummary:
         progress=5,
         duration='00:00:00',
     )
-    projects[project_id] = {**project.model_dump(), 'media_path': None, 'segments': [], 'audio_segments': []}
+    projects[project_id] = {
+        **project.model_dump(), 'media_path': None, 'segments': [], 'audio_segments': [],
+        # Project-wide term list ("王明=វ៉ាង មីង" lines). Empty by default.
+        'glossary': payload.glossary or '',
+    }
     persist_project(project_id)
     return project
 
@@ -2088,6 +2312,38 @@ async def cancel_transcribe(payload: ProcessingRequest) -> dict[str, str]:
     return {'status': 'cancelling', 'project_id': payload.project_id}
 
 
+def _translation_model_hint(engine: str | None) -> str:
+    """Model name that goes into the translation-cache key ('' = no choice)."""
+    try:
+        if engine == 'gemini':
+            from backend.app.providers import GeminiTranslationProvider
+
+            return GeminiTranslationProvider.model_name()
+        if engine == 'custom':
+            from backend.app import custom_api
+
+            return str(custom_api.get_config().get('primary') or '')
+        if engine == 'openai':
+            from backend.app.online_providers import OPENAI_DEFAULT_CHAT_MODEL
+
+            return OPENAI_DEFAULT_CHAT_MODEL
+        if engine == 'codecraft':
+            from backend.app.online_providers import CODECRAFT_DEFAULT_CHAT_MODEL
+
+            return CODECRAFT_DEFAULT_CHAT_MODEL
+    except Exception:
+        return ''
+    return ''
+
+
+def _translation_tone(emotion: str | None) -> str:
+    """Tone line for the prompt: the acting preset when one is chosen."""
+    label = str(emotion or '').strip()
+    if not label or label.lower() == 'auto':
+        return 'natural and consistent'
+    return f'{label.lower()}, consistent across the scene'
+
+
 @app.post('/api/process/translate')
 async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
     project = projects.get(payload.project_id)
@@ -2112,10 +2368,13 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
         payload.project_id, 'Translating', 52,
         f'Translating with {active_engine or "no engine"}.', engine=active_engine,
     )
-    total = len(segments)
+    # Only lines with text can be translated: a blank segment (an imported cue
+    # that carries no words) must not cost a request or make the run look failed.
+    translatable = [segment for segment in segments if str(segment.get('text') or '').strip()]
+    total = len(translatable)
     # Resume support: segments that already carry a translation are kept, so
     # re-running after a failure continues instead of starting over.
-    pending = [segment for segment in segments if not segment.get('translation')]
+    pending = [segment for segment in translatable if not segment.get('translation')]
     already_done = total - len(pending)
     if already_done:
         await emit_progress(
@@ -2126,6 +2385,19 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
     loop = asyncio.get_running_loop()
     translated_count = 0
     first_error: Exception | None = None
+
+    # Batching inputs: the project's glossary (or the per-run override), a tone
+    # line taken from the acting preset, and the model name for the cache key.
+    glossary = str(
+        payload.glossary if payload.glossary is not None else project.get('glossary') or ''
+    ).strip()
+    tone = _translation_tone(payload.emotion)
+    model_hint = _translation_model_hint(active_engine)
+    usage: dict[str, int] = {
+        'requests': 0, 'retries': 0, 'batches': 0, 'lines': 0,
+        'cache_hits': 0, 'prompt_tokens': 0, 'candidates_tokens': 0, 'thoughts_tokens': 0,
+    }
+    batch_capable = bool(getattr(translator, 'supports_batch', lambda: False)())
 
     def translate_pending() -> None:
         nonlocal translated_count, first_error
@@ -2178,9 +2450,114 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
                         loop,
                     )
 
+    def translate_batched() -> None:
+        """One request per batch of ≤40 lines (≤3000 chars), cache checked first."""
+        nonlocal translated_count, first_error
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        remaining: dict[str, list[dict[str, Any]]] = {}
+        for segment in pending:
+            remaining.setdefault(segment['text'], []).append(segment)
+
+        # 1) Cache: a line this model already translated (same glossary) is free.
+        for text in list(remaining):
+            cached = translation_memory.lookup(
+                text, source_language, payload.target_language, model_hint, glossary,
+            )
+            if not cached:
+                continue
+            members = remaining.pop(text)
+            for member in members:
+                member['translation'] = cached
+            translated_count += len(members)
+            usage['cache_hits'] += len(members)
+            api_events.emit_cache_hit(
+                lines=len(members), provider=active_engine or '',
+            )
+
+        ordered = list(remaining)
+        if not ordered:
+            return
+
+        positions = {id(segment): index for index, segment in enumerate(segments)}
+        batches = split_translation_batches(ordered)
+
+        def context_for(batch: list[str]) -> list[str]:
+            first = remaining[batch[0]][0]
+            index = positions.get(id(first), 0)
+            return [item['text'] for item in segments[max(0, index - TRANSLATION_CONTEXT_LINES):index]]
+
+        def run_batch(batch: list[str]):
+            local: dict[str, int] = {}
+            result = translator.translate_batch(
+                batch,
+                context=context_for(batch),
+                glossary=glossary,
+                source_language=source_language,
+                target_language=payload.target_language,
+                tone=tone,
+                usage=local,
+            )
+            return batch, result, local
+
+        total_batches = len(batches)
+        # Two batches at a time: enough to hide latency, well under the rate limit.
+        with ThreadPoolExecutor(max_workers=min(2, total_batches)) as pool:
+            futures = [pool.submit(run_batch, batch) for batch in batches]
+            for completed, future in enumerate(as_completed(futures), start=1):
+                try:
+                    batch, result, local = future.result()
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+                    continue
+                usage['batches'] += 1
+                usage['lines'] += len(batch)
+                for field in ('requests', 'retries', 'prompt_tokens', 'candidates_tokens', 'thoughts_tokens'):
+                    usage[field] += int(local.get(field, 0))
+                for text, value in zip(batch, result):
+                    if not value:
+                        continue
+                    members = remaining.pop(text, [])
+                    for member in members:
+                        member['translation'] = value
+                    translated_count += len(members)
+                    translation_memory.remember(
+                        text, value, source_language, payload.target_language,
+                        model_hint, glossary, provider=active_engine or '',
+                    )
+                asyncio.run_coroutine_threadsafe(
+                    emit_progress(
+                        payload.project_id, 'Translating',
+                        52 + int(28 * (already_done + translated_count) / total),
+                        f'Translated batch {completed} of {total_batches}.',
+                    ),
+                    loop,
+                )
+
+        # 2) Lines a batch could not fill: the old one-line request, for those only.
+        for text in [item for item in ordered if item in remaining]:
+            try:
+                value = translator.translate(text, payload.target_language, source_language)
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+                continue
+            if not str(value or '').strip():
+                continue
+            members = remaining.pop(text, [])
+            for member in members:
+                member['translation'] = value
+            translated_count += len(members)
+            usage['requests'] += 1
+            translation_memory.remember(
+                text, value, source_language, payload.target_language,
+                model_hint, glossary, provider=active_engine or '',
+            )
+
     if pending:
         try:
-            await run_in_threadpool(translate_pending)
+            await run_in_threadpool(translate_batched if batch_capable else translate_pending)
         except Exception as error:
             persist_project(payload.project_id)
             update_project(payload.project_id, status='Ready', progress=52)
@@ -2241,7 +2618,11 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
     ]
     await emit_progress(payload.project_id, 'Translating', 82, 'Translation complete and aligned with timeline.')
     update_project(payload.project_id, status='Ready', progress=82)
-    return {'project_id': payload.project_id, 'status': 'ok', 'translation': translated_chunks, 'chunks': translated_chunks}
+    return {
+        'project_id': payload.project_id, 'status': 'ok',
+        'translation': translated_chunks, 'chunks': translated_chunks,
+        'engine': active_engine, 'usage': usage,
+    }
 
 
 @app.post('/api/process/tts')
@@ -3628,7 +4009,12 @@ async def undo_fix_overlaps(project_id: str) -> dict[str, Any]:
 
 @app.websocket('/ws')
 async def websocket_status(websocket: WebSocket) -> None:
+    global _LIVE_LOOP
     await websocket.accept()
+    # The event bus lives in worker threads; the live socket is where its loop is
+    # known for sure (no startup hook, no deprecated on_event).
+    _LIVE_LOOP = asyncio.get_running_loop()
+    api_events.set_publisher(_publish_api_event)
     active_connections.append(websocket)
     try:
         while True:

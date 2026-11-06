@@ -751,6 +751,232 @@ class GoogleTranslateProvider(TranslationProvider):
         ) from last_error
 
 
+# ---------------------------------------------------------------------------
+# Batch translation: one request for a group of subtitle lines
+# ---------------------------------------------------------------------------
+
+# One subtitle line is a tiny request, but repeating the full instruction block
+# for every line is what made the old translate step expensive: on a 300-line
+# video the system prompt alone was sent 300 times. Lines are now grouped into
+# requests that are bounded by BOTH a line count and a character budget, so a
+# batch never turns into a huge single completion either.
+TRANSLATION_BATCH_MAX_LINES = 40
+TRANSLATION_BATCH_MAX_CHARS = 3000
+TRANSLATION_CONTEXT_LINES = 3
+TRANSLATION_BATCH_RETRIES = 2
+TRANSLATION_OUTPUT_TOKEN_CAP = 8192
+
+# "1|text" (the id is batch-local, 1-based) — tolerant of the spacing models add.
+_BATCH_LINE = re.compile(r'^\s*(\d+)\s*\|\s?(.*)$')
+
+_TRANSLATION_SYSTEM_TEMPLATE = (
+    'You are a professional dubbing translator. Translate subtitle lines into '
+    '{TARGET} for voice-over. The source language is {SOURCE} (auto-detect per line).\n'
+    '\n'
+    'Rules:\n'
+    '1. Input: one line per item as "ID|text". Output the same IDs in the same order as "ID|translation".\n'
+    '2. Output exactly one line per input line. Never merge, split, skip, or add lines.\n'
+    '3. Output ONLY the {TARGET_NAME} translations. No explanations, notes, quotes, pinyin, or markdown.\n'
+    '4. Translate for speech: natural spoken {TARGET_NAME}, easy to read aloud. Not word by word. '
+    'Keep it as short as possible so it fits the original timing.\n'
+    '5. Chinese: translate the meaning, not the characters. Convert idioms, slang, and internet '
+    'phrases into natural {TARGET_NAME}. Resolve omitted subjects using CONTEXT.\n'
+    '6. Names: keep brand/product/technical terms in original form. Chinese person names in '
+    '{TARGET_NAME} transliteration, spelled the same way every time.\n'
+    '7. Numbers as digits.\n'
+    '8. Use CONTEXT only to understand meaning. Never output it.\n'
+    '9. Lines that are only a sound or symbol ([Music], ♪, (笑)) are returned unchanged.\n'
+    '10. Keep the tone consistent: {TONE}.\n'
+    '\n'
+    'Glossary (use these exact translations):\n'
+    '{GLOSSARY}'
+)
+
+# The prompt above is written for the product's default target; other targets
+# substitute their own name so the same rules still read correctly.
+_TARGET_LABELS = {
+    'km': ('Khmer', 'ភាសាខ្មែរ'),
+    'khmer': ('Khmer', 'ភាសាខ្មែរ'),
+}
+
+
+def translation_target_label(target_language: str) -> tuple[str, str]:
+    """(English name, native name) for the system prompt."""
+    code = _resolve_lang_code(target_language or 'Khmer')
+    if code in _TARGET_LABELS:
+        return _TARGET_LABELS[code]
+    name = str(target_language or 'Khmer').strip() or 'Khmer'
+    return name, name
+
+
+def build_translation_system_prompt(
+    glossary: str = '',
+    tone: str = 'natural and consistent',
+    target_language: str = 'Khmer',
+) -> str:
+    """The batch instruction block, sent once per request (never per line).
+
+    ``glossary`` is the project's small term list ("王明=វ៉ាង មីង" lines); an
+    empty glossary becomes the literal ``none`` so the model never gets a blank
+    section it might fill with invented terms.
+    """
+    target, native = translation_target_label(target_language)
+    return _TRANSLATION_SYSTEM_TEMPLATE.format(
+        TARGET=f'{target} ({native})',
+        TARGET_NAME=target,
+        SOURCE='English or Chinese',
+        TONE=str(tone or 'natural and consistent').strip(),
+        GLOSSARY=str(glossary or '').strip() or 'none',
+    )
+
+
+def build_translation_user_message(lines: list[str], context: list[str] | None = None,
+                                  ids: list[int] | None = None) -> str:
+    """``CONTEXT:`` (previous lines, never translated) + ``TRANSLATE:`` with IDs.
+
+    ``ids`` keeps a line's id stable when only the failed lines are re-sent; by
+    default the lines are numbered 1..n.
+    """
+    context_block = '\n'.join(str(line) for line in (context or [])[-TRANSLATION_CONTEXT_LINES:] if str(line).strip())
+    identifiers = list(ids) if ids is not None else list(range(1, len(lines) + 1))
+    numbered = '\n'.join(f'{identifier}|{line}' for identifier, line in zip(identifiers, lines))
+    return f'CONTEXT:\n{context_block or "none"}\n\nTRANSLATE:\n{numbered}'
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token count for a mixed English/CJK/Khmer body.
+
+    Deliberately conservative: Khmer costs more tokens per character than Latin
+    text, and under-estimating would truncate the batch.
+    """
+    return max(1, int(len(str(text or '')) / 2.2) + 1)
+
+
+def batch_output_token_budget(user_message: str, line_count: int) -> int:
+    """About 3x the input tokens, bounded by a sane floor and ceiling.
+
+    The floor is per line, not a constant: Khmer costs far more tokens per
+    character in some tokenizers (Mistral emitted ~64 tokens for one short line),
+    so a 25-line batch needs real headroom or the answer is cut mid-line.
+    """
+    budget = 3 * estimate_tokens(user_message) + 64
+    floor = 512 + 80 * max(0, line_count - 1)
+    return int(min(TRANSLATION_OUTPUT_TOKEN_CAP, max(budget, floor)))
+
+
+def split_translation_batches(
+    texts: list[str],
+    max_lines: int = TRANSLATION_BATCH_MAX_LINES,
+    max_chars: int = TRANSLATION_BATCH_MAX_CHARS,
+) -> list[list[str]]:
+    """Order-preserving groups bounded by line count and characters.
+
+    A single line longer than the character budget still gets its own batch:
+    dropping it would silently leave that subtitle untranslated.
+    """
+    batches: list[list[str]] = []
+    current: list[str] = []
+    used = 0
+    for text in texts:
+        cost = len(str(text or '')) + 8  # the "N|" prefix and the newline
+        if current and (len(current) >= max_lines or used + cost > max_chars):
+            batches.append(current)
+            current, used = [], 0
+        current.append(text)
+        used += cost
+    if current:
+        batches.append(current)
+    return batches
+
+
+def parse_batch_reply(raw: str, expected_ids: list[int] | None = None) -> dict[int, str]:
+    """``ID|translation`` lines from a model answer, keyed by ID.
+
+    Tolerant of markdown fences, blank lines and prose the model adds around the
+    answer: only lines that start with an id and a pipe are kept. Duplicate ids
+    keep the last answer (reasoning models sometimes restate a line).
+    """
+    text = _strip_reasoning(raw)
+    text = re.sub(r'```[a-zA-Z]*', '', text)
+    parsed: dict[int, str] = {}
+    for line in text.splitlines():
+        match = _BATCH_LINE.match(line.strip())
+        if not match:
+            continue
+        identifier = int(match.group(1))
+        if expected_ids is not None and identifier not in expected_ids:
+            continue
+        value = match.group(2).strip()
+        if value:
+            parsed[identifier] = value
+    return parsed
+
+
+def _clean_batch_value(raw: str, source: str, source_language: str, target_language: str) -> str | None:
+    """One accepted translation (or None) using the existing validators."""
+    cleaned = str(raw or '').strip().strip('"“”').strip()
+    if not cleaned:
+        return None
+    if _translation_script_ok(cleaned, source, source_language, target_language) and _subtitle_length_ok(cleaned, source):
+        return cleaned
+    salvaged = _extract_subtitle_answer(cleaned, source, source_language, target_language)
+    if salvaged and _translation_script_ok(salvaged, source, source_language, target_language) and _subtitle_length_ok(salvaged, source):
+        return salvaged
+    return None
+
+
+# Engines that answered "slow down" are skipped for a while instead of being
+# asked again for every line of the video (the same policy the Google engine
+# already applies to its own 429s).
+_PARKED_ENGINES: dict[str, float] = {}
+_PARK_SECONDS = 60.0
+
+
+def _park_engine(key: str, seconds: float = _PARK_SECONDS) -> None:
+    _PARKED_ENGINES[key] = time.monotonic() + seconds
+
+
+def _engine_parked(key: str) -> bool:
+    until = _PARKED_ENGINES.get(key)
+    if until is None:
+        return False
+    if time.monotonic() >= until:
+        _PARKED_ENGINES.pop(key, None)
+        return False
+    return True
+
+
+# A pool whose entries are all down (an unavailable model, a revoked key) would
+# otherwise cost every batch a round of failing attempts before the stored key
+# takes over. One failure marks the pool down briefly; the fallback key serves
+# the run in the meantime.
+_POOL_DOWN_UNTIL: dict[str, float] = {}
+_POOL_DOWN_SECONDS = 300.0
+
+# A batch is large and few: one try per configuration and a bounded wait. A
+# healthy pool answers in seconds; a broken one must not hold up the run, and the
+# breaker above keeps the next batches off it for a while.
+BATCH_POOL_TIMEOUT = 30
+
+
+def _pool_usable(engine: str) -> bool:
+    return time.monotonic() >= _POOL_DOWN_UNTIL.get(engine, 0.0)
+
+
+def _mark_pool_down(engine: str, seconds: float = _POOL_DOWN_SECONDS) -> None:
+    _POOL_DOWN_UNTIL[engine] = time.monotonic() + seconds
+
+
+def clear_pool_breaker() -> None:
+    """Forget "this pool is down" (the panel's Clear-cooldowns action)."""
+    _POOL_DOWN_UNTIL.clear()
+
+
+def _looks_rate_limited(error: Exception) -> bool:
+    message = str(error).lower()
+    return '429' in message or 'rate limit' in message or 'quota' in message or 'resource_exhausted' in message
+
+
 class OnlineLLMTranslationProvider(TranslationProvider):
     """Base for the paid online engines: one line in, one translation out.
 
@@ -846,6 +1072,160 @@ class OnlineLLMTranslationProvider(TranslationProvider):
             candidate, text, source_language, target_language,
         ) and _subtitle_length_ok(candidate, text)
 
+    # Batched requests want a low temperature (subtitle lines must stay literal);
+    # engines with extra switches return them from _batch_generation_config.
+    BATCH_TEMPERATURE = 0.2
+
+    def _batch_generation_config(self) -> dict:
+        return {'temperature': self.BATCH_TEMPERATURE}
+
+    def _batch_messages(self, system: str, user: str) -> list[dict]:
+        return [
+            {'role': 'system', 'content': system},
+            {'role': 'user', 'content': user},
+        ]
+
+    def _batch_complete(self, system: str, user: str, max_tokens: int,
+                        usage: dict[str, int] | None = None,
+                        meta: dict[str, Any] | None = None) -> str:
+        """One batched completion: the API pool when it has entries, else the key.
+
+        The pool is what actually serves this engine at runtime (rotation, quota,
+        health), so a batch must not bypass it — otherwise two configured keys turn
+        into one, and the pool's usage numbers miss every subtitle line.
+        """
+        from . import api_events, api_pool
+
+        meta = dict(meta or {})
+        meta.setdefault('node_id', f'legacy:{self.ENGINE}')
+        lines = int(meta.get('lines') or 0)
+        messages = self._batch_messages(system, user)
+        if api_pool.has_entries(self.ENGINE) and _pool_usable(self.ENGINE):
+            try:
+                return api_pool.chat(
+                    self.ENGINE, messages, max_tokens=max_tokens, max_attempts=1,
+                    timeout=BATCH_POOL_TIMEOUT,
+                    generation_config=self._batch_generation_config(), usage_out=usage,
+                    api_meta=meta,
+                )
+            except api_pool.PoolUnavailable as error:
+                _mark_pool_down(self.ENGINE)
+                if self._stored_key_missing():
+                    raise RuntimeError(
+                        f'{self._provider_label()} pool is unavailable: {error}'
+                    ) from error
+                logger.info(
+                    '%s pool unavailable for a batch (%s); using the stored key.',
+                    self.ENGINE, error,
+                )
+        key = self._key()
+        meta['key_hint'] = api_events.hint_for(key)
+        request_id = api_events.start(
+            meta['node_id'], provider=self.ENGINE, model=self.DEFAULT_MODEL,
+            lines=lines, key_hint=meta['key_hint'],
+        )
+        started = time.monotonic()
+        try:
+            text = self._complete(messages, key)
+        except Exception as error:
+            api_events.finish(
+                request_id, meta['node_id'], ok=False, provider=self.ENGINE,
+                lines=lines, latency_ms=int((time.monotonic() - started) * 1000),
+                error=error, key_hint=meta['key_hint'],
+            )
+            raise
+        api_events.finish(
+            request_id, meta['node_id'], ok=True, provider=self.ENGINE, lines=lines,
+            latency_ms=int((time.monotonic() - started) * 1000), key_hint=meta['key_hint'],
+        )
+        return text
+
+    def supports_batch(self) -> bool:
+        return True
+
+    def translate_batch(
+        self,
+        lines: list[str],
+        context: list[str] | None = None,
+        glossary: str = '',
+        *,
+        source_language: str = 'auto',
+        target_language: str = 'Khmer',
+        tone: str = 'natural and consistent',
+        usage: dict[str, int] | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> list[str | None]:
+        """Translate ``lines`` in as few requests as possible.
+
+        Returns one entry per input line: the translation, or ``None`` when the
+        model never produced a usable line for it (the caller then falls back to
+        the single-line path for just that line). Missing ids are re-requested on
+        their own — never the whole batch.
+        """
+        results: list[str | None] = [None] * len(lines)
+        if not lines:
+            return results
+        system = build_translation_system_prompt(
+            glossary=glossary, tone=tone, target_language=target_language,
+        )
+        pending: dict[int, str] = {index + 1: text for index, text in enumerate(lines)}
+        # A truncated answer (the model stops mid-line at its token ceiling) is
+        # retried in smaller groups instead of the same oversized request.
+        group_size = len(lines)
+        for round_index in range(TRANSLATION_BATCH_RETRIES + 1):
+            if not pending:
+                break
+            if round_index:
+                # Backoff with jitter, only for the lines that came back missing.
+                time.sleep(0.6 * (2 ** (round_index - 1)) + random.uniform(0.0, 0.4))
+                if usage is not None:
+                    usage['retries'] = int(usage.get('retries', 0)) + 1
+            pending_ids = sorted(pending)
+            groups = [pending_ids[start:start + group_size] for start in range(0, len(pending_ids), group_size)]
+            for ids in groups:
+                subset = [pending[identifier] for identifier in ids]
+                user = build_translation_user_message(subset, context=context, ids=ids)
+                before = dict(usage) if usage is not None else {}
+                raw = self._batch_complete(
+                    system, user, batch_output_token_budget(user, len(subset)), usage,
+                    {'lines': len(subset), **(meta or {})},
+                )
+                if usage is not None:
+                    usage['requests'] = int(usage.get('requests', 0)) + 1
+                    # One line per request: what was sent, what it cost, which retry
+                    # round it belonged to. This is the audit trail the old per-line
+                    # path never had.
+                    logger.info(
+                        'Translation batch request: lines=%d retry=%d prompt_tokens=%d '
+                        'candidates_tokens=%d thoughts_tokens=%d',
+                        len(subset), round_index,
+                        int(usage.get('prompt_tokens', 0)) - int(before.get('prompt_tokens', 0)),
+                        int(usage.get('candidates_tokens', 0)) - int(before.get('candidates_tokens', 0)),
+                        int(usage.get('thoughts_tokens', 0)) - int(before.get('thoughts_tokens', 0)),
+                    )
+                parsed = parse_batch_reply(raw, set(ids))
+                if not parsed and str(raw or '').strip():
+                    # The model answered, but not in "ID|translation" form: keep the
+                    # evidence instead of silently reporting an empty result.
+                    logger.warning(
+                        'Unparseable batch answer from %s (lines=%d): %s',
+                        type(self).__name__, len(subset), str(raw)[:300],
+                    )
+                for identifier in ids:
+                    candidate = parsed.get(identifier)
+                    if candidate is None:
+                        continue
+                    cleaned = _clean_batch_value(
+                        candidate, pending[identifier], source_language, target_language,
+                    )
+                    if cleaned is None:
+                        continue
+                    results[identifier - 1] = cleaned
+                    pending.pop(identifier, None)
+            if pending:
+                group_size = max(4, group_size // 2)
+        return results
+
     def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
         if not str(text or '').strip():
             return ''
@@ -893,11 +1273,84 @@ class GeminiTranslationProvider(OnlineLLMTranslationProvider):
     """Google Gemini text translation through the stored Gemini API key."""
 
     ENGINE = 'gemini'
+    # app-settings.json key: the model this engine uses for translation.
+    MODEL_SETTING = 'gemini_translation_model'
+    FALLBACK_MODEL = 'gemini-2.5-flash'
+
+    @classmethod
+    def model_name(cls) -> str:
+        """Configured text model (``gemini-2.5-flash`` unless the user changes it)."""
+        from . import model_manager
+
+        try:
+            configured = str(model_manager.load_settings().get(cls.MODEL_SETTING) or '').strip()
+        except Exception:
+            configured = ''
+        return configured or cls.FALLBACK_MODEL
 
     def _complete(self, messages: list[dict], key: str) -> str:
-        from .online_providers import GEMINI_DEFAULT_CHAT_MODEL, gemini_chat
+        from .online_providers import gemini_chat
 
-        return gemini_chat(key, messages, model=GEMINI_DEFAULT_CHAT_MODEL)
+        return gemini_chat(key, messages, model=self.model_name())
+
+    def _batch_generation_config(self) -> dict:
+        # 2.5-style models think by default and a subtitle batch never needs it;
+        # the pool forwards this verbatim, so the saving holds on both paths.
+        return {'temperature': self.BATCH_TEMPERATURE, 'thinkingConfig': {'thinkingBudget': 0}}
+
+    def _batch_complete(self, system: str, user: str, max_tokens: int,
+                        usage: dict[str, int] | None = None,
+                        meta: dict[str, Any] | None = None) -> str:
+        """Batched request: instruction once, low temperature, no thinking.
+
+        The pool serves this engine at runtime, so the batch goes through it first
+        (both keys, quota, health); the stored key is the fallback.
+        """
+        from . import api_events, api_keys, api_pool
+        from .online_providers import gemini_chat
+
+        meta = dict(meta or {})
+        meta.setdefault('node_id', 'legacy:gemini')
+        if api_pool.has_entries('gemini') and _pool_usable('gemini'):
+            try:
+                return api_pool.chat(
+                    'gemini', self._batch_messages(system, user), max_tokens=max_tokens,
+                    max_attempts=1, timeout=BATCH_POOL_TIMEOUT,
+                    generation_config=self._batch_generation_config(), usage_out=usage,
+                    api_meta=meta,
+                )
+            except api_pool.PoolUnavailable as error:
+                _mark_pool_down('gemini')
+                if not api_keys.has_key('gemini'):
+                    raise RuntimeError(f'Gemini pool is unavailable: {error}') from error
+                logger.info('Gemini pool unavailable for a batch (%s); using the stored key.', error)
+
+        key = self._key()
+        meta['key_hint'] = api_events.hint_for(key)
+        text, result_meta = gemini_chat(
+            key,
+            [{'role': 'user', 'content': user}],
+            model=self.model_name(),
+            generation_config={
+                'temperature': self.BATCH_TEMPERATURE,
+                'maxOutputTokens': int(max_tokens),
+                'thinkingConfig': {'thinkingBudget': 0},
+            },
+            system_instruction=system,
+            want_usage=True,
+            prefer_requested=True,
+            api_meta=meta,
+        )
+        if usage is not None:
+            totals = result_meta.get('usage') or {}
+            for field in ('prompt_tokens', 'candidates_tokens', 'thoughts_tokens'):
+                usage[field] = int(usage.get(field, 0)) + int(totals.get(field, 0))
+            logger.info(
+                'Gemini translation: model=%s prompt=%s candidates=%s thoughts=%s finish=%s',
+                result_meta.get('model'), totals.get('prompt_tokens'), totals.get('candidates_tokens'),
+                totals.get('thoughts_tokens'), result_meta.get('finish_reason'),
+            )
+        return text
 
     @staticmethod
     def is_available() -> bool:
@@ -969,6 +1422,44 @@ class CustomAPITranslationProvider(OnlineLLMTranslationProvider):
         from . import custom_api
 
         return custom_api.chat(key, messages)
+
+    def _batch_complete(self, system: str, user: str, max_tokens: int,
+                        usage: dict[str, int] | None = None,
+                        meta: dict[str, Any] | None = None) -> str:
+        """Batched request with an explicit output ceiling and token accounting."""
+        from . import api_events, api_pool, custom_api
+
+        meta = dict(meta or {})
+        meta.setdefault('node_id', 'legacy:custom')
+        messages = self._batch_messages(system, user)
+        if api_pool.has_entries('custom') and _pool_usable('custom'):
+            try:
+                return api_pool.chat(
+                    'custom', messages, max_tokens=max_tokens, max_attempts=1,
+                    timeout=BATCH_POOL_TIMEOUT,
+                    generation_config=self._batch_generation_config(), usage_out=usage,
+                    api_meta=meta,
+                )
+            except api_pool.PoolUnavailable as error:
+                _mark_pool_down('custom')
+                if self._stored_key_missing():
+                    raise RuntimeError(f'Custom API pool is unavailable: {error}') from error
+                logger.info('Custom API pool unavailable for a batch (%s); using the endpoint settings.', error)
+
+        key = self._key()
+        meta['key_hint'] = api_events.hint_for(key)
+        tokens: dict[str, int] = {}
+        text = custom_api.chat(
+            key,
+            messages,
+            max_tokens=int(max_tokens),
+            usage_out=tokens,
+            api_meta=meta,
+        )
+        if usage is not None:
+            for field in ('prompt_tokens', 'candidates_tokens', 'thoughts_tokens'):
+                usage[field] = int(usage.get(field, 0)) + int(tokens.get(field, 0))
+        return text
 
     @staticmethod
     def is_available() -> bool:
@@ -1087,6 +1578,15 @@ class HybridTranslationProvider(TranslationProvider):
             order = [self._preference] + [key for key in local_engines if key != self._preference]
         else:
             order = ([self._preference] if self._preference != 'auto' else []) + ['qwen', 'argos', 'google']
+            # Choosing a paid engine means "use this endpoint"; when it fails the
+            # user's own configured endpoint is the fallback they expect, before
+            # the free/local engines take over.
+            if (
+                self._preference in ONLINE_TRANSLATION_ENGINES
+                and self._preference != 'custom'
+                and self._custom is not None
+            ):
+                order.insert(1, 'custom')
         available = {
             'qwen': self._qwen,
             'nllb': self._nllb,
@@ -1204,6 +1704,65 @@ class HybridTranslationProvider(TranslationProvider):
                     nllb_local.nllb_code(language)
                 except ValueError as error:
                     raise RuntimeError(f'{error}. Choose Google Translate or another engine.') from error
+
+    def supports_batch(self) -> bool:
+        """True when the engine that would run can translate a whole group at once."""
+        for key, provider in self._chain():
+            if _engine_parked(key):
+                continue
+            return bool(getattr(provider, 'supports_batch', lambda: False)())
+        return False
+
+    def translate_batch(
+        self,
+        lines: list[str],
+        context: list[str] | None = None,
+        glossary: str = '',
+        *,
+        source_language: str = 'auto',
+        target_language: str = 'Khmer',
+        tone: str = 'natural and consistent',
+        usage: dict[str, int] | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> list[str | None]:
+        """Batch translation through the chain, skipping parked engines.
+
+        Each engine gets the whole batch; an engine that raises (quota, network)
+        parks itself when the message looks like rate limiting and the next one
+        retries the same lines. A batch where every line came back empty counts
+        as a failure so the fallback engine still gets its turn.
+        """
+        modes = {
+            'qwen': 'qwen', 'nllb': 'nllb', 'argos': 'offline', 'google': 'online',
+            'gemini': 'gemini', 'openai': 'openai', 'codecraft': 'codecraft',
+            'custom': 'custom',
+        }
+        last_error: Exception | None = None
+        for key, provider in self._chain():
+            if _engine_parked(key):
+                continue
+            if not getattr(provider, 'supports_batch', lambda: False)():
+                continue
+            try:
+                result = provider.translate_batch(
+                    lines, context=context, glossary=glossary,
+                    source_language=source_language, target_language=target_language,
+                    tone=tone, usage=usage,
+                    meta=meta,
+                )
+            except Exception as error:
+                logger.info('%s batch translation failed (%s), trying the next provider.', key, error)
+                if _looks_rate_limited(error):
+                    _park_engine(key)
+                last_error = error
+                continue
+            self._mode = modes[key]
+            if any(item is not None for item in result):
+                return result
+            last_error = RuntimeError(f'{key} returned no usable translations')
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError('No translation provider is available for batches')
 
     def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
         modes = {

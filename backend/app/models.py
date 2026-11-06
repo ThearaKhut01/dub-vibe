@@ -20,6 +20,7 @@ class ProjectRequest(BaseModel):
     name: str = Field(..., min_length=1)
     mode: Literal['EDIT', 'DUB'] = 'DUB'
     target_language: str = 'Khmer'
+    glossary: str = ''
 
 
 class ProjectSummary(BaseModel):
@@ -74,6 +75,8 @@ class ProcessingRequest(BaseModel):
     word_timestamps: bool = False
     # Translation engine: which provider goes first (the chain still falls back).
     translation_provider: str = 'auto'   # auto | qwen | nllb | argos | google | gemini | openai | codecraft
+    # Per-run glossary override ("王明=វ៉ាង មីង" lines). None = use the project's own.
+    glossary: str | None = None
     # Canvas design values from the preview: platform frame, background,
     # video transform and caption position/size. All normalised (never pixels).
     design: dict[str, Any] | None = None

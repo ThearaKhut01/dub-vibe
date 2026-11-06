@@ -48,6 +48,9 @@ _DEFAULT_SETTINGS = {
     'selected_whisper_model': os.environ.get('DUBVIBE_WHISPER_MODEL', 'base'),
     'device': 'auto',     # auto | cpu | cuda
     'compute': 'auto',    # auto | int8 | float16 | float32
+    # Text model used for translation (and the batch prompt). Editable in
+    # app-settings.json or through POST /api/models/settings.
+    'gemini_translation_model': os.environ.get('DUBVIBE_GEMINI_MODEL', 'gemini-2.5-flash'),
 }
 _SETTINGS_CACHE: dict | None = None
 
@@ -81,7 +84,7 @@ def save_settings(update: dict) -> dict:
     global _SETTINGS_CACHE
     with _STATE_LOCK:
         settings = load_settings()
-        for key in ('selected_whisper_model', 'device', 'compute'):
+        for key in ('selected_whisper_model', 'device', 'compute', 'gemini_translation_model'):
             if key in update and update[key]:
                 settings[key] = update[key]
         if 'custom_api' in update:

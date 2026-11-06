@@ -114,7 +114,7 @@ interface StudioState {
   setProviderKey: (provider: string, key: string) => Promise<void>;
   removeProviderKey: (provider: string) => Promise<void>;
   setCustomApi: (config: { base_url: string; model: string }) => Promise<void>;
-  testProvider: (provider: string) => Promise<{ models: string[]; translationModels: string[]; model?: string | null }>;
+  testProvider: (provider: string) => Promise<{ models: string[]; translationModels: string[]; model?: string | null; via?: string | null; sample?: string | null; poolError?: string | null }>;
   previewLine: (payload: { text: string; provider: string; voice?: string; model?: string; emotion: string; intensity: number; speed?: number; language: string }) => Promise<string>;
   refreshCharacters: () => Promise<void>;
   saveCharacters: (characters: Record<string, Record<string, unknown>>) => Promise<void>;
@@ -331,7 +331,9 @@ const connectProgressSocket = () => {
   progressSocket = socket;
   socket.onmessage = (event) => {
     try {
-      const message = JSON.parse(String(event.data)) as { project_id: string; stage: string; progress: number; message: string; engine?: string | null };
+      const message = JSON.parse(String(event.data)) as { project_id: string; stage: string; progress: number; message: string; engine?: string | null; type?: string };
+      // Live API frames ride the same socket; they are the Live tab's business.
+      if (message.type === 'api_event') return;
       useStudioStore.getState().appendLog(`[${message.stage}] ${message.message}`);
       const stepId = STAGE_TO_STEP[message.stage];
       useStudioStore.setState((state) => {
@@ -891,6 +893,9 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       models: payload.tts_models ?? [],
       translationModels: payload.translation_models ?? [],
       model: payload.model ?? null,
+      via: payload.via ?? null,
+      sample: payload.sample ?? null,
+      poolError: payload.pool_error ?? null,
     };
   },
   previewLine: async (payload) => {
@@ -1224,10 +1229,18 @@ export const useStudioStore = create<StudioState>((set, get) => ({
             color: index % 2 === 0 ? '#38bdf8' : '#a78bfa',
           }))
           : workflow === 'translate' && Array.isArray(payload.translation)
-            ? state.transcript.map((segment, index) => ({
-              ...segment,
-              translation: payload.translation[index]?.translation ?? segment.translation,
-            }))
+            // Match by segment id: the API returns only the translated lines, so
+            // an index-based zip shifts every later line when one is missing.
+            ? (() => {
+              const byId = new Map<string, string>();
+              for (const row of payload.translation as Array<{ id?: string; translation?: string }>) {
+                if (row?.id && row.translation) byId.set(String(row.id), row.translation);
+              }
+              return state.transcript.map((segment) => ({
+                ...segment,
+                translation: byId.get(String(segment.id)) ?? segment.translation,
+              }));
+            })()
             : state.transcript,
         dubAudioSegments: workflow === 'tts' && Array.isArray(payload.result?.segments)
           ? payload.result.segments.map((segment: any, index: number) => ({
