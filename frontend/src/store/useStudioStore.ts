@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { designPayload, useDesignStore } from './useDesignStore';
 import type {
   ApiPoolEntry,
   ApiPoolStatus,
@@ -138,7 +139,6 @@ interface StudioState {
     keepMusic: boolean;
     keepSfx: boolean;
     platformStyle: 'original' | 'vertical' | 'standard' | 'square';
-    platformFit: 'blur' | 'crop';
   }) => Promise<{ vtt: string | null; videoUrl: string | null; parts: Array<{ index: number; name: string }>; folder: string | null; files: string[] }>;
   clearProject: () => void;
   updateDubAudioSegments: (segments: TimelineSegment[]) => void;
@@ -1271,7 +1271,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
         keep_music: options.keepMusic,
         keep_sfx: options.keepSfx,
         platform_style: options.platformStyle,
-        platform_fit: options.platformFit,
+        // The preview and this export read the same normalised design values.
+        design: designPayload(useDesignStore.getState()),
       }),
     });
     if (!response.ok) {

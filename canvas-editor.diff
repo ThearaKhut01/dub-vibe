@@ -1,0 +1,2013 @@
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 636027e2..ebf4da19 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -58,7 +58,7 @@ from fastapi.responses import FileResponse, StreamingResponse
+ from urllib.parse import quote
+ 
+ from backend.app.chunking import SmartChunkEngine, format_timestamp, split_subtitle_cues
+-from backend.app import acting, api_keys, api_pool, cuda_pack, model_manager, online_providers, speaker_diarization, tts_service, voxcpm_local
++from backend.app import acting, api_keys, api_pool, cuda_pack, export_design, model_manager, online_providers, speaker_diarization, tts_service, voxcpm_local
+ from backend.app import segment_tts
+ from backend.app.models import ProjectRequest, ProjectSummary, ProviderSettings, ProcessingRequest, SegmentSplit, SegmentUpdate, WorkflowProgress
+ from backend.app.providers import (
+@@ -2467,14 +2467,24 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
+     return {'project_id': payload.project_id, 'status': 'ok', 'result': result}
+ 
+ 
+-def _apply_platform_style(ffmpeg: str, source: str, dest: str, target_w: int, target_h: int, fit: str) -> None:
++def _apply_platform_style(ffmpeg: str, source: str, dest: str, target_w: int, target_h: int, fit: str,
++                          design: export_design.Design | None = None,
++                          caption_file: Path | None = None) -> None:
+     """Convert a finished video to a platform aspect ratio.
+ 
+-    'blur' fills the target frame with a blurred, scaled copy of the video and
+-    centers the original on top (the TikTok/Shorts look). 'crop' center-crops
+-    to fill the frame. Video is re-encoded; audio is copied untouched.
++    Without a design: 'blur' fills the target frame with a blurred, scaled copy
++    and centres the original on top (the TikTok/Shorts look); 'crop' centre-crops
++    to fill. With a canvas design the frame is composed from the preview's own
++    normalised values (background, scale, offset, rotation, flips) and the caption
++    is burned onto the final frame, so the file matches what was on screen.
+     """
+-    if fit == 'crop':
++    if design is not None:
++        caption = escape_filter_path(caption_file) if caption_file else None
++        graph, label = export_design.frame_filter_graph(
++            design, target_w, target_h, caption_file=caption,
++        )
++        command = [ffmpeg, '-y', '-i', source, '-filter_complex', graph, '-map', label]
++    elif fit == 'crop':
+         vf = f'scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1'
+         command = [ffmpeg, '-y', '-i', source, '-vf', vf, '-map', '0:v:0']
+     else:
+@@ -2577,12 +2587,33 @@ async def process_export(payload: ProcessingRequest) -> dict[str, Any]:
+             # Platform style: target frame size for the export (9:16 vertical,
+             # 16:9 standard, 1:1 square). Skipped when the source already has
+             # the target aspect (within 3%).
+-            platform_target = {'vertical': (1080, 1920), 'standard': (1920, 1080), 'square': (1080, 1080)}.get(payload.platform_style)
++            design = export_design.normalize_design(payload.design)
++            # The canvas owns the frame: when it is present its platform select is
++            # the one the user sees, so it must be the one the file is made in.
++            platform_target = {'vertical': (1080, 1920), 'standard': (1920, 1080),
++                               'square': (1080, 1080)}.get(design.platform if design is not None else payload.platform_style)
++            # Canvas design: the preview's normalised values. When a design is
++            # present the export always renders the frame, so the caption lands
++            # on the final frame instead of being baked into the source first.
++            if design is not None and source_width and source_height:
++                target_size = platform_target or ((source_width // 2) * 2, (source_height // 2) * 2)
++            else:
++                target_size = platform_target
+             platform_skip = (
+-                not platform_target
++                not target_size
+                 or not source_width or not source_height
+-                or abs(source_width / source_height - platform_target[0] / platform_target[1]) / (platform_target[0] / platform_target[1]) < 0.03
++                or (
++                    design is None
++                    and abs(source_width / source_height - target_size[0] / target_size[1]) / (target_size[0] / target_size[1]) < 0.03
++                )
+             )
++            caption_ass_path: Path | None = None
++            if design is not None and payload.burn_subtitles and design.caption and target_size:
++                caption_ass_path = export_dir / 'dubbed-subtitles.ass'
++                caption_ass_path.write_text(
++                    export_design.caption_ass(export_segments, target_size[0], target_size[1], design),
++                    encoding='utf-8',
++                )
+             mode = payload.export_mode or 'single'
+             chunks = [chunk for chunk in (project.get('chunks') or []) if Path(str(chunk.get('path') or '')).is_file()]
+             want_combined = mode in ('single', 'both') or not chunks
+@@ -2725,7 +2756,7 @@ async def process_export(payload: ProcessingRequest) -> dict[str, Any]:
+                     '-filter_complex', ';'.join(filter_parts),
+                     '-map', '0:v:0', '-map', '[dubbed]',
+                 ])
+-                if payload.burn_subtitles:
++                if payload.burn_subtitles and caption_ass_path is None:
+                     srt_path = escape_filter_path(export_dir / 'dubbed-subtitles.srt')
+                     vf_parts = [f"subtitles='{srt_path}'"]
+                     if pad_seconds > 0.05:
+@@ -2744,11 +2775,12 @@ async def process_export(payload: ProcessingRequest) -> dict[str, Any]:
+                 project['video_path'] = str(video_path)
+                 if not platform_skip:
+                     styled = export_dir / 'styled-video.mp4'
+-                    _apply_platform_style(ffmpeg, str(video_path), str(styled), platform_target[0], platform_target[1], payload.platform_fit)
++                    _apply_platform_style(ffmpeg, str(video_path), str(styled), target_size[0], target_size[1],
++                                          payload.platform_fit, design=design, caption_file=caption_ass_path)
+                     video_path.unlink(missing_ok=True)
+                     styled.replace(video_path)
+                     await emit_progress(payload.project_id, 'Exporting', 94,
+-                                        f'Converted to {platform_target[0]}×{platform_target[1]} for the selected platform.')
++                                        f'Converted to {target_size[0]}×{target_size[1]} for the selected platform.')
+ 
+             if want_parts:
+                 # One dubbed MP4 per chunk, reusing the keyframe-aligned chunk
+@@ -2908,7 +2940,10 @@ async def process_export(payload: ProcessingRequest) -> dict[str, Any]:
+                         subprocess.run(part_command, check=True, capture_output=True, text=True)
+                     if not platform_skip and part_path.is_file():
+                         styled_part = part_path.with_name(f'styled-{part_path.name}')
+-                        _apply_platform_style(ffmpeg, str(part_path), str(styled_part), platform_target[0], platform_target[1], payload.platform_fit)
++                        # The caption is baked per part only in the combined export;
++                        # parts carry the same frame design without its ASS file.
++                        _apply_platform_style(ffmpeg, str(part_path), str(styled_part), target_size[0], target_size[1],
++                                              payload.platform_fit, design=design)
+                         styled_part.replace(part_path)
+                     parts_list.append({'index': chunk_index + 1, 'name': part_path.name})
+                 project['parts_dir'] = str(parts_dir)
+diff --git a/backend/app/models.py b/backend/app/models.py
+index 3f06e20d..00bd7987 100644
+--- a/backend/app/models.py
++++ b/backend/app/models.py
+@@ -1,6 +1,6 @@
+ from __future__ import annotations
+ 
+-from typing import Literal
++from typing import Any, Literal
+ 
+ from pydantic import BaseModel, Field
+ 
+@@ -74,6 +74,9 @@ class ProcessingRequest(BaseModel):
+     word_timestamps: bool = False
+     # Translation engine: which provider goes first (the chain still falls back).
+     translation_provider: str = 'auto'   # auto | qwen | nllb | argos | google | gemini | openai | codecraft
++    # Canvas design values from the preview: platform frame, background,
++    # video transform and caption position/size. All normalised (never pixels).
++    design: dict[str, Any] | None = None
+     # Platform style: convert the export to a platform aspect ratio.
+     # vertical = 9:16 (TikTok/Reels/Shorts), standard = 16:9 (YouTube/FB),
+     # square = 1:1 (Instagram/FB feed). 'blur' fills the frame with a blurred
+diff --git a/frontend/src/store/useStudioStore.ts b/frontend/src/store/useStudioStore.ts
+index 1642b708..5dc76309 100644
+--- a/frontend/src/store/useStudioStore.ts
++++ b/frontend/src/store/useStudioStore.ts
+@@ -1,4 +1,5 @@
+ import { create } from 'zustand';
++import { designPayload, useDesignStore } from './useDesignStore';
+ import type {
+   ApiPoolEntry,
+   ApiPoolStatus,
+@@ -138,7 +139,6 @@ interface StudioState {
+     keepMusic: boolean;
+     keepSfx: boolean;
+     platformStyle: 'original' | 'vertical' | 'standard' | 'square';
+-    platformFit: 'blur' | 'crop';
+   }) => Promise<{ vtt: string | null; videoUrl: string | null; parts: Array<{ index: number; name: string }>; folder: string | null; files: string[] }>;
+   clearProject: () => void;
+   updateDubAudioSegments: (segments: TimelineSegment[]) => void;
+@@ -1271,7 +1271,8 @@ export const useStudioStore = create<StudioState>((set, get) => ({
+         keep_music: options.keepMusic,
+         keep_sfx: options.keepSfx,
+         platform_style: options.platformStyle,
+-        platform_fit: options.platformFit,
++        // The preview and this export read the same normalised design values.
++        design: designPayload(useDesignStore.getState()),
+       }),
+     });
+     if (!response.ok) {
+diff --git a/backend/app/export_design.py b/backend/app/export_design.py
+new file mode 100644
+index 00000000..039914ce
+--- /dev/null
++++ b/backend/app/export_design.py
+@@ -0,0 +1,302 @@
++"""Platform frame design: the numbers the preview uses, applied by FFmpeg.
++
++The preview and the export must agree pixel for pixel, so both sides work from
++the same normalised values (see ``frontend/src/store/useDesignStore.ts``):
++
++- ``video.x`` / ``video.y``  centre offset, in frame widths/heights (-1..1)
++- ``video.size``             video width as a fraction of the frame width
++- ``video.rotation``         degrees
++- ``subtitle.x`` / ``y``     0..1 inside the frame
++- ``subtitle.size``          font size as a fraction of the frame height
++- ``background.blur``        0..50 at a 720 px-wide frame; scaled by width/720
++
++Everything here is a pure function so the filter graph can be tested without
++running FFmpeg.
++"""
++from __future__ import annotations
++
++import math
++import re
++from dataclasses import dataclass
++from typing import Any, Iterable
++
++# Target frames, identical to the preview's 9:16 / 16:9 / 1:1 boxes.
++PLATFORM_FRAMES: dict[str, tuple[int, int]] = {
++    'vertical': (1080, 1920),
++    'standard': (1920, 1080),
++    'square': (1080, 1080),
++}
++
++BACKGROUND_MODES = ('blur', 'color', 'gradient')
++_HEX = re.compile(r'^#?[0-9a-fA-F]{6}$')
++
++
++@dataclass(frozen=True)
++class Design:
++    platform: str = 'original'
++    background_mode: str = 'blur'
++    background_blur: float = 0.0
++    background_color: str = '#0b1220'
++    background_from: str = '#1e293b'
++    background_to: str = '#0ea5e9'
++    x: float = 0.0
++    y: float = 0.0
++    size: float = 1.0
++    rotation: float = 0.0
++    flip_h: bool = False
++    flip_v: bool = False
++    caption: bool = True
++    caption_x: float = 0.5
++    caption_y: float = 0.88
++    caption_size: float = 0.06
++    # 0 = the whole line in one cue; 1–12 = advance through the line in cues of
++    # at most that many words.
++    caption_words: int = 0
++    # A blurred rectangle over the frame, hiding subtitles or logos that are
++    # burned into the source video.
++    blur_enabled: bool = False
++    blur_x: float = 0.05
++    blur_y: float = 0.78
++    blur_w: float = 0.9
++    blur_h: float = 0.14
++    blur_strength: float = 20.0
++
++    @property
++    def has_transform(self) -> bool:
++        """True when the video itself is moved, scaled, rotated or flipped."""
++        return (
++            abs(self.size - 1.0) > 0.001
++            or abs(self.x) > 0.001
++            or abs(self.y) > 0.001
++            or abs(self.rotation) > 0.01
++            or self.flip_h
++            or self.flip_v
++        )
++
++
++def _number(value: Any, default: float) -> float:
++    try:
++        number = float(value)
++    except (TypeError, ValueError):
++        return default
++    return number if math.isfinite(number) else default
++
++
++def _clamp(value: float, low: float, high: float) -> float:
++    return max(low, min(high, value))
++
++
++def _colour(value: Any, default: str) -> str:
++    text = str(value or '').strip()
++    return text if _HEX.match(text) else default
++
++
++def _flag(value: Any) -> bool:
++    if isinstance(value, str):
++        return value.strip().lower() in ('1', 'true', 'yes', 'on')
++    return bool(value)
++
++
++def normalize_design(payload: Any) -> Design | None:
++    """Validate the browser's design payload; None when there is nothing to do."""
++    if not isinstance(payload, dict):
++        return None
++    platform = str(payload.get('platform') or 'original').strip().lower()
++    if platform not in ('original', *PLATFORM_FRAMES):
++        platform = 'original'
++
++    background = payload.get('background') if isinstance(payload.get('background'), dict) else {}
++    mode = str(background.get('mode') or 'blur').strip().lower()
++    if mode not in BACKGROUND_MODES:
++        mode = 'blur'
++
++    video = payload.get('video') if isinstance(payload.get('video'), dict) else {}
++    subtitle = payload.get('subtitle') if isinstance(payload.get('subtitle'), dict) else {}
++    blur = payload.get('blur_box') if isinstance(payload.get('blur_box'), dict) else {}
++
++    return Design(
++        platform=platform,
++        background_mode=mode,
++        background_blur=_clamp(_number(background.get('blur'), 0.0), 0.0, 50.0),
++        background_color=_colour(background.get('color'), '#0b1220'),
++        background_from=_colour(background.get('from'), '#1e293b'),
++        background_to=_colour(background.get('to'), '#0ea5e9'),
++        x=_clamp(_number(video.get('x'), 0.0), -1.0, 1.0),
++        y=_clamp(_number(video.get('y'), 0.0), -1.0, 1.0),
++        size=_clamp(_number(video.get('size'), 1.0), 0.05, 1.0),
++        rotation=_clamp(_number(video.get('rotation'), 0.0), -180.0, 180.0),
++        flip_h=_flag(video.get('flipH')),
++        flip_v=_flag(video.get('flipV')),
++        caption=_flag(subtitle.get('enabled', True)),
++        caption_x=_clamp(_number(subtitle.get('x'), 0.5), 0.0, 1.0),
++        caption_y=_clamp(_number(subtitle.get('y'), 0.88), 0.0, 1.0),
++        caption_size=_clamp(_number(subtitle.get('size'), 0.06), 0.02, 0.2),
++        caption_words=int(_clamp(_number(subtitle.get('wordsPerLine'), 0), 0, 12)),
++        blur_enabled=_flag(blur.get('enabled')),
++        blur_x=_clamp(_number(blur.get('x'), 0.05), 0.0, 0.98),
++        blur_y=_clamp(_number(blur.get('y'), 0.78), 0.0, 0.98),
++        blur_w=_clamp(_number(blur.get('w'), 0.9), 0.02, 1.0),
++        blur_h=_clamp(_number(blur.get('h'), 0.14), 0.02, 1.0),
++        blur_strength=_clamp(_number(blur.get('strength'), 20.0), 0.0, 50.0),
++    )
++
++
++def _even(value: float) -> int:
++    """Round to the nearest even pixel; libx264 rejects odd dimensions."""
++    number = max(2, int(round(value)))
++    return number if number % 2 == 0 else number - 1
++
++
++def frame_filter_graph(design: Design, width: int, height: int, *,
++                       caption_file: str | None = None) -> tuple[str, str]:
++    """Filter graph turning ``[0:v]`` into the designed frame at width×height.
++
++    Returns (filter_complex, output_label). The graph ends with the caption burn
++    when ``caption_file`` is given, so subtitles are placed on the final frame in
++    its own coordinates instead of being baked into the source first.
++    """
++    foreground_width = _even(design.size * width)
++    chains: list[str] = []
++
++    if design.background_mode == 'blur':
++        # The bars are the clip itself, blurred and cropped to fill.
++        radius = int(round(design.background_blur * width / 720.0))
++        blur = f',boxblur=luma_radius={radius}:luma_power=2' if radius > 0 else ''
++        chains.append('[0:v]split=2[bg][fg]')
++        chains.append(
++            f'[bg]scale={width}:{height}:force_original_aspect_ratio=increase,'
++            f'crop={width}:{height}{blur}[bgd]'
++        )
++    elif design.background_mode == 'color':
++        chains.append('[0:v]null[fg]')
++        chains.append(f'color=c=0x{design.background_color.lstrip("#")}:s={width}x{height}[bgd]')
++    else:
++        chains.append('[0:v]null[fg]')
++        chains.append(
++            f'gradients=s={width}x{height}:c0=0x{design.background_from.lstrip("#")}:'
++            f'c1=0x{design.background_to.lstrip("#")}:x0=0:y0=0:x1={width}:y1={height}[bgd]'
++        )
++
++    foreground = [f'scale={foreground_width}:-2']
++    if design.flip_h:
++        foreground.append('hflip')
++    if design.flip_v:
++        foreground.append('vflip')
++    if abs(design.rotation) > 0.01:
++        radians = math.radians(design.rotation)
++        foreground.append(
++            f'rotate={radians:.6f}:c=none:ow=rotw({radians:.6f}):oh=roth({radians:.6f})'
++        )
++    chains.append(f'[fg]{",".join(foreground)}[fgs]')
++
++    # Same mapping as the preview: half a frame width per unit of x.
++    offset_x = int(round(design.x * width * 0.5))
++    offset_y = int(round(design.y * height * 0.5))
++    chains.append(
++        f'[bgd][fgs]overlay=x=(W-w)/2+{offset_x}:y=(H-h)/2+{offset_y}:shortest=1,'
++        f'setsar=1[vframe]'
++    )
++
++    final = '[vframe]'
++    # Blur box: crop the region, blur it and lay it back over the same spot. It
++    # goes after the video is placed (so it covers the source's own subtitles)
++    # and before the caption (so our text stays sharp).
++    if design.blur_enabled and design.blur_strength > 0:
++        box_x = int(round(_clamp(design.blur_x, 0.0, 1.0) * width))
++        box_y = int(round(_clamp(design.blur_y, 0.0, 1.0) * height))
++        box_w = max(2, int(round(_clamp(design.blur_w, 0.0, 1.0) * width)))
++        box_h = max(2, int(round(_clamp(design.blur_h, 0.0, 1.0) * height)))
++        box_w = min(box_w, width - box_x) if box_x < width else width
++        box_h = min(box_h, height - box_y) if box_y < height else height
++        radius = int(round(design.blur_strength * width / 720.0))
++        if radius > 0 and box_w >= 2 and box_h >= 2:
++            chains.append(f'{final}split=2[bmain][bpatch]')
++            chains.append(
++                f'[bpatch]crop={box_w}:{box_h}:{box_x}:{box_y},'
++                f'boxblur=luma_radius={radius}:luma_power=2[bblur]'
++            )
++            chains.append(f'[bmain][bblur]overlay={box_x}:{box_y}[vbox]')
++            final = '[vbox]'
++
++    chains.append(
++        f'{final}format=yuv420p'
++        + (f",subtitles='{caption_file}'" if caption_file else '')
++        + '[v]'
++    )
++    return ';'.join(chains), '[v]'
++
++
++def _ass_time(seconds: float) -> str:
++    total = max(0.0, float(seconds or 0.0))
++    hours = int(total // 3600)
++    minutes = int((total - hours * 3600) // 60)
++    secs = total - hours * 3600 - minutes * 60
++    return f'{hours}:{minutes:02d}:{secs:05.2f}'
++
++
++def _ass_text(value: Any) -> str:
++    text = str(value or '').strip()
++    text = text.replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}')
++    return text.replace('\r\n', ' ').replace('\n', ' ').replace('\r', ' ') or ' '
++
++
++def _split_cue_words(text: str, words: int) -> list[str]:
++    """The cue's text cut into pieces of at most `words` words (0 = one piece)."""
++    body = str(text or '').strip()
++    if not body:
++        return []
++    if words <= 0:
++        return [body]
++    parts = body.split()
++    return [' '.join(parts[index:index + words]) for index in range(0, len(parts), words)]
++
++
++def caption_ass(segments: Iterable[dict[str, Any]], width: int, height: int,
++                design: Design) -> str:
++    """An ASS subtitle file placed exactly where the preview draws the caption.
++
++    PlayRes is the final frame, so ``\\pos`` and the font size are the same
++    normalised numbers the preview uses — no per-platform recolouring.
++    """
++    font_size = max(8, int(round(design.caption_size * height)))
++    pos_x = int(round(design.caption_x * width))
++    pos_y = int(round(design.caption_y * height))
++    outline = max(1, int(round(height / 360)))
++
++    lines = [
++        '[Script Info]',
++        'ScriptType: v4.00+',
++        f'PlayResX: {width}',
++        f'PlayResY: {height}',
++        'WrapStyle: 2',
++        'ScaledBorderAndShadow: yes',
++        '',
++        '[V4+ Styles]',
++        'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, '
++        'BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, '
++        'BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
++        f'Style: Default,Arial,{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,'
++        f'1,0,0,0,100,100,0,0,1,{outline},0,5,0,0,0,1',
++        '',
++        '[Events]',
++        'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
++    ]
++    for segment in segments:
++        text = segment.get('text') or segment.get('translation') or ''
++        if not str(text).strip():
++            continue
++        start = float(segment.get('start') or 0)
++        end = float(segment.get('end') or 0)
++        chunks = _split_cue_words(text, design.caption_words)
++        if not chunks:
++            continue
++        # One dialogue per word chunk, spread evenly over the cue's time, so the
++        # caption advances through the line while it plays — the same timing the
++        # preview uses (chunk index = elapsed / duration * chunk count).
++        span = max(0.01, end - start) / len(chunks)
++        for index, chunk in enumerate(chunks):
++            lines.append(
++                f'Dialogue: 0,{_ass_time(start + index * span)},{_ass_time(start + (index + 1) * span)},'
++                f'Default,,0,0,0,,{{\\pos({pos_x},{pos_y})}}{_ass_text(chunk)}'
++            )
++    return '\n'.join(lines) + '\n'
+diff --git a/backend/tests/test_export_design.py b/backend/tests/test_export_design.py
+new file mode 100644
+index 00000000..5a029829
+--- /dev/null
++++ b/backend/tests/test_export_design.py
+@@ -0,0 +1,186 @@
++"""The export half of the canvas editor.
++
++The preview and FFmpeg consume the same normalised numbers, so these tests pin
++the translation: what the graph looks like, where the caption lands, and — in
++the last test — that the graph actually runs in FFmpeg at the platform size.
++"""
++from __future__ import annotations
++
++import json
++import shutil
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from backend.app import export_design, main
++from backend.app.export_design import Design, caption_ass, frame_filter_graph, normalize_design
++
++
++def design(*, platform: str = 'vertical', background: dict | None = None,
++           video: dict | None = None, subtitle: dict | None = None,
++           blur_box: dict | None = None) -> Design:
++    payload = {
++        'platform': platform,
++        'background': {
++            'mode': 'blur', 'blur': 20, 'color': '#112233', 'from': '#000000', 'to': '#ffffff',
++            **(background or {}),
++        },
++        'video': {'x': 0, 'y': 0, 'size': 1, 'rotation': 0, 'flipH': False, 'flipV': False, **(video or {})},
++        'subtitle': {'enabled': True, 'x': 0.5, 'y': 0.88, 'size': 0.06, **(subtitle or {})},
++        'blur_box': {
++            'enabled': False, 'x': 0.05, 'y': 0.78, 'w': 0.9, 'h': 0.14, 'strength': 20,
++            **(blur_box or {}),
++        },
++    }
++    parsed = normalize_design(payload)
++    assert parsed is not None
++    return parsed
++
++
++def test_normalize_design_clamps_and_defaults():
++    parsed = normalize_design({'platform': 'nope', 'video': {'size': 9, 'x': -4}, 'subtitle': {'y': 2}})
++    assert parsed is not None
++    assert parsed.platform == 'original'
++    assert parsed.size == 1.0          # clamped from 9
++    assert parsed.x == -1.0            # clamped from -4
++    assert parsed.caption_y == 1.0     # clamped from 2
++    assert normalize_design(None) is None
++    assert normalize_design('nonsense') is None
++
++
++def test_blur_frame_splits_scales_and_blurs_by_width():
++    graph, label = frame_filter_graph(design(video={'size': 0.8}), 1080, 1920)
++    assert label == '[v]'
++    assert graph.startswith('[0:v]split=2[bg][fg]')
++    # 20 at a 1080-wide frame is 30 px of luma radius (the slider is calibrated at 720).
++    assert 'boxblur=luma_radius=30:luma_power=2' in graph
++    assert 'scale=864:-2' in graph      # 0.8 * 1080
++    assert 'overlay=x=(W-w)/2+0:y=(H-h)/2+0' in graph
++    assert 'setsar=1[vframe]' in graph
++    assert graph.endswith('[vframe]format=yuv420p[v]')
++
++
++def test_offset_is_half_a_frame_per_unit():
++    graph, _ = frame_filter_graph(design(video={'x': 0.5, 'y': -0.5}), 1080, 1920)
++    assert 'x=(W-w)/2+270' in graph     # 0.5 * 1080 * 0.5
++    assert 'y=(H-h)/2+-480' in graph    # -0.5 * 1920 * 0.5
++
++
++def test_colour_and_gradient_backgrounds_replace_the_blurred_copy():
++    colour, _ = frame_filter_graph(design(background={'mode': 'color', 'color': '#112233'}), 1080, 1920)
++    assert 'color=c=0x112233:s=1080x1920[bgd]' in colour
++    assert 'split=2' not in colour
++
++    gradient, _ = frame_filter_graph(
++        design(background={'mode': 'gradient', 'from': '#010203', 'to': '#aabbcc'}), 1080, 1920,
++    )
++    assert 'gradients=s=1080x1920:c0=0x010203:c1=0xaabbcc' in gradient
++
++
++def test_flip_happens_before_rotation():
++    graph, _ = frame_filter_graph(design(video={'flipH': True, 'rotation': 30, 'size': 1}), 1080, 1920)
++    chain = graph.split('[fg]', 1)[1].split('[fgs]', 1)[0]
++    assert chain.index('hflip') < chain.index('rotate=')
++
++
++def test_blur_box_crops_blurs_and_lays_the_patch_back():
++    graph, _ = frame_filter_graph(
++        design(blur_box={'enabled': True, 'x': 0.1, 'y': 0.7, 'w': 0.8, 'h': 0.2, 'strength': 20}),
++        1080, 1920,
++    )
++    # 0.1*1080, 0.7*1920, 0.8*1080, 0.2*1920 and a 30 px radius at this width.
++    assert '[bpatch]crop=864:384:108:1344,boxblur=luma_radius=30:luma_power=2[bblur]' in graph
++    assert '[bmain][bblur]overlay=108:1344[vbox]' in graph
++    # The patch goes on after the frame is composed, before the caption.
++    assert graph.index('[vbox]format=yuv420p') > graph.index('overlay=108:1344')
++
++
++def test_blur_box_is_skipped_when_disabled_or_strength_is_zero():
++    off = frame_filter_graph(design(blur_box={'enabled': False}), 1080, 1920)[0]
++    assert 'bpatch' not in off
++    zero = frame_filter_graph(design(blur_box={'enabled': True, 'strength': 0}), 1080, 1920)[0]
++    assert 'bpatch' not in zero
++
++
++def test_caption_is_burned_last_so_it_stays_on_the_final_frame():
++    graph, _ = frame_filter_graph(design(), 1080, 1920, caption_file='C\\:/tmp/a.ass')
++    assert graph.endswith("format=yuv420p,subtitles='C\\:/tmp/a.ass'[v]")
++
++
++def test_caption_ass_uses_the_same_normalised_position():
++    ass = caption_ass(
++        [{'start': 1.0, 'end': 2.5, 'text': 'Hello {world}'}],
++        1080, 1920, design(subtitle={'x': 0.5, 'y': 0.25, 'size': 0.1}),
++    )
++    assert 'PlayResX: 1080' in ass and 'PlayResY: 1920' in ass
++    assert 'Style: Default,Arial,192,' in ass            # 0.1 * 1920
++    assert '{\\pos(540,480)}Hello \\{world\\}' in ass     # 0.5 * 1080, 0.25 * 1920
++    assert 'Dialogue: 0,0:00:01.00,0:00:02.50,Default' in ass
++
++
++def test_caption_splits_a_line_into_timed_cues():
++    ass = caption_ass(
++        [{'start': 0, 'end': 3, 'text': 'one two three four five six'}],
++        1080, 1920, design(subtitle={'wordsPerLine': 3}),
++    )
++    dialogues = [line for line in ass.splitlines() if line.startswith('Dialogue:')]
++    assert len(dialogues) == 2
++    assert dialogues[0].startswith('Dialogue: 0,0:00:00.00,0:00:01.50,') and 'one two three' in dialogues[0]
++    assert dialogues[1].startswith('Dialogue: 0,0:00:01.50,0:00:03.00,') and 'four five six' in dialogues[1]
++
++
++def test_caption_stays_one_cue_when_the_split_is_off():
++    ass = caption_ass(
++        [{'start': 0, 'end': 3, 'text': 'one two three four'}],
++        1080, 1920, design(),
++    )
++    dialogues = [line for line in ass.splitlines() if line.startswith('Dialogue:')]
++    assert len(dialogues) == 1
++    assert 'one two three four' in dialogues[0]
++    assert '\\N' not in dialogues[0]
++
++
++def test_request_model_accepts_a_design():
++    from backend.app.models import ProcessingRequest
++
++    payload = ProcessingRequest(project_id='p', design={'platform': 'vertical', 'video': {'size': 0.5}})
++    assert payload.design is not None
++    assert ProcessingRequest(project_id='p').design is None
++
++
++FFMPEG = shutil.which('ffmpeg')
++
++
++@pytest.mark.skipif(FFMPEG is None, reason='ffmpeg is not installed')
++def test_frame_graph_runs_in_ffmpeg(tmp_path: Path):
++    """The graph must actually parse and produce the platform frame."""
++    source = tmp_path / 'src.mp4'
++    subprocess.run(
++        [FFMPEG, '-y', '-f', 'lavfi', '-i', 'testsrc=size=640x360:rate=15:duration=1',
++         '-pix_fmt', 'yuv420p', str(source)],
++        check=True, capture_output=True,
++    )
++    caption = tmp_path / 'c.ass'
++    caption.write_text(
++        caption_ass([{'start': 0, 'end': 1, 'text': 'ok'}], 1080, 1920,
++                    design(subtitle={'x': 0.5, 'y': 0.8, 'size': 0.08})),
++        encoding='utf-8',
++    )
++    out = tmp_path / 'out.mp4'
++    main._apply_platform_style(
++        FFMPEG, str(source), str(out), 1080, 1920, 'blur',
++        design=design(
++            video={'size': 0.7, 'rotation': 12, 'flipH': True, 'x': 0.1, 'y': -0.05},
++            blur_box={'enabled': True, 'x': 0.1, 'y': 0.6, 'w': 0.8, 'h': 0.2, 'strength': 15},
++        ),
++        caption_file=caption,
++    )
++    assert out.is_file() and out.stat().st_size > 1000
++    probe = subprocess.run(
++        [shutil.which('ffprobe') or 'ffprobe', '-v', 'error', '-select_streams', 'v:0',
++         '-show_entries', 'stream=width,height', '-of', 'json', str(out)],
++        check=True, capture_output=True, text=True,
++    )
++    stream = json.loads(probe.stdout)['streams'][0]
++    assert (stream['width'], stream['height']) == (1080, 1920)
+diff --git a/frontend/src/store/useDesignStore.ts b/frontend/src/store/useDesignStore.ts
+new file mode 100644
+index 00000000..df2249f8
+--- /dev/null
++++ b/frontend/src/store/useDesignStore.ts
+@@ -0,0 +1,226 @@
++import { create } from 'zustand';
++import { persist } from 'zustand/middleware';
++
++/**
++ * Canvas/design state for the preview and, through it, the export.
++ *
++ * Every geometry value is normalised so the preview and FFmpeg can use the same
++ * numbers without knowing each other's pixels:
++ *
++ * - `video.x` / `video.y` — the video's centre as an offset from the frame centre,
++ *   in frame widths/heights (-1 = left/top edge, 0 = centred, 1 = right/bottom).
++ * - `video.size` — the video's width as a fraction of the frame width.
++ * - `subtitle.x` / `subtitle.y` — 0..1 across/inside the frame.
++ * - `subtitle.size` — font size as a fraction of the frame height.
++ * - `background.blur` — the slider's 0..50 intensity (a radius, not a layout size).
++ * - `video.rotation` — degrees, because an angle has no pixel or frame unit.
++ */
++
++export type DesignPlatform = 'original' | 'vertical' | 'standard' | 'square';
++export type BackgroundMode = 'blur' | 'color' | 'gradient';
++
++export interface DesignPlatformInfo {
++  label: string;
++  hint: string;
++  /** null = follow the source video's own shape. */
++  ratio: number | null;
++}
++
++export const DESIGN_PLATFORMS: Record<DesignPlatform, DesignPlatformInfo> = {
++  original: { label: 'Original', hint: 'The video’s own aspect ratio', ratio: null },
++  vertical: { label: '9:16', hint: 'TikTok, Reels, Shorts', ratio: 9 / 16 },
++  standard: { label: '16:9', hint: 'YouTube, Facebook', ratio: 16 / 9 },
++  square: { label: '1:1', hint: 'Instagram feed', ratio: 1 },
++};
++
++export const BACKGROUND_MODES: Record<BackgroundMode, string> = {
++  blur: 'Blur',
++  color: 'Colour',
++  gradient: 'Gradient',
++};
++
++const clamp = (value: number, min: number, max: number): number =>
++  Math.max(min, Math.min(max, Number.isFinite(value) ? value : min));
++
++const clamp01 = (value: number): number => clamp(value, 0, 1);
++
++interface DesignState {
++  platform: DesignPlatform;
++  /** Show handles, snap guides and the subtitle box. */
++  editing: boolean;
++  background: {
++    mode: BackgroundMode;
++    /** 0–50, the slider's own unit. */
++    blur: number;
++    color: string;
++    from: string;
++    to: string;
++  };
++  video: {
++    x: number;
++    y: number;
++    size: number;
++    rotation: number;
++    flipH: boolean;
++    flipV: boolean;
++  };
++  subtitle: {
++    enabled: boolean;
++    x: number;
++    y: number;
++    size: number;
++    /** 0 = keep each cue on one line; 1–12 = wrap the text after that many words. */
++    wordsPerLine: number;
++  };
++  /**
++   * A blurred rectangle over the frame, for hiding subtitles or logos that are
++   * burned into the source video. Same normalised space as the caption.
++   */
++  blurBox: {
++    enabled: boolean;
++    x: number;
++    y: number;
++    w: number;
++    h: number;
++    /** 0–50, the same scale as the background blur. */
++    strength: number;
++  };
++  safeZone: boolean;
++
++  setPlatform: (platform: DesignPlatform) => void;
++  setEditing: (editing: boolean) => void;
++  setBackground: (update: Partial<DesignState['background']>) => void;
++  setVideo: (update: Partial<DesignState['video']>) => void;
++  setSubtitle: (update: Partial<DesignState['subtitle']>) => void;
++  setBlurBox: (update: Partial<DesignState['blurBox']>) => void;
++  toggleSafeZone: () => void;
++  reset: () => void;
++}
++
++const DEFAULT_VIDEO = { x: 0, y: 0, size: 1, rotation: 0, flipH: false, flipV: false };
++const DEFAULT_SUBTITLE = { enabled: true, x: 0.5, y: 0.88, size: 0.06, wordsPerLine: 0 };
++// Sits over the letterbox bar where burned-in subtitles usually are; wide and
++// short, so it reads as a strip rather than a blank rectangle.
++const DEFAULT_BLUR_BOX = { enabled: false, x: 0.05, y: 0.7, w: 0.9, h: 0.12, strength: 20 };
++const DEFAULT_BACKGROUND = {
++  mode: 'blur' as BackgroundMode,
++  blur: 20,
++  color: '#0b1220',
++  from: '#1e293b',
++  to: '#0ea5e9',
++};
++
++export const useDesignStore = create<DesignState>()(
++  persist(
++    (set) => ({
++      platform: 'original',
++      editing: true,
++      background: { ...DEFAULT_BACKGROUND },
++      video: { ...DEFAULT_VIDEO },
++      subtitle: { ...DEFAULT_SUBTITLE },
++      blurBox: { ...DEFAULT_BLUR_BOX },
++      safeZone: false,
++
++      setPlatform: (platform) => set({ platform }),
++      setEditing: (editing) => set({ editing }),
++      setBackground: (update) => set((state) => ({
++        background: {
++          ...state.background,
++          ...update,
++          ...(update.blur !== undefined ? { blur: clamp(update.blur, 0, 50) } : {}),
++        },
++      })),
++      setVideo: (update) => set((state) => ({
++        video: {
++          ...state.video,
++          ...update,
++          ...(update.x !== undefined ? { x: clamp(update.x, -1, 1) } : {}),
++          ...(update.y !== undefined ? { y: clamp(update.y, -1, 1) } : {}),
++          ...(update.size !== undefined ? { size: clamp(update.size, 0.05, 1) } : {}),
++          ...(update.rotation !== undefined ? { rotation: clamp(update.rotation, -180, 180) } : {}),
++        },
++      })),
++      setSubtitle: (update) => set((state) => ({
++        subtitle: {
++          ...state.subtitle,
++          ...update,
++          ...(update.x !== undefined ? { x: clamp01(update.x) } : {}),
++          ...(update.y !== undefined ? { y: clamp01(update.y) } : {}),
++          ...(update.size !== undefined ? { size: clamp(update.size, 0.02, 0.2) } : {}),
++          ...(update.wordsPerLine !== undefined
++            ? { wordsPerLine: Math.round(clamp(update.wordsPerLine, 0, 12)) }
++            : {}),
++        },
++      })),
++      setBlurBox: (update) => set((state) => {
++        const merged = { ...state.blurBox, ...update };
++        const strength = clamp(merged.strength, 0, 50);
++        // Keep the rectangle inside the frame while it is dragged or resized.
++        const x = clamp(merged.x, 0, 0.98);
++        const y = clamp(merged.y, 0, 0.98);
++        const w = clamp(merged.w, 0.02, 1 - x);
++        const h = clamp(merged.h, 0.02, 1 - y);
++        return { blurBox: { ...merged, x, y, w, h, strength } };
++      }),
++      toggleSafeZone: () => set((state) => ({ safeZone: !state.safeZone })),
++      // Layout only: the platform and the blur keep their settings, because those
++      // describe the output, not where the video sits inside it.
++      reset: () => set({
++        video: { ...DEFAULT_VIDEO },
++        subtitle: { ...DEFAULT_SUBTITLE },
++        blurBox: { ...DEFAULT_BLUR_BOX },
++      }),
++    }),
++    {
++      name: 'dubvibe-design',
++      version: 1,
++      partialize: (state) => ({
++        platform: state.platform,
++        editing: state.editing,
++        background: state.background,
++        video: state.video,
++        subtitle: state.subtitle,
++        blurBox: state.blurBox,
++        safeZone: state.safeZone,
++      }),
++    },
++  ),
++);
++
++/** Cut a line into cues of at most `words` words (0 = the whole line). */
++export function splitCueWords(text: string, words: number): string[] {
++  const body = String(text ?? '').trim();
++  if (!body) return [];
++  if (words <= 0) return [body];
++  const parts = body.split(/\s+/);
++  const chunks: string[] = [];
++  for (let index = 0; index < parts.length; index += words) {
++    chunks.push(parts.slice(index, index + words).join(' '));
++  }
++  return chunks;
++}
++
++/**
++ * The cue that should be on screen at `time`, given the line's own window.
++ * Cues are spread evenly over the line, so the text advances while it plays and
++ * the last word still lands before the line ends.
++ */
++export function captionAtTime(text: string, words: number, time: number, start: number, end: number): string {
++  const chunks = splitCueWords(text, words);
++  if (chunks.length <= 1) return chunks[0] ?? '';
++  const duration = Math.max(0.001, end - start);
++  const ratio = Math.min(0.999, Math.max(0, (time - start) / duration));
++  return chunks[Math.min(chunks.length - 1, Math.floor(ratio * chunks.length))];
++}
++
++/** The payload sent to the backend export, with the same normalised numbers. */
++export function designPayload(state: DesignState): Record<string, unknown> {
++  return {
++    platform: state.platform,
++    background: { ...state.background },
++    video: { ...state.video },
++    subtitle: { ...state.subtitle },
++    blur_box: { ...state.blurBox },
++    safe_zone: state.safeZone,
++  };
++}
+diff --git a/frontend/src/components/PreviewCanvas.tsx b/frontend/src/components/PreviewCanvas.tsx
+new file mode 100644
+index 00000000..c92b0606
+--- /dev/null
++++ b/frontend/src/components/PreviewCanvas.tsx
+@@ -0,0 +1,478 @@
++import { useEffect, useRef, useState } from 'react';
++import type React from 'react';
++import { DESIGN_PLATFORMS, useDesignStore } from '../store/useDesignStore';
++
++interface PreviewCanvasProps {
++  /** The media the canvas shows (empty string = placeholder). */
++  src: string;
++  /** The element the rest of the app (timeline, sync, seek) keeps using. */
++  videoRef: React.RefObject<HTMLVideoElement>;
++  onLoadedMetadata?: (event: React.SyntheticEvent<HTMLVideoElement>) => void;
++  onTimeUpdate?: (event: React.SyntheticEvent<HTMLVideoElement>) => void;
++  onPlay?: () => void;
++  onPause?: () => void;
++  /** Current subtitle line, drawn where the export will draw it. */
++  subtitleText?: string;
++  /** Rendered when `src` is empty. */
++  empty?: React.ReactNode;
++}
++
++const SNAP_PX = 8;
++/** The blur slider is calibrated at a 720 px-wide frame; both the preview and
++ * the export scale it by width / 720 so the bars look the same at any size. */
++const BLUR_REFERENCE_WIDTH = 720;
++
++function capture(event: React.PointerEvent<HTMLElement>): void {
++  try {
++    event.currentTarget.setPointerCapture?.(event.pointerId);
++  } catch {
++    // A synthetic or already-released pointer cannot be captured; the drag still
++    // works while the pointer stays over the element.
++  }
++}
++
++/**
++ * The editing surface: one platform frame (9:16, 16:9, 1:1 or the source's own
++ * shape) with the video, its background, the caption and the guide overlays.
++ *
++ * It is deliberately a DOM/CSS compositor rather than a `<canvas>`: the app
++ * already plays a real `<video>` here (timeline seeking, synced playback, the
++ * dubbed export), and CSS transforms let the preview and the FFmpeg filter graph
++ * consume the same normalised numbers. Nothing is measured into the store — the
++ * frame is the only thing that knows about pixels.
++ */
++export function PreviewCanvas({
++  src,
++  videoRef,
++  onLoadedMetadata,
++  onTimeUpdate,
++  onPlay,
++  onPause,
++  subtitleText,
++  empty,
++}: PreviewCanvasProps) {
++  const { platform, editing, background, video, subtitle, blurBox, safeZone, setVideo, setBlurBox } = useDesignStore();
++  const containerRef = useRef<HTMLDivElement>(null);
++  const backgroundRef = useRef<HTMLVideoElement>(null);
++
++  const [box, setBox] = useState<{ width: number; height: number } | null>(null);
++  const [sourceRatio, setSourceRatio] = useState(16 / 9);
++  const [guides, setGuides] = useState<{ x: boolean; y: boolean }>({ x: false, y: false });
++
++  const platformRatio = DESIGN_PLATFORMS[platform].ratio ?? sourceRatio;
++
++  // Largest frame of this ratio that fits the card — the same "no black bars"
++  // rule the preview had before, now driven by the platform.
++  useEffect(() => {
++    const element = containerRef.current;
++    if (!element) return;
++    const measure = () => {
++      const width = element.clientWidth;
++      const height = element.clientHeight;
++      if (!width || !height) return;
++      const fitWidth = Math.min(width, height * platformRatio);
++      setBox({ width: Math.floor(fitWidth), height: Math.floor(fitWidth / platformRatio) });
++    };
++    measure();
++    const observer = new ResizeObserver(measure);
++    observer.observe(element);
++    return () => observer.disconnect();
++  }, [platformRatio]);
++
++  // The background is the same clip, blurred, muted and kept in step with the
++  // main video so the bars never show a frozen or drifting picture.
++  const syncBackground = (time: number) => {
++    const element = backgroundRef.current;
++    if (!element) return;
++    if (Math.abs(element.currentTime - time) > 0.35) element.currentTime = time;
++  };
++
++  useEffect(() => {
++    const element = backgroundRef.current;
++    if (!element || !src) return;
++    element.load();
++  }, [src]);
++
++  const dragRef = useRef<{ startX: number; startY: number; x: number; y: number } | null>(null);
++
++  const onVideoPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
++    if (!editing || !box) return;
++    event.preventDefault();
++    event.stopPropagation();
++    capture(event);
++    dragRef.current = { startX: event.clientX, startY: event.clientY, x: video.x, y: video.y };
++  };
++
++  const onVideoPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
++    const start = dragRef.current;
++    if (!start || !box) return;
++    const nextX = start.x + (event.clientX - start.startX) / (box.width * 0.5);
++    const nextY = start.y + (event.clientY - start.startY) / (box.height * 0.5);
++    const snapX = Math.abs(nextX) < SNAP_PX / (box.width * 0.5) ? 0 : nextX;
++    const snapY = Math.abs(nextY) < SNAP_PX / (box.height * 0.5) ? 0 : nextY;
++    setGuides({ x: snapX === 0 && nextX !== start.x, y: snapY === 0 && nextY !== start.y });
++    setVideo({ x: snapX, y: snapY });
++  };
++
++  const endVideoDrag = (event: React.PointerEvent<HTMLDivElement>) => {
++    dragRef.current = null;
++    setGuides({ x: false, y: false });
++    const target = event.currentTarget as HTMLElement;
++    if (target.hasPointerCapture?.(event.pointerId)) target.releasePointerCapture(event.pointerId);
++  };
++
++  const scaleRef = useRef<{ distance: number; size: number } | null>(null);
++
++  const onHandlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
++    if (!box) return;
++    event.preventDefault();
++    event.stopPropagation();
++    capture(event);
++    const frame = event.currentTarget.parentElement?.getBoundingClientRect();
++    if (!frame) return;
++    const centreX = frame.left + frame.width / 2;
++    const centreY = frame.top + frame.height / 2;
++    scaleRef.current = {
++      distance: Math.max(12, Math.hypot(event.clientX - centreX, event.clientY - centreY)),
++      size: video.size,
++    };
++  };
++
++  const onHandlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
++    const start = scaleRef.current;
++    if (!start) return;
++    const frame = event.currentTarget.parentElement?.getBoundingClientRect();
++    if (!frame) return;
++    const centreX = frame.left + frame.width / 2;
++    const centreY = frame.top + frame.height / 2;
++    const distance = Math.hypot(event.clientX - centreX, event.clientY - centreY);
++    setVideo({ size: start.size * (distance / start.distance) });
++  };
++
++  const endHandleDrag = (event: React.PointerEvent<HTMLDivElement>) => {
++    scaleRef.current = null;
++    const target = event.currentTarget as HTMLElement;
++    if (target.hasPointerCapture?.(event.pointerId)) target.releasePointerCapture(event.pointerId);
++  };
++
++  const captionRef = useRef<{ startX: number; startY: number; x: number; y: number } | null>(null);
++  const onCaptionPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
++    if (!editing || !box) return;
++    event.preventDefault();
++    event.stopPropagation();
++    capture(event);
++    captionRef.current = { startX: event.clientX, startY: event.clientY, x: subtitle.x, y: subtitle.y };
++  };
++
++  const onCaptionPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
++    const start = captionRef.current;
++    if (!start || !box) return;
++    const store = useDesignStore.getState();
++    store.setSubtitle({
++      x: start.x + (event.clientX - start.startX) / box.width,
++      y: start.y + (event.clientY - start.startY) / box.height,
++    });
++  };
++
++  const endCaptionDrag = (event: React.PointerEvent<HTMLDivElement>) => {
++    captionRef.current = null;
++    const target = event.currentTarget as HTMLElement;
++    if (target.hasPointerCapture?.(event.pointerId)) target.releasePointerCapture(event.pointerId);
++  };
++
++  const captionScaleRef = useRef<{ startY: number; size: number } | null>(null);
++
++  const onCaptionResizeDown = (event: React.PointerEvent<HTMLDivElement>) => {
++    event.preventDefault();
++    event.stopPropagation();
++    capture(event);
++    captionScaleRef.current = { startY: event.clientY, size: subtitle.size };
++  };
++
++  const onCaptionResizeMove = (event: React.PointerEvent<HTMLDivElement>) => {
++    const start = captionScaleRef.current;
++    if (!start || !box) return;
++    // Do not let the parent caption drag run on the same pointer move.
++    event.stopPropagation();
++    useDesignStore.getState().setSubtitle({
++      size: start.size + (event.clientY - start.startY) / box.height,
++    });
++  };
++
++  const endCaptionResize = (event: React.PointerEvent<HTMLDivElement>) => {
++    captionScaleRef.current = null;
++    const target = event.currentTarget as HTMLElement;
++    if (target.hasPointerCapture?.(event.pointerId)) target.releasePointerCapture(event.pointerId);
++  };
++
++  // --- blur box: dragged and resized in the same normalised frame space ------
++  const blurDragRef = useRef<{ startX: number; startY: number; x: number; y: number } | null>(null);
++
++  const onBlurPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
++    if (!editing || !box) return;
++    event.preventDefault();
++    event.stopPropagation();
++    capture(event);
++    blurDragRef.current = { startX: event.clientX, startY: event.clientY, x: blurBox.x, y: blurBox.y };
++  };
++
++  const onBlurPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
++    const start = blurDragRef.current;
++    if (!start || !box) return;
++    setBlurBox({
++      x: start.x + (event.clientX - start.startX) / box.width,
++      y: start.y + (event.clientY - start.startY) / box.height,
++    });
++  };
++
++  const endBlurDrag = (event: React.PointerEvent<HTMLDivElement>) => {
++    blurDragRef.current = null;
++    const target = event.currentTarget;
++    if (target.hasPointerCapture?.(event.pointerId)) target.releasePointerCapture(event.pointerId);
++  };
++
++  const blurResizeRef = useRef<{
++    corner: string; startX: number; startY: number; box: typeof blurBox;
++  } | null>(null);
++
++  const onBlurHandleDown = (corner: 'nw' | 'ne' | 'sw' | 'se') => (event: React.PointerEvent<HTMLDivElement>) => {
++    event.preventDefault();
++    event.stopPropagation();
++    capture(event);
++    blurResizeRef.current = { corner, startX: event.clientX, startY: event.clientY, box: { ...blurBox } };
++  };
++
++  const onBlurHandleMove = (event: React.PointerEvent<HTMLDivElement>) => {
++    const start = blurResizeRef.current;
++    if (!start || !box) return;
++    const deltaX = (event.clientX - start.startX) / box.width;
++    const deltaY = (event.clientY - start.startY) / box.height;
++    const next = { ...start.box };
++    if (start.corner.includes('e')) next.w = start.box.w + deltaX;
++    if (start.corner.includes('s')) next.h = start.box.h + deltaY;
++    if (start.corner.includes('w')) { next.x = start.box.x + deltaX; next.w = start.box.w - deltaX; }
++    if (start.corner.includes('n')) { next.y = start.box.y + deltaY; next.h = start.box.h - deltaY; }
++    setBlurBox(next);
++  };
++
++  const endBlurResize = (event: React.PointerEvent<HTMLDivElement>) => {
++    blurResizeRef.current = null;
++    const target = event.currentTarget;
++    if (target.hasPointerCapture?.(event.pointerId)) target.releasePointerCapture(event.pointerId);
++  };
++
++  // Same calibration as the background bars: 0–50 at a 720 px-wide frame.
++  const blurPx = (blurBox.strength * (box?.width ?? BLUR_REFERENCE_WIDTH)) / BLUR_REFERENCE_WIDTH;
++
++  // The video box in frame percentages: the frame is 100% × 100%, so the same
++  // numbers the export uses describe it here.
++  const widthPct = video.size * 100;
++  const heightPct = box ? ((video.size * box.width) / sourceRatio / box.height) * 100 : 0;
++  const leftPct = 50 + video.x * 50 - widthPct / 2;
++  const topPct = 50 + video.y * 50 - heightPct / 2;
++
++  return (
++    <div ref={containerRef} className="relative flex h-full w-full items-center justify-center">
++      <div
++        className="relative overflow-hidden rounded-xl bg-black shadow-[0_0_0_1px_rgba(255,255,255,0.08)]"
++        style={{
++          width: box?.width ?? '100%',
++          height: box?.height ?? '100%',
++          aspectRatio: String(platformRatio),
++        }}
++      >
++        {/* Background: the same clip blurred, or a flat / gradient fill. */}
++        {src && background.mode === 'blur' && (
++          <video
++            ref={backgroundRef}
++            src={src}
++            muted
++            playsInline
++            aria-hidden
++            tabIndex={-1}
++            className="pointer-events-none absolute inset-0 h-full w-full scale-110 object-cover"
++            style={{ filter: `blur(${((background.blur * (box?.width ?? BLUR_REFERENCE_WIDTH)) / BLUR_REFERENCE_WIDTH).toFixed(2)}px)` }}
++          />
++        )}
++        {background.mode === 'color' && (
++          <div className="absolute inset-0" style={{ background: background.color }} />
++        )}
++        {background.mode === 'gradient' && (
++          <div
++            className="absolute inset-0"
++            style={{ background: `linear-gradient(135deg, ${background.from}, ${background.to})` }}
++          />
++        )}
++
++        {/* Foreground video: width is a fraction of the frame, height follows the
++            media's own ratio, position is the normalised centre offset. */}
++        {src ? (
++          <div
++            className="absolute"
++            style={{
++              left: `${50 + video.x * 50}%`,
++              top: `${50 + video.y * 50}%`,
++              width: `${widthPct}%`,
++              transform: 'translate(-50%, -50%)',
++            }}
++          >
++            <video
++              ref={videoRef}
++              src={src}
++              playsInline
++              onLoadedMetadata={(event) => {
++                const element = event.currentTarget;
++                if (element.videoWidth > 0 && element.videoHeight > 0) {
++                  setSourceRatio(element.videoWidth / element.videoHeight);
++                }
++                onLoadedMetadata?.(event);
++              }}
++              onTimeUpdate={(event) => {
++                const element = event.currentTarget;
++                syncBackground(element.currentTime);
++                onTimeUpdate?.(event);
++              }}
++              onPlay={() => {
++                void backgroundRef.current?.play().catch(() => { });
++                onPlay?.();
++              }}
++              onPause={() => {
++                backgroundRef.current?.pause();
++                onPause?.();
++              }}
++              style={{
++                transform: `rotate(${video.rotation}deg) scaleX(${video.flipH ? -1 : 1}) scaleY(${video.flipV ? -1 : 1})`,
++              }}
++              className="block h-auto w-full"
++            />
++          </div>
++        ) : (
++          <div className="absolute inset-0">{empty}</div>
++        )}
++
++        {/* Blur box: hides subtitles or logos burned into the source. It sits
++            above the video but below the caption, so our own text stays sharp. */}
++        {src && blurBox.enabled && (
++          <>
++            <div
++              className={`absolute z-20 ${editing ? 'cursor-move border border-dashed border-rose-300/60' : 'pointer-events-none'}`}
++              style={{
++                left: `${blurBox.x * 100}%`,
++                top: `${blurBox.y * 100}%`,
++                width: `${blurBox.w * 100}%`,
++                height: `${blurBox.h * 100}%`,
++                backdropFilter: `blur(${blurPx.toFixed(2)}px)`,
++                WebkitBackdropFilter: `blur(${blurPx.toFixed(2)}px)`,
++              }}
++              onPointerDown={onBlurPointerDown}
++              onPointerMove={onBlurPointerMove}
++              onPointerUp={endBlurDrag}
++              onPointerCancel={endBlurDrag}
++              title={editing ? 'Drag to move the blur box' : undefined}
++            />
++            {editing && (
++              <div
++                className="absolute z-40 flex h-3.5 w-9 -translate-x-1/2 -translate-y-1/2 cursor-move items-center justify-center rounded-full border border-white bg-rose-500 text-[8px] font-bold leading-none text-white"
++                style={{ left: `${(blurBox.x + blurBox.w / 2) * 100}%`, top: `${blurBox.y * 100}%` }}
++                onPointerDown={onBlurPointerDown}
++                onPointerMove={onBlurPointerMove}
++                onPointerUp={endBlurDrag}
++                onPointerCancel={endBlurDrag}
++                title="Drag to move the blur box"
++              >
++                ⠿
++              </div>
++            )}
++            {editing && ([
++              { key: 'nw', cursor: 'cursor-nwse-resize', style: { left: `${blurBox.x * 100}%`, top: `${blurBox.y * 100}%` } },
++              { key: 'ne', cursor: 'cursor-nesw-resize', style: { left: `${(blurBox.x + blurBox.w) * 100}%`, top: `${blurBox.y * 100}%` } },
++              { key: 'sw', cursor: 'cursor-nesw-resize', style: { left: `${blurBox.x * 100}%`, top: `${(blurBox.y + blurBox.h) * 100}%` } },
++              { key: 'se', cursor: 'cursor-nwse-resize', style: { left: `${(blurBox.x + blurBox.w) * 100}%`, top: `${(blurBox.y + blurBox.h) * 100}%` } },
++            ] as const).map((handle) => (
++              <div
++                key={handle.key}
++                className={`absolute z-30 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-sm border border-white bg-rose-400 ${handle.cursor}`}
++                style={handle.style}
++                onPointerDown={onBlurHandleDown(handle.key)}
++                onPointerMove={onBlurHandleMove}
++                onPointerUp={endBlurResize}
++                onPointerCancel={endBlurResize}
++                title="Drag to resize the blur box"
++              />
++            ))}
++          </>
++        )}
++
++        {/* Editing chrome: outline, corner handles, guides, caption box. */}
++        {src && editing && (
++          <>
++            <div
++              className="absolute z-10 cursor-move border border-dashed border-sky-400/50"
++              style={{ left: `${leftPct}%`, top: `${topPct}%`, width: `${widthPct}%`, height: `${heightPct}%` }}
++              onPointerDown={onVideoPointerDown}
++              onPointerMove={onVideoPointerMove}
++              onPointerUp={endVideoDrag}
++              onPointerCancel={endVideoDrag}
++              title="Drag to move the video"
++            />
++            {([
++              { key: 'nw', cursor: 'cursor-nwse-resize', style: { left: `${leftPct}%`, top: `${topPct}%` } },
++              { key: 'ne', cursor: 'cursor-nesw-resize', style: { right: `${100 - leftPct - widthPct}%`, top: `${topPct}%` } },
++              { key: 'sw', cursor: 'cursor-nesw-resize', style: { left: `${leftPct}%`, bottom: `${100 - topPct - heightPct}%` } },
++              { key: 'se', cursor: 'cursor-nwse-resize', style: { right: `${100 - leftPct - widthPct}%`, bottom: `${100 - topPct - heightPct}%` } },
++            ]).map((handle) => (
++              <div
++                key={handle.key}
++                className={`absolute z-30 h-3 w-3 rounded-sm border border-white bg-sky-400 ${handle.cursor}`}
++                style={handle.style}
++                onPointerDown={onHandlePointerDown}
++                onPointerMove={onHandlePointerMove}
++                onPointerUp={endHandleDrag}
++                onPointerCancel={endHandleDrag}
++                title="Drag a corner to scale"
++              />
++            ))}
++            {guides.x && <div className="pointer-events-none absolute left-1/2 top-0 h-full w-px -translate-x-1/2 bg-emerald-400/80" />}
++            {guides.y && <div className="pointer-events-none absolute left-0 top-1/2 h-px w-full -translate-y-1/2 bg-emerald-400/80" />}
++          </>
++        )}
++
++        {safeZone && (
++          <div className="pointer-events-none absolute inset-0">
++            <div className="absolute inset-[5%] border border-dashed border-amber-300/50" />
++            <div className="absolute inset-x-[5%] bottom-[5%] h-[18%] border border-dashed border-rose-300/40 bg-rose-500/5" />
++          </div>
++        )}
++
++        {src && subtitle.enabled && (
++          <div
++            className={`absolute z-40 max-w-[92%] -translate-x-1/2 -translate-y-1/2 whitespace-pre-line text-center font-semibold leading-tight text-white ${editing ? 'cursor-move rounded border border-dashed border-white/40 px-1' : 'pointer-events-none'}`}
++            style={{
++              left: `${subtitle.x * 100}%`,
++              top: `${subtitle.y * 100}%`,
++              fontSize: box ? `${Math.max(8, subtitle.size * box.height)}px` : `${subtitle.size * 100}%`,
++              textShadow: '0 1px 3px rgba(0,0,0,0.9), 0 0 1px rgba(0,0,0,0.9)',
++            }}
++            onPointerDown={onCaptionPointerDown}
++            onPointerMove={onCaptionPointerMove}
++            onPointerUp={endCaptionDrag}
++            onPointerCancel={endCaptionDrag}
++            title={editing ? 'Drag to place the caption' : undefined}
++          >
++            {subtitleText || 'Caption preview'}
++            {editing && (
++              <span
++                className="absolute -bottom-1.5 -right-1.5 h-3 w-3 cursor-ns-resize rounded-sm border border-white bg-emerald-400"
++                onPointerDown={onCaptionResizeDown}
++                onPointerMove={onCaptionResizeMove}
++                onPointerUp={endCaptionResize}
++                onPointerCancel={endCaptionResize}
++                title="Drag to resize the caption"
++              />
++            )}
++          </div>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/frontend/src/components/DesignBar.tsx b/frontend/src/components/DesignBar.tsx
+new file mode 100644
+index 00000000..f433e25e
+--- /dev/null
++++ b/frontend/src/components/DesignBar.tsx
+@@ -0,0 +1,177 @@
++import { BACKGROUND_MODES, DESIGN_PLATFORMS, useDesignStore } from '../store/useDesignStore';
++import type { BackgroundMode, DesignPlatform } from '../store/useDesignStore';
++
++/** Small pill button used by the segmented controls. */
++function Choice({ active, onClick, title, children }: {
++  active: boolean;
++  onClick: () => void;
++  title?: string;
++  children: React.ReactNode;
++}) {
++  return (
++    <button
++      type="button"
++      onClick={onClick}
++      aria-pressed={active}
++      title={title}
++      className={`rounded px-1.5 py-1 text-[10px] font-semibold transition ${
++        active ? 'bg-sky-500/25 text-sky-100' : 'text-slate-400 hover:bg-white/5 hover:text-slate-200'
++      }`}
++    >
++      {children}
++    </button>
++  );
++}
++
++/**
++ * The controls for the canvas that sits over both previews.
++ *
++ * It only edits normalised values — the preview components and the FFmpeg export
++ * both read them — so nothing here depends on the current preview's pixel size.
++ */
++export function DesignBar() {
++  const {
++    platform, editing, background, video, subtitle, blurBox, safeZone,
++    setPlatform, setEditing, setBackground, setVideo, setSubtitle, setBlurBox, toggleSafeZone, reset,
++  } = useDesignStore();
++
++  return (
++    <section className="rounded-2xl border border-white/10 bg-slate-900/70 px-3 py-2">
++      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
++        <span className="text-[10px] uppercase tracking-[0.2em] text-slate-500">Canvas</span>
++        <div className="flex items-center overflow-hidden rounded-md border border-white/10" role="group" aria-label="Platform frame">
++          {(Object.keys(DESIGN_PLATFORMS) as DesignPlatform[]).map((key) => (
++            <Choice key={key} active={platform === key} onClick={() => setPlatform(key)} title={DESIGN_PLATFORMS[key].hint}>
++              {DESIGN_PLATFORMS[key].label}
++            </Choice>
++          ))}
++        </div>
++
++        <span className="text-[10px] uppercase tracking-[0.2em] text-slate-500">Background</span>
++        <div className="flex items-center overflow-hidden rounded-md border border-white/10" role="group" aria-label="Background">
++          {(Object.keys(BACKGROUND_MODES) as BackgroundMode[]).map((key) => (
++            <Choice key={key} active={background.mode === key} onClick={() => setBackground({ mode: key })}>
++              {BACKGROUND_MODES[key]}
++            </Choice>
++          ))}
++        </div>
++
++        {background.mode === 'blur' && (
++          <label className="flex items-center gap-1.5 text-[10px] text-slate-400">
++            Blur
++            <input
++              type="range" min={0} max={50} step={1} value={background.blur}
++              onChange={(event) => setBackground({ blur: Number(event.target.value) })}
++              className="h-1 w-20 cursor-pointer" aria-label="Background blur"
++            />
++            <span className="w-4 text-right tabular-nums text-slate-300">{background.blur}</span>
++          </label>
++        )}
++        {background.mode === 'color' && (
++          <input
++            type="color" value={background.color}
++            onChange={(event) => setBackground({ color: event.target.value })}
++            className="h-5 w-7 cursor-pointer rounded border border-white/10 bg-transparent"
++            aria-label="Background colour"
++          />
++        )}
++        {background.mode === 'gradient' && (
++          <span className="flex items-center gap-1">
++            <input
++              type="color" value={background.from}
++              onChange={(event) => setBackground({ from: event.target.value })}
++              className="h-5 w-7 cursor-pointer rounded border border-white/10 bg-transparent"
++              aria-label="Gradient start"
++            />
++            <input
++              type="color" value={background.to}
++              onChange={(event) => setBackground({ to: event.target.value })}
++              className="h-5 w-7 cursor-pointer rounded border border-white/10 bg-transparent"
++              aria-label="Gradient end"
++            />
++          </span>
++        )}
++      </div>
++
++      <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5">
++        <label className="flex items-center gap-1.5 text-[10px] text-slate-400">
++          Rotate
++          <input
++            type="range" min={-180} max={180} step={1} value={video.rotation}
++            onChange={(event) => setVideo({ rotation: Number(event.target.value) })}
++            className="h-1 w-24 cursor-pointer" aria-label="Video rotation"
++          />
++          <span className="w-8 text-right tabular-nums text-slate-300">{video.rotation}°</span>
++        </label>
++
++        <div className="flex items-center overflow-hidden rounded-md border border-white/10">
++          <Choice active={video.flipH} onClick={() => setVideo({ flipH: !video.flipH })} title="Mirror left to right">Flip H</Choice>
++          <Choice active={video.flipV} onClick={() => setVideo({ flipV: !video.flipV })} title="Mirror top to bottom">Flip V</Choice>
++        </div>
++
++        <label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-slate-300">
++          <input
++            type="checkbox" checked={subtitle.enabled}
++            onChange={(event) => setSubtitle({ enabled: event.target.checked })}
++            className="h-3 w-3 accent-sky-500"
++          />
++          Caption
++        </label>
++        <label className="flex items-center gap-1.5 text-[10px] text-slate-400" title="Each cue shows at most this many words and advances through the line while it plays (0 = the whole line)">
++          Words/cue
++          <input
++            type="range" min={0} max={12} step={1} value={subtitle.wordsPerLine}
++            onChange={(event) => setSubtitle({ wordsPerLine: Number(event.target.value) })}
++            className="h-1 w-16 cursor-pointer"
++            aria-label="Words per subtitle cue"
++          />
++          <span className="w-5 text-right tabular-nums text-slate-300">
++            {subtitle.wordsPerLine === 0 ? 'all' : subtitle.wordsPerLine}
++          </span>
++        </label>
++        <label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-slate-300"
++               title="Hides subtitles or logos burned into the source video">
++          <input
++            type="checkbox" checked={blurBox.enabled}
++            onChange={(event) => setBlurBox({ enabled: event.target.checked })}
++            className="h-3 w-3 accent-rose-500"
++          />
++          Blur box
++        </label>
++        {blurBox.enabled && (
++          <label className="flex items-center gap-1.5 text-[10px] text-slate-400">
++            Strength
++            <input
++              type="range" min={0} max={50} step={1} value={blurBox.strength}
++              onChange={(event) => setBlurBox({ strength: Number(event.target.value) })}
++              className="h-1 w-16 cursor-pointer" aria-label="Blur box strength"
++            />
++            <span className="w-4 text-right tabular-nums text-slate-300">{blurBox.strength}</span>
++          </label>
++        )}
++        <label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-slate-300">
++          <input
++            type="checkbox" checked={safeZone} onChange={toggleSafeZone}
++            className="h-3 w-3 accent-amber-500"
++          />
++          Safe zone
++        </label>
++        <label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-slate-300" title="Show the drag handles and snap guides on the previews">
++          <input
++            type="checkbox" checked={editing} onChange={(event) => setEditing(event.target.checked)}
++            className="h-3 w-3 accent-emerald-500"
++          />
++          Handles
++        </label>
++
++        <button
++          type="button" onClick={reset}
++          className="ml-auto rounded-md border border-white/10 bg-slate-900 px-2 py-1 text-[10px] font-medium text-slate-300 transition hover:bg-slate-800"
++          title="Reset the video position, scale, rotation, flips, caption and blur box"
++        >
++          Reset
++        </button>
++      </div>
++    </section>
++  );
++}
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -25,9 +25,17 @@ import {
+   FilePlus,
+   Trash2,
+   Wand2,
++  Link2,
++  RotateCcw,
+ } from 'lucide-react';
+ import { useStudioStore } from './store/useStudioStore';
++import { usePreviewLayout } from './store/usePreviewLayout';
++import { useDesignStore } from './store/useDesignStore';
++import { captionAtTime } from './store/useDesignStore';
++import { useDragResize } from './hooks/useDragResize';
+ import ApiPoolManager from './components/ApiPoolManager';
++import { DesignBar } from './components/DesignBar';
++import { PreviewCanvas } from './components/PreviewCanvas';
+ import { DubbingTrackEditor } from './components/DubbingTrackEditor';
+ import { TimelineEditor } from './components/TimelineEditor';
+ import type { ProjectSummary, OverlapProposal, FixOverlapsResponse } from './types';
+@@ -222,8 +230,6 @@ function App() {
+   const [autoDuck, setAutoDuck] = useState(() => localStorage.getItem('dubvibe-auto-duck') !== 'false');
+   const [keepMusic, setKeepMusic] = useState(() => localStorage.getItem('dubvibe-keep-music') !== 'false');
+   const [keepSfx, setKeepSfx] = useState(() => localStorage.getItem('dubvibe-keep-sfx') !== 'false');
+-  const [platformStyle, setPlatformStyle] = useState(() => localStorage.getItem('dubvibe-platform-style') ?? 'original');
+-  const [platformFit, setPlatformFit] = useState(() => localStorage.getItem('dubvibe-platform-fit') ?? 'blur');
+   const [showModels, setShowModels] = useState(false);
+   const [modelBusy, setModelBusy] = useState<string | null>(null);
+   const [nllbConfirm, setNllbConfirm] = useState(false);
+@@ -350,6 +356,95 @@ function App() {
+     'Subtitle': { muted: false, hidden: false, locked: false },
+   });
+ 
++  // --- Preview layout (persisted): one row shared by both players ----------
++  const {
++    height: previewHeight,
++    share: previewShare,
++    size: previewSize,
++    syncPlayback,
++    applySize,
++    bumpHeight,
++    bumpShare,
++    setShare,
++    setSyncPlayback,
++    fitToViewport,
++    reset: resetPreviewLayout,
++  } = usePreviewLayout();
++  const previewRowRef = useRef<HTMLDivElement>(null);
++  // The Dubbing Track may grow to the Workflow panel's height, never past it.
++  const workflowCardRef = useRef<HTMLDivElement>(null);
++  const [workflowCardHeight, setWorkflowCardHeight] = useState(0);
++  // Only one player may drive the other; otherwise every timeupdate would pull
++  // the other one back and the pair would jitter.
++  const syncMasterRef = useRef<'source' | 'dubbed'>('source');
++  const rowResize = useDragResize({ onDelta: (_deltaX, deltaY) => bumpHeight(deltaY) });
++  const columnResize = useDragResize({
++    onDelta: (deltaX) => {
++      const width = previewRowRef.current?.getBoundingClientRect().width ?? 0;
++      if (width > 0) bumpShare(deltaX / width);
++    },
++  });
++
++  const measureWorkflowCard = () => {
++    const element = workflowCardRef.current;
++    if (!element) return;
++    setWorkflowCardHeight(Math.round(element.getBoundingClientRect().height));
++  };
++
++  useEffect(() => {
++    const element = workflowCardRef.current;
++    if (!element) return;
++    measureWorkflowCard();
++    const observer = new ResizeObserver(measureWorkflowCard);
++    observer.observe(element);
++    return () => observer.disconnect();
++  }, []);
++
++  // A row taller than 70% of the window (after a resize, or restored from a
++  // larger screen) would push the timeline out of reach.
++  useEffect(() => {
++    fitToViewport();
++  }, [fitToViewport]);
++
++  useEffect(() => {
++    const onWindowResize = () => fitToViewport();
++    window.addEventListener('resize', onWindowResize);
++    return () => window.removeEventListener('resize', onWindowResize);
++  }, [fitToViewport]);
++
++  const toggleSyncPlayback = () => {
++    const next = !syncPlayback;
++    setSyncPlayback(next);
++    if (!next) return;
++    // Align immediately, so turning sync on never causes an audible jump.
++    const source = videoRef.current;
++    const dubbed = dubbedVideoRef.current;
++    if (!source || !dubbed) return;
++    const master = !source.paused || dubbed.paused ? 'source' : 'dubbed';
++    syncMasterRef.current = master;
++    const time = master === 'source' ? source.currentTime : dubbed.currentTime;
++    if (Math.abs(dubbed.currentTime - time) > 0.2) dubbed.currentTime = time;
++    if (Math.abs(source.currentTime - time) > 0.2) source.currentTime = time;
++    if (master === 'source' && !source.paused && dubbed.paused) void dubbed.play().catch(() => { });
++    if (master === 'dubbed' && !dubbed.paused && source.paused) void source.play().catch(() => { });
++  };
++
++  // The cue under the playhead: with a words-per-cue setting the line advances
++  // chunk by chunk while it plays, exactly as the burned ASS file does.
++  const wordsPerCue = useDesignStore((state) => state.subtitle.wordsPerLine);
++  const activeTranslation = useMemo(() => {
++    const line = transcript.find((segment) => currentTime >= segment.start && currentTime < segment.end);
++    if (!line) return '';
++    return captionAtTime(
++      line.translation || line.text || '',
++      wordsPerCue, currentTime, line.start, line.end,
++    );
++  }, [transcript, currentTime, wordsPerCue]);
++
++  // The canvas platform select is the frame the user sees, and therefore the
++  // frame the export makes: there is no second Platform style control any more.
++  const designPlatform = useDesignStore((state) => state.platform);
++
+   const projectDurationSeconds = useMemo(() => {
+     if (videoDuration && videoDuration > 0) return videoDuration;
+     const [hours, minutes, seconds] = project.duration.split(':').map(Number);
+@@ -710,8 +868,7 @@ function App() {
+         autoDuck,
+         keepMusic,
+         keepSfx,
+-        platformStyle: (platformStyle as 'original' | 'vertical' | 'standard' | 'square'),
+-        platformFit: (platformFit as 'blur' | 'crop'),
++        platformStyle: designPlatform,
+       });
+       setExportFiles({
+         subtitlesUrl: exported.vtt
+@@ -1554,35 +1721,63 @@ function App() {
+                           </button>
+                         </div>
+                       )}
+-                      <span className="text-xs uppercase tracking-[0.2em] text-slate-500">Source preview</span>
++                      <div className="flex items-center overflow-hidden rounded-md border border-white/10" role="group" aria-label="Preview size">
++                        {(['S', 'M', 'L', 'Fit'] as const).map((option) => (
++                          <button
++                            key={option}
++                            onClick={() => applySize(option)}
++                            aria-pressed={previewSize === option}
++                            title={option === 'Fit' ? 'Fill the available height' : `${option} preview size`}
++                            className={`px-1.5 py-1 text-[10px] font-semibold transition ${previewSize === option ? 'bg-sky-500/25 text-sky-100' : 'text-slate-400 hover:bg-white/5 hover:text-slate-200'}`}
++                          >
++                            {option}
++                          </button>
++                        ))}
++                      </div>
++                      <button
++                        onClick={toggleSyncPlayback}
++                        aria-pressed={syncPlayback}
++                        title={syncPlayback ? 'Source and Dubbed play, pause and seek together (on)' : 'Play both previews together'}
++                        className={`flex items-center gap-1 rounded-md border px-1.5 py-1 text-[10px] font-medium transition ${syncPlayback ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200' : 'border-white/10 bg-slate-900/80 text-slate-400 hover:text-slate-200'}`}
++                      >
++                        <Link2 size={11} /> Sync
++                      </button>
++                      <button
++                        onClick={resetPreviewLayout}
++                        title="Reset the preview size and split to their defaults"
++                        className="rounded-md border border-white/10 bg-slate-900/80 p-1 text-slate-400 transition hover:text-slate-200"
++                      >
++                        <RotateCcw size={11} />
++                      </button>
+                     </div>
+                   </div>
+ 
+-                  <div className="relative flex h-64 items-center justify-center overflow-hidden rounded-2xl border border-white/10 bg-black">
+-                    {previewUrl ? (
+-                      <video
+-                        ref={videoRef}
+-                        src={previewUrl}
+-                        onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+-                        onLoadedMetadata={(e) => setVideoDuration(e.currentTarget.duration)}
+-                        onPlay={() => { setIsPlaying(true); dubbedVideoRef.current?.pause(); stopPreviewAudio(); }}
+-                        onPause={() => setIsPlaying(false)}
+-                        className="h-full w-full object-contain"
+-                      />
+-                    ) : (
+-                      <button onClick={() => fileInputRef.current?.click()} className="flex h-full w-full flex-col items-center justify-center gap-3 text-sm text-slate-400 hover:text-white group transition">
+-                        <div className="rounded-full border border-dashed border-white/20 p-4 group-hover:border-sky-500/50 group-hover:bg-sky-500/10 transition">
+-                          <FileVideo size={32} className="text-slate-400 group-hover:text-sky-400 transition" />
+-                        </div>
+-                        <div className="text-center">
+-                          <p className="font-medium text-slate-200 group-hover:text-sky-300">Click to import video</p>
+-                          <p className="text-xs text-slate-500 mt-0.5">MP4, MOV, MKV, WebM supported</p>
+-                        </div>
+-                      </button>
+-                    )}
++                  {/* The canvas: platform frame, background, transform and caption,
++                      all driven by the normalised design values. */}
++                  <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden">
++                    <PreviewCanvas
++                      src={previewUrl}
++                      videoRef={videoRef}
++                      onTimeUpdate={(e) => { setCurrentTime(e.currentTarget.currentTime); alignOtherPlayer('source', e.currentTarget.currentTime); }}
++                      onLoadedMetadata={(e) => setVideoDuration(e.currentTarget.duration)}
++                      onPlay={handleSourcePlay}
++                      onPause={handleSourcePause}
++                      subtitleText={activeTranslation}
++                      empty={(
++                        <button onClick={() => fileInputRef.current?.click()} className="group flex h-full w-full flex-col items-center justify-center gap-2 overflow-hidden rounded-xl border border-white/10 bg-black p-2 text-sm text-slate-400 transition hover:text-white">
++                          <div className="rounded-full border border-dashed border-white/20 p-2.5 transition group-hover:border-sky-500/50 group-hover:bg-sky-500/10">
++                            <FileVideo size={22} className="text-slate-400 transition group-hover:text-sky-400" />
++                          </div>
++                          <div className="text-center">
++                            <p className="text-xs font-medium text-slate-200 group-hover:text-sky-300">Click to import video</p>
++                            <p className="mt-0.5 text-[10px] text-slate-500">MP4, MOV, MKV, WebM supported</p>
++                          </div>
++                        </button>
++                      )}
++                    />
+                   </div>
+                   {previewUrl && (
+-                    <div className="mt-3 flex items-center gap-2 rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2">
++                    <div className="mt-2 flex shrink-0 items-center gap-2 rounded-xl border border-white/10 bg-slate-900/80 px-2 py-1.5">
+                       <button onClick={() => skipVideo(videoRef, -5)} title="Back 5 seconds" className="rounded p-1 text-slate-400 transition hover:text-white">
+                         <SkipBack size={14} />
+                       </button>
+@@ -1626,37 +1842,48 @@ function App() {
+                           <span>Download</span>
+                         </a>
+                       )}
+-                      <span className="text-xs uppercase tracking-[0.2em] text-slate-500">Dubbed output</span>
++                      <div className="flex items-center overflow-hidden rounded-md border border-white/10" role="group" aria-label="Preview size">
++                        {(['S', 'M', 'L', 'Fit'] as const).map((option) => (
++                          <button
++                            key={option}
++                            onClick={() => applySize(option)}
++                            aria-pressed={previewSize === option}
++                            title={option === 'Fit' ? 'Fill the available height' : `${option} preview size`}
++                            className={`px-1.5 py-1 text-[10px] font-semibold transition ${previewSize === option ? 'bg-emerald-500/25 text-emerald-100' : 'text-slate-400 hover:bg-white/5 hover:text-slate-200'}`}
++                          >
++                            {option}
++                          </button>
++                        ))}
++                      </div>
+                     </div>
+                   </div>
+-                  <div className="relative flex h-64 items-center justify-center overflow-hidden rounded-2xl border border-white/10 bg-black">
+-                    {dubbedPreviewUrl ? (
+-                      <video
+-                        key={dubbedPreviewUrl}
+-                        ref={dubbedVideoRef}
+-                        src={dubbedPreviewUrl}
+-                        onTimeUpdate={(e) => setDubbedTime(e.currentTarget.currentTime)}
+-                        onLoadedMetadata={(e) => setDubbedDuration(e.currentTarget.duration || 0)}
+-                        onPlay={() => { setDubbedPlaying(true); videoRef.current?.pause(); }}
+-                        onPause={() => setDubbedPlaying(false)}
+-                        className="h-full w-full object-contain"
+-                      />
+-                    ) : (
+-                      <div className="flex flex-col items-center gap-3 text-center">
+-                        <div className="rounded-full border border-dashed border-white/15 p-4">
+-                          <AudioLines size={28} className="text-slate-600" />
+-                        </div>
+-                        <div>
+-                          <p className="text-sm font-medium text-slate-400">No dubbed video yet</p>
+-                          <p className="mt-0.5 max-w-[280px] text-xs text-slate-600">
+-                            Run Dub, then Export — the dubbed MP4 plays here directly, no need to save the file first.
+-                          </p>
++                  <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden">
++                    <PreviewCanvas
++                      key={dubbedPreviewUrl}
++                      src={dubbedPreviewUrl}
++                      videoRef={dubbedVideoRef}
++                      onTimeUpdate={(e) => { setDubbedTime(e.currentTarget.currentTime); alignOtherPlayer('dubbed', e.currentTarget.currentTime); }}
++                      onLoadedMetadata={(e) => setDubbedDuration(e.currentTarget.duration || 0)}
++                      onPlay={handleDubbedPlay}
++                      onPause={handleDubbedPause}
++                      subtitleText={activeTranslation}
++                      empty={(
++                        <div className="flex h-full w-full flex-col items-center justify-center gap-2 overflow-hidden rounded-xl border border-white/10 bg-black p-2 text-center">
++                          <div className="rounded-full border border-dashed border-white/15 p-2.5">
++                            <AudioLines size={22} className="text-slate-600" />
++                          </div>
++                          <div>
++                            <p className="text-xs font-medium text-slate-400">No dubbed video yet</p>
++                            <p className="mt-0.5 max-w-[260px] text-[10px] text-slate-600">
++                              Run Dub, then Export — the dubbed MP4 plays here directly.
++                            </p>
++                          </div>
+                         </div>
+-                      </div>
+-                    )}
++                      )}
++                    />
+                   </div>
+                   {dubbedPreviewUrl && (
+-                    <div className="mt-3 flex items-center gap-2 rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2">
++                    <div className="mt-2 flex shrink-0 items-center gap-2 rounded-xl border border-white/10 bg-slate-900/80 px-2 py-1.5">
+                       <button onClick={() => skipVideo(dubbedVideoRef, -5)} title="Back 5 seconds" className="rounded p-1 text-slate-400 transition hover:text-white">
+                         <SkipBack size={14} />
+                       </button>
+@@ -1684,62 +1918,62 @@ function App() {
+                 </div>
+               </div>
+ 
+-              <div className="rounded-2xl border border-white/10 bg-slate-900/80 p-4">
+-                <div className="mb-3 flex items-center justify-between">
+-                  <p className="text-[10px] uppercase tracking-[0.22em] text-slate-500">Workflow</p>
+-                  <FileVideo size={14} className="text-slate-400" />
+-                </div>
+-
+-                <div className="space-y-3">
+-                  {workflowSteps.map((step) => (
+-                    <div key={step.id} className="rounded-xl border border-white/10 bg-slate-950/80 p-3">
+-                      <div className="mb-2 flex items-center justify-between">
+-                        <div className="flex items-center gap-2">
+-                          {step.status === 'Completed' ? <CheckCircle2 size={14} className="text-emerald-400" /> : step.status === 'Active' ? <BadgeCheck size={14} className="text-sky-400" /> : <FolderOpen size={14} className="text-slate-400" />}
+-                          <span className="text-sm font-medium text-slate-200">{step.label}</span>
+-                        </div>
+-                        <span className="text-[10px] uppercase tracking-[0.14em] text-slate-400">{step.status}</span>
+-                      </div>
+-                      <div className="mb-2 h-2 overflow-hidden rounded-full bg-slate-800">
+-                        <div className="h-full rounded-full bg-gradient-to-r from-sky-500 to-violet-500" style={{ width: `${step.progress}%` }} />
+-                      </div>
+-                      <p className="text-xs text-slate-400">{step.id === 'subtitle' && !subtitleSync ? 'Subtitle sync disabled by user' : step.detail}</p>
+-                      {step.id === 'subtitle' && <label className="mt-3 flex cursor-pointer items-center gap-2 text-xs text-slate-300">
+-                        <input
+-                          type="checkbox"
+-                          checked={subtitleSync}
+-                          onChange={(event) => {
+-                            const enabled = event.target.checked;
+-                            setSubtitleSync(enabled);
+-                            localStorage.setItem('dubvibe-subtitle-sync', String(enabled));
+-                            if (!enabled) {
+-                              setBurnSubtitles(false);
+-                              localStorage.setItem('dubvibe-burn-subtitles', 'false');
+-                            }
+-                            setExportFiles(null);
+-                          }}
+-                          className="h-4 w-4 accent-sky-500"
+-                        />
+-                        Include synced subtitles in export
+-                      </label>}
+-                      {step.id === 'subtitle' && <label className={`mt-2 flex items-center gap-2 text-xs ${subtitleSync ? 'cursor-pointer text-slate-300' : 'cursor-not-allowed text-slate-500'}`}>
+-                        <input
+-                          type="checkbox"
+-                          checked={burnSubtitles}
+-                          disabled={!subtitleSync}
+-                          onChange={(event) => {
+-                            setBurnSubtitles(event.target.checked);
+-                            localStorage.setItem('dubvibe-burn-subtitles', String(event.target.checked));
+-                            setExportFiles(null);
+-                          }}
+-                          className="h-4 w-4 accent-sky-500"
+-                        />
+-                        Burn captions into video
+-                      </label>}
+-                    </div>
+-                  ))}
+-                </div>
++              {/* Controls for the canvas above: platform, background, transform, caption. */}
++              <DesignBar />
++
++              {/* Drag to change the preview height: 180 px → 70% of the window. */}
++              <div
++                role="separator"
++                aria-orientation="horizontal"
++                aria-label="Resize the preview area"
++                tabIndex={0}
++                title="Drag to resize the preview area · double-click for the default size"
++                onDoubleClick={() => applySize('M')}
++                onKeyDown={(event) => {
++                  if (event.key === 'ArrowUp') bumpHeight(-24);
++                  if (event.key === 'ArrowDown') bumpHeight(24);
++                }}
++                className="group flex h-3 shrink-0 cursor-row-resize items-center justify-center rounded-full outline-none transition focus-visible:ring-2 focus-visible:ring-sky-500/60"
++                {...rowResize.handleProps}
++              >
++                <span className={`h-1 w-full rounded-full transition-colors ${rowResize.dragging ? 'bg-sky-400' : 'bg-white/10 group-hover:bg-sky-500/60'}`} />
+               </div>
++
++              {/* The timeline follows the preview row directly: its zoom, scroll
++                  and selection stay untouched by the splitter above it. */}
++              <TimelineEditor
++                projectId={project.id}
++                mode={mode}
++                busy={busy}
++                segments={transcript}
++                dubSegments={dubAudioSegments}
++                dubAudioVersion={dubAudioVersion}
++                hasMedia={hasMedia}
++                mediaName={importedFile?.name ?? project.mediaName ?? 'Imported Video'}
++                duration={projectDurationSeconds}
++                currentTime={currentTime}
++                isPlaying={isPlaying}
++                videoRef={videoRef}
++                videoChunks={videoChunks}
++                chunkSeconds={chunkSeconds}
++                selectedId={selectedSegmentId}
++                onSelect={setSelectedSegmentId}
++                onSeek={seekTo}
++                onTogglePlay={togglePlay}
++                onOpenEditor={openSegmentEditor}
++                onNotice={setNotice}
++                trackStates={trackStates}
++                onToggleMute={toggleTrackMute}
++                onToggleHide={toggleTrackHide}
++                onToggleLock={toggleTrackLock}
++                onRefresh={handleRefresh}
++                isRefreshing={isRefreshing}
++                onFixOverlaps={handleFixOverlaps}
++                fixOverlapsState={fixOverlapsState}
++                onCutRange={handleCutRange}
++                cutBusy={cutBusy}
++                targetLanguage={targetLanguage}
++              />
+             </div>
+ 
+             {/* Video parts — every chunk with live one-by-one dubbing progress */}
+@@ -2367,30 +2630,6 @@ function App() {
+                 <p className="mt-1 text-[10px] leading-4 text-slate-500">
+                   Separate parts follow the video chunking above (Part 1, Part 2, …). Without chunking, export is always one combined video.
+                 </p>
+-                <label className="mb-1 mt-3 block text-xs uppercase tracking-[0.18em] text-slate-500">Platform style</label>
+-                <select
+-                  value={platformStyle}
+-                  onChange={(event) => { setPlatformStyle(event.target.value); localStorage.setItem('dubvibe-platform-style', event.target.value); setExportFiles(null); }}
+-                  className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200"
+-                >
+-                  <option value="original">Original — no conversion</option>
+-                  <option value="vertical">TikTok / Reels / Shorts (9:16 vertical)</option>
+-                  <option value="standard">Standard YouTube / Facebook (16:9)</option>
+-                  <option value="square">Instagram / FB Feed (1:1 square)</option>
+-                </select>
+-                {platformStyle !== 'original' && (
+-                  <>
+-                    <label className="mb-1 mt-2 block text-[10px] uppercase tracking-[0.14em] text-slate-500">Fit style</label>
+-                    <select
+-                      value={platformFit}
+-                      onChange={(event) => { setPlatformFit(event.target.value); localStorage.setItem('dubvibe-platform-fit', event.target.value); setExportFiles(null); }}
+-                      className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-xs text-slate-200"
+-                    >
+-                      <option value="blur">Blurred background, video centered</option>
+-                      <option value="crop">Center-crop to fill</option>
+-                    </select>
+-                  </>
+-                )}
+                 <label className="mb-1 mt-3 block text-xs uppercase tracking-[0.18em] text-slate-500">Export folder</label>
+                 <div className="flex gap-2">
+                   <input

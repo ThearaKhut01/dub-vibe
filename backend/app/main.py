@@ -58,7 +58,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from urllib.parse import quote
 
 from backend.app.chunking import SmartChunkEngine, format_timestamp, split_subtitle_cues
-from backend.app import acting, api_keys, api_pool, cuda_pack, model_manager, online_providers, speaker_diarization, tts_service, voxcpm_local
+from backend.app import acting, api_keys, api_pool, cuda_pack, export_design, model_manager, online_providers, speaker_diarization, tts_service, voxcpm_local
 from backend.app import segment_tts
 from backend.app.models import ProjectRequest, ProjectSummary, ProviderSettings, ProcessingRequest, SegmentSplit, SegmentUpdate, WorkflowProgress
 from backend.app.providers import (
@@ -2467,14 +2467,24 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
     return {'project_id': payload.project_id, 'status': 'ok', 'result': result}
 
 
-def _apply_platform_style(ffmpeg: str, source: str, dest: str, target_w: int, target_h: int, fit: str) -> None:
+def _apply_platform_style(ffmpeg: str, source: str, dest: str, target_w: int, target_h: int, fit: str,
+                          design: export_design.Design | None = None,
+                          caption_file: Path | None = None) -> None:
     """Convert a finished video to a platform aspect ratio.
 
-    'blur' fills the target frame with a blurred, scaled copy of the video and
-    centers the original on top (the TikTok/Shorts look). 'crop' center-crops
-    to fill the frame. Video is re-encoded; audio is copied untouched.
+    Without a design: 'blur' fills the target frame with a blurred, scaled copy
+    and centres the original on top (the TikTok/Shorts look); 'crop' centre-crops
+    to fill. With a canvas design the frame is composed from the preview's own
+    normalised values (background, scale, offset, rotation, flips) and the caption
+    is burned onto the final frame, so the file matches what was on screen.
     """
-    if fit == 'crop':
+    if design is not None:
+        caption = escape_filter_path(caption_file) if caption_file else None
+        graph, label = export_design.frame_filter_graph(
+            design, target_w, target_h, caption_file=caption,
+        )
+        command = [ffmpeg, '-y', '-i', source, '-filter_complex', graph, '-map', label]
+    elif fit == 'crop':
         vf = f'scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h},setsar=1'
         command = [ffmpeg, '-y', '-i', source, '-vf', vf, '-map', '0:v:0']
     else:
@@ -2577,12 +2587,33 @@ async def process_export(payload: ProcessingRequest) -> dict[str, Any]:
             # Platform style: target frame size for the export (9:16 vertical,
             # 16:9 standard, 1:1 square). Skipped when the source already has
             # the target aspect (within 3%).
-            platform_target = {'vertical': (1080, 1920), 'standard': (1920, 1080), 'square': (1080, 1080)}.get(payload.platform_style)
+            design = export_design.normalize_design(payload.design)
+            # The canvas owns the frame: when it is present its platform select is
+            # the one the user sees, so it must be the one the file is made in.
+            platform_target = {'vertical': (1080, 1920), 'standard': (1920, 1080),
+                               'square': (1080, 1080)}.get(design.platform if design is not None else payload.platform_style)
+            # Canvas design: the preview's normalised values. When a design is
+            # present the export always renders the frame, so the caption lands
+            # on the final frame instead of being baked into the source first.
+            if design is not None and source_width and source_height:
+                target_size = platform_target or ((source_width // 2) * 2, (source_height // 2) * 2)
+            else:
+                target_size = platform_target
             platform_skip = (
-                not platform_target
+                not target_size
                 or not source_width or not source_height
-                or abs(source_width / source_height - platform_target[0] / platform_target[1]) / (platform_target[0] / platform_target[1]) < 0.03
+                or (
+                    design is None
+                    and abs(source_width / source_height - target_size[0] / target_size[1]) / (target_size[0] / target_size[1]) < 0.03
+                )
             )
+            caption_ass_path: Path | None = None
+            if design is not None and payload.burn_subtitles and design.caption and target_size:
+                caption_ass_path = export_dir / 'dubbed-subtitles.ass'
+                caption_ass_path.write_text(
+                    export_design.caption_ass(export_segments, target_size[0], target_size[1], design),
+                    encoding='utf-8',
+                )
             mode = payload.export_mode or 'single'
             chunks = [chunk for chunk in (project.get('chunks') or []) if Path(str(chunk.get('path') or '')).is_file()]
             want_combined = mode in ('single', 'both') or not chunks
@@ -2725,7 +2756,7 @@ async def process_export(payload: ProcessingRequest) -> dict[str, Any]:
                     '-filter_complex', ';'.join(filter_parts),
                     '-map', '0:v:0', '-map', '[dubbed]',
                 ])
-                if payload.burn_subtitles:
+                if payload.burn_subtitles and caption_ass_path is None:
                     srt_path = escape_filter_path(export_dir / 'dubbed-subtitles.srt')
                     vf_parts = [f"subtitles='{srt_path}'"]
                     if pad_seconds > 0.05:
@@ -2744,11 +2775,12 @@ async def process_export(payload: ProcessingRequest) -> dict[str, Any]:
                 project['video_path'] = str(video_path)
                 if not platform_skip:
                     styled = export_dir / 'styled-video.mp4'
-                    _apply_platform_style(ffmpeg, str(video_path), str(styled), platform_target[0], platform_target[1], payload.platform_fit)
+                    _apply_platform_style(ffmpeg, str(video_path), str(styled), target_size[0], target_size[1],
+                                          payload.platform_fit, design=design, caption_file=caption_ass_path)
                     video_path.unlink(missing_ok=True)
                     styled.replace(video_path)
                     await emit_progress(payload.project_id, 'Exporting', 94,
-                                        f'Converted to {platform_target[0]}×{platform_target[1]} for the selected platform.')
+                                        f'Converted to {target_size[0]}×{target_size[1]} for the selected platform.')
 
             if want_parts:
                 # One dubbed MP4 per chunk, reusing the keyframe-aligned chunk
@@ -2908,7 +2940,10 @@ async def process_export(payload: ProcessingRequest) -> dict[str, Any]:
                         subprocess.run(part_command, check=True, capture_output=True, text=True)
                     if not platform_skip and part_path.is_file():
                         styled_part = part_path.with_name(f'styled-{part_path.name}')
-                        _apply_platform_style(ffmpeg, str(part_path), str(styled_part), platform_target[0], platform_target[1], payload.platform_fit)
+                        # The caption is baked per part only in the combined export;
+                        # parts carry the same frame design without its ASS file.
+                        _apply_platform_style(ffmpeg, str(part_path), str(styled_part), target_size[0], target_size[1],
+                                              payload.platform_fit, design=design)
                         styled_part.replace(part_path)
                     parts_list.append({'index': chunk_index + 1, 'name': part_path.name})
                 project['parts_dir'] = str(parts_dir)

@@ -21,6 +21,10 @@ interface DubbingTrackEditorProps {
   provider: string;
   currentTime: number;
   videoDuration: number;
+  /** Ceiling for the panel, so it never grows past the panel it sits beside. */
+  maxHeight?: number;
+  /** Re-read that ceiling (called when the slider reaches its end). */
+  onMeasureMaxHeight?: () => void;
   onSeek: (time: number) => void;
   onNotice: (message: string) => void;
 }
@@ -40,6 +44,8 @@ export function DubbingTrackEditor({
   provider,
   currentTime,
   videoDuration,
+  maxHeight,
+  onMeasureMaxHeight,
   onSeek,
   onNotice,
 }: DubbingTrackEditorProps) {
@@ -47,7 +53,16 @@ export function DubbingTrackEditor({
   const updateSegment = useStudioStore((state) => state.updateSegment);
   const deleteSegment = useStudioStore((state) => state.deleteSegment);
 
-  const [height, setHeight] = useState(420);
+  // `height` is the whole card, header included, so the slider and the panel
+  // next to it can be compared directly. The ceiling is that panel's height, and
+  // the track OPENS at it: the default is the slider dragged all the way right,
+  // so both panels line up without the user touching anything. "At the ceiling"
+  // is remembered, so a re-measured Workflow card keeps being matched instead of
+  // leaving the track a few pixels short.
+  const [height, setHeight] = useState(480);
+  const [atCeiling, setAtCeiling] = useState(true);
+  const ceiling = Math.max(260, Math.round(maxHeight ?? Math.min(720, window.innerHeight * 0.62)));
+  const cardHeight = atCeiling ? ceiling : Math.max(220, Math.min(height, ceiling));
   const [collapsed, setCollapsed] = useState(false);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [genders, setGenders] = useState<Record<string, Gender>>({});
@@ -62,11 +77,25 @@ export function DubbingTrackEditor({
   }, [ordered, currentTime]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const rowRefs = useRef<Map<string, HTMLTableRowElement>>(new Map());
+  const listRef = useRef<HTMLDivElement>(null);
   const lastScrolledRef = useRef<string | null>(null);
   useEffect(() => {
     if (!activeId || activeId === lastScrolledRef.current) return;
     lastScrolledRef.current = activeId;
-    rowRefs.current.get(activeId)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    const row = rowRefs.current.get(activeId);
+    const list = listRef.current;
+    if (!row || !list) return;
+    const rowBox = row.getBoundingClientRect();
+    const listBox = list.getBoundingClientRect();
+    // Already fully visible inside the track: leave everything alone.
+    if (rowBox.top >= listBox.top + 4 && rowBox.bottom <= listBox.bottom - 4) return;
+    // Scroll THIS list by hand. `scrollIntoView` also scrolls every scrollable
+    // ancestor — it used to jump the whole page down to the track while the
+    // preview at the top was playing.
+    const offset = rowBox.top < listBox.top
+      ? rowBox.top - listBox.top - 8
+      : rowBox.bottom - listBox.bottom + 8;
+    list.scrollTo({ top: list.scrollTop + offset, behavior: 'smooth' });
   }, [activeId]);
   const totalSeconds = Math.max(videoDuration, ...ordered.map((item) => item.end), 1);
 
@@ -180,8 +209,11 @@ export function DubbingTrackEditor({
   };
 
   return (
-    <section className="timeline-container rounded-2xl border border-white/[0.08] bg-[#0c1220] shadow-2xl overflow-hidden">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] bg-[#0e1526] px-4 py-2.5">
+    <section
+      className="timeline-container flex flex-col rounded-2xl border border-white/[0.08] bg-[#0c1220] shadow-2xl overflow-hidden"
+      style={collapsed ? undefined : { height: cardHeight }}
+    >
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] bg-[#0e1526] px-4 py-2.5">
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 text-sm font-semibold text-white">
             <Mic size={16} className="text-emerald-400" />
@@ -195,15 +227,28 @@ export function DubbingTrackEditor({
           )}
         </div>
         <div className="flex items-center gap-2">
-          <label className="flex items-center gap-2 text-[11px] text-slate-400">
+          <label
+            className="flex items-center gap-2 text-[11px] text-slate-400"
+            title={`Drag to resize. All the way right it matches the panel beside it (${ceiling} px).`}
+          >
             Height
             <input
               type="range"
-              min={160}
-              max={520}
-              step={20}
-              value={height}
-              onChange={(event) => setHeight(Number(event.target.value))}
+              min={220}
+              max={ceiling}
+              step={1}
+              value={cardHeight}
+              onChange={(event) => {
+                const next = Number(event.target.value);
+                setHeight(next);
+                // The end of the track means "same height as the panel next to me".
+                // Re-measure it here: the card can have grown since the last
+                // ResizeObserver notification (a step finishing, a label wrapping)
+                // and the end of the slider must land exactly on it.
+                const atEnd = next >= ceiling;
+                setAtCeiling(atEnd);
+                if (atEnd) onMeasureMaxHeight?.();
+              }}
               className="h-1 w-20 cursor-pointer"
               aria-label="Dubbing track height"
             />
@@ -228,7 +273,7 @@ export function DubbingTrackEditor({
       </div>
 
       {!collapsed && (
-        <div className="flex flex-col" style={{ height }}>
+        <div className="flex min-h-0 flex-1 flex-col">
           {problems.length > 0 && (
             <ul className="max-h-20 overflow-y-auto border-b border-amber-500/20 bg-amber-500/5 px-4 py-1.5 text-[11px] text-amber-200">
               {problems.slice(0, 20).map((problem, index) => (
@@ -240,7 +285,7 @@ export function DubbingTrackEditor({
           )}
 
           <div className="grid h-full min-h-0 flex-1 grid-rows-[minmax(0,1fr)] overflow-hidden">
-            <div className="h-full min-h-0 overflow-y-auto">
+            <div ref={listRef} className="h-full min-h-0 overflow-y-auto">
               {ordered.length === 0 && (
                 <p className="p-4 text-xs text-slate-500">
                   No segments yet. Transcribe and translate the video, or add a segment.

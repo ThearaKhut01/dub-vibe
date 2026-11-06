@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -74,6 +74,9 @@ class ProcessingRequest(BaseModel):
     word_timestamps: bool = False
     # Translation engine: which provider goes first (the chain still falls back).
     translation_provider: str = 'auto'   # auto | qwen | nllb | argos | google | gemini | openai | codecraft
+    # Canvas design values from the preview: platform frame, background,
+    # video transform and caption position/size. All normalised (never pixels).
+    design: dict[str, Any] | None = None
     # Platform style: convert the export to a platform aspect ratio.
     # vertical = 9:16 (TikTok/Reels/Shorts), standard = 16:9 (YouTube/FB),
     # square = 1:1 (Instagram/FB feed). 'blur' fills the frame with a blurred

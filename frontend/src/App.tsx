@@ -25,9 +25,17 @@ import {
   FilePlus,
   Trash2,
   Wand2,
+  Link2,
+  RotateCcw,
 } from 'lucide-react';
 import { useStudioStore } from './store/useStudioStore';
+import { usePreviewLayout } from './store/usePreviewLayout';
+import { useDesignStore } from './store/useDesignStore';
+import { captionAtTime } from './store/useDesignStore';
+import { useDragResize } from './hooks/useDragResize';
 import ApiPoolManager from './components/ApiPoolManager';
+import { DesignBar } from './components/DesignBar';
+import { PreviewCanvas } from './components/PreviewCanvas';
 import { DubbingTrackEditor } from './components/DubbingTrackEditor';
 import { TimelineEditor } from './components/TimelineEditor';
 import type { ProjectSummary, OverlapProposal, FixOverlapsResponse } from './types';
@@ -222,8 +230,6 @@ function App() {
   const [autoDuck, setAutoDuck] = useState(() => localStorage.getItem('dubvibe-auto-duck') !== 'false');
   const [keepMusic, setKeepMusic] = useState(() => localStorage.getItem('dubvibe-keep-music') !== 'false');
   const [keepSfx, setKeepSfx] = useState(() => localStorage.getItem('dubvibe-keep-sfx') !== 'false');
-  const [platformStyle, setPlatformStyle] = useState(() => localStorage.getItem('dubvibe-platform-style') ?? 'original');
-  const [platformFit, setPlatformFit] = useState(() => localStorage.getItem('dubvibe-platform-fit') ?? 'blur');
   const [showModels, setShowModels] = useState(false);
   const [modelBusy, setModelBusy] = useState<string | null>(null);
   const [nllbConfirm, setNllbConfirm] = useState(false);
@@ -350,6 +356,95 @@ function App() {
     'Subtitle': { muted: false, hidden: false, locked: false },
   });
 
+  // --- Preview layout (persisted): one row shared by both players ----------
+  const {
+    height: previewHeight,
+    share: previewShare,
+    size: previewSize,
+    syncPlayback,
+    applySize,
+    bumpHeight,
+    bumpShare,
+    setShare,
+    setSyncPlayback,
+    fitToViewport,
+    reset: resetPreviewLayout,
+  } = usePreviewLayout();
+  const previewRowRef = useRef<HTMLDivElement>(null);
+  // The Dubbing Track may grow to the Workflow panel's height, never past it.
+  const workflowCardRef = useRef<HTMLDivElement>(null);
+  const [workflowCardHeight, setWorkflowCardHeight] = useState(0);
+  // Only one player may drive the other; otherwise every timeupdate would pull
+  // the other one back and the pair would jitter.
+  const syncMasterRef = useRef<'source' | 'dubbed'>('source');
+  const rowResize = useDragResize({ onDelta: (_deltaX, deltaY) => bumpHeight(deltaY) });
+  const columnResize = useDragResize({
+    onDelta: (deltaX) => {
+      const width = previewRowRef.current?.getBoundingClientRect().width ?? 0;
+      if (width > 0) bumpShare(deltaX / width);
+    },
+  });
+
+  const measureWorkflowCard = () => {
+    const element = workflowCardRef.current;
+    if (!element) return;
+    setWorkflowCardHeight(Math.round(element.getBoundingClientRect().height));
+  };
+
+  useEffect(() => {
+    const element = workflowCardRef.current;
+    if (!element) return;
+    measureWorkflowCard();
+    const observer = new ResizeObserver(measureWorkflowCard);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  // A row taller than 70% of the window (after a resize, or restored from a
+  // larger screen) would push the timeline out of reach.
+  useEffect(() => {
+    fitToViewport();
+  }, [fitToViewport]);
+
+  useEffect(() => {
+    const onWindowResize = () => fitToViewport();
+    window.addEventListener('resize', onWindowResize);
+    return () => window.removeEventListener('resize', onWindowResize);
+  }, [fitToViewport]);
+
+  const toggleSyncPlayback = () => {
+    const next = !syncPlayback;
+    setSyncPlayback(next);
+    if (!next) return;
+    // Align immediately, so turning sync on never causes an audible jump.
+    const source = videoRef.current;
+    const dubbed = dubbedVideoRef.current;
+    if (!source || !dubbed) return;
+    const master = !source.paused || dubbed.paused ? 'source' : 'dubbed';
+    syncMasterRef.current = master;
+    const time = master === 'source' ? source.currentTime : dubbed.currentTime;
+    if (Math.abs(dubbed.currentTime - time) > 0.2) dubbed.currentTime = time;
+    if (Math.abs(source.currentTime - time) > 0.2) source.currentTime = time;
+    if (master === 'source' && !source.paused && dubbed.paused) void dubbed.play().catch(() => { });
+    if (master === 'dubbed' && !dubbed.paused && source.paused) void source.play().catch(() => { });
+  };
+
+  // The cue under the playhead: with a words-per-cue setting the line advances
+  // chunk by chunk while it plays, exactly as the burned ASS file does.
+  const wordsPerCue = useDesignStore((state) => state.subtitle.wordsPerLine);
+  const activeTranslation = useMemo(() => {
+    const line = transcript.find((segment) => currentTime >= segment.start && currentTime < segment.end);
+    if (!line) return '';
+    return captionAtTime(
+      line.translation || line.text || '',
+      wordsPerCue, currentTime, line.start, line.end,
+    );
+  }, [transcript, currentTime, wordsPerCue]);
+
+  // The canvas platform select is the frame the user sees, and therefore the
+  // frame the export makes: there is no second Platform style control any more.
+  const designPlatform = useDesignStore((state) => state.platform);
+
   const projectDurationSeconds = useMemo(() => {
     if (videoDuration && videoDuration > 0) return videoDuration;
     const [hours, minutes, seconds] = project.duration.split(':').map(Number);
@@ -374,11 +469,27 @@ function App() {
     }
   };
 
+  /** Keep the follower aligned while synced playback is on. */
+  const alignOtherPlayer = (origin: 'source' | 'dubbed', time: number) => {
+    if (!syncPlayback || syncMasterRef.current !== origin) return;
+    const other = origin === 'source' ? dubbedVideoRef.current : videoRef.current;
+    if (!other) return;
+    // A fraction of a second is inaudible; correcting every frame would stutter.
+    if (Math.abs(other.currentTime - time) > 0.35) {
+      other.currentTime = Math.max(0, Math.min(time, other.duration || time));
+    }
+  };
+
   const seekTo = (time: number) => {
     const clamped = Math.max(0, Math.min(time, projectDurationSeconds));
     setCurrentTime(clamped);
     if (videoRef.current) {
       videoRef.current.currentTime = clamped;
+    }
+    if (syncPlayback && dubbedVideoRef.current) {
+      syncMasterRef.current = 'source';
+      const dubbed = dubbedVideoRef.current;
+      dubbed.currentTime = Math.max(0, Math.min(clamped, dubbed.duration || clamped));
     }
   };
 
@@ -387,6 +498,7 @@ function App() {
       setNotice('Import a video first to play.');
       return;
     }
+    syncMasterRef.current = 'source';
     if (videoRef.current.paused) {
       videoRef.current.play().catch(console.error);
     } else {
@@ -397,6 +509,7 @@ function App() {
   const toggleDubbedPlay = () => {
     const video = dubbedVideoRef.current;
     if (!video) return;
+    syncMasterRef.current = 'dubbed';
     if (video.paused) {
       void video.play().catch(() => { });
     } else {
@@ -408,7 +521,52 @@ function App() {
     const video = ref.current;
     if (!video) return;
     const duration = video.duration || 0;
-    video.currentTime = Math.max(0, Math.min(duration, video.currentTime + delta));
+    const next = Math.max(0, Math.min(duration, video.currentTime + delta));
+    video.currentTime = next;
+    if (!syncPlayback) return;
+    const other = ref === videoRef ? dubbedVideoRef.current : ref === dubbedVideoRef ? videoRef.current : null;
+    syncMasterRef.current = ref === videoRef ? 'source' : 'dubbed';
+    if (other) other.currentTime = Math.max(0, Math.min(next, other.duration || next));
+  };
+
+  // The native play/pause events also fire when the other player is started
+  // programmatically, so these handlers only mirror state and alignment — the
+  // master is chosen by the button that was actually pressed.
+  const handleSourcePlay = () => {
+    setIsPlaying(true);
+    if (!syncPlayback) {
+      dubbedVideoRef.current?.pause();
+      stopPreviewAudio();
+      return;
+    }
+    const source = videoRef.current;
+    const dubbed = dubbedVideoRef.current;
+    if (!source || !dubbed) return;
+    if (Math.abs(dubbed.currentTime - source.currentTime) > 0.25) dubbed.currentTime = source.currentTime;
+    if (dubbed.paused) void dubbed.play().catch(() => { });
+  };
+
+  const handleSourcePause = () => {
+    setIsPlaying(false);
+    if (syncPlayback) dubbedVideoRef.current?.pause();
+  };
+
+  const handleDubbedPlay = () => {
+    setDubbedPlaying(true);
+    if (!syncPlayback) {
+      videoRef.current?.pause();
+      return;
+    }
+    const source = videoRef.current;
+    const dubbed = dubbedVideoRef.current;
+    if (!source || !dubbed) return;
+    if (Math.abs(source.currentTime - dubbed.currentTime) > 0.25) source.currentTime = dubbed.currentTime;
+    if (source.paused) void source.play().catch(() => { });
+  };
+
+  const handleDubbedPause = () => {
+    setDubbedPlaying(false);
+    if (syncPlayback) videoRef.current?.pause();
   };
 
   const formatTimecode = (seconds: number) => {
@@ -710,8 +868,7 @@ function App() {
         autoDuck,
         keepMusic,
         keepSfx,
-        platformStyle: (platformStyle as 'original' | 'vertical' | 'standard' | 'square'),
-        platformFit: (platformFit as 'blur' | 'crop'),
+        platformStyle: designPlatform,
       });
       setExportFiles({
         subtitlesUrl: exported.vtt
@@ -1525,15 +1682,25 @@ function App() {
               ))}
             </div>
 
-            <div className="grid gap-4 xl:grid-cols-[1.3fr_0.7fr]">
-              <div className="flex min-w-0 flex-col gap-4">
-                <div className="rounded-2xl border border-white/10 bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.12),_transparent_50%),rgba(15,23,42,0.9)] p-4">
-                  <div className="mb-4 flex items-center justify-between">
-                    <div className="flex items-center gap-2 text-sm text-slate-300">
-                      <Play className="fill-current text-sky-400" size={15} />
-                      Preview
+            {/* Preview row + draggable splitters ---------------------------------
+                Source and Dubbed share one row; the bar under it resizes the row
+                (persisted), the bar between them resizes the two widths. */}
+            <div className="flex flex-col gap-2">
+              <div
+                ref={previewRowRef}
+                className="flex min-h-0 flex-col gap-2 md:flex-row"
+                style={{ height: previewHeight }}
+              >
+                <div
+                  className="flex min-h-0 min-w-0 flex-col rounded-2xl border border-white/10 bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.12),_transparent_50%),rgba(15,23,42,0.9)] p-3"
+                  style={{ flexGrow: previewShare, flexBasis: 0 }}
+                >
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-slate-300">
+                      <Play className="fill-current text-sky-400" size={14} />
+                      <span className="text-sm font-medium">Source preview</span>
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center justify-end gap-1.5">
                       {hasMedia && (
                         <div className="flex items-center gap-1.5">
                           <button
@@ -1554,35 +1721,63 @@ function App() {
                           </button>
                         </div>
                       )}
-                      <span className="text-xs uppercase tracking-[0.2em] text-slate-500">Source preview</span>
+                      <div className="flex items-center overflow-hidden rounded-md border border-white/10" role="group" aria-label="Preview size">
+                        {(['S', 'M', 'L', 'Fit'] as const).map((option) => (
+                          <button
+                            key={option}
+                            onClick={() => applySize(option)}
+                            aria-pressed={previewSize === option}
+                            title={option === 'Fit' ? 'Fill the available height' : `${option} preview size`}
+                            className={`px-1.5 py-1 text-[10px] font-semibold transition ${previewSize === option ? 'bg-sky-500/25 text-sky-100' : 'text-slate-400 hover:bg-white/5 hover:text-slate-200'}`}
+                          >
+                            {option}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        onClick={toggleSyncPlayback}
+                        aria-pressed={syncPlayback}
+                        title={syncPlayback ? 'Source and Dubbed play, pause and seek together (on)' : 'Play both previews together'}
+                        className={`flex items-center gap-1 rounded-md border px-1.5 py-1 text-[10px] font-medium transition ${syncPlayback ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200' : 'border-white/10 bg-slate-900/80 text-slate-400 hover:text-slate-200'}`}
+                      >
+                        <Link2 size={11} /> Sync
+                      </button>
+                      <button
+                        onClick={resetPreviewLayout}
+                        title="Reset the preview size and split to their defaults"
+                        className="rounded-md border border-white/10 bg-slate-900/80 p-1 text-slate-400 transition hover:text-slate-200"
+                      >
+                        <RotateCcw size={11} />
+                      </button>
                     </div>
                   </div>
 
-                  <div className="relative flex h-64 items-center justify-center overflow-hidden rounded-2xl border border-white/10 bg-black">
-                    {previewUrl ? (
-                      <video
-                        ref={videoRef}
-                        src={previewUrl}
-                        onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
-                        onLoadedMetadata={(e) => setVideoDuration(e.currentTarget.duration)}
-                        onPlay={() => { setIsPlaying(true); dubbedVideoRef.current?.pause(); stopPreviewAudio(); }}
-                        onPause={() => setIsPlaying(false)}
-                        className="h-full w-full object-contain"
-                      />
-                    ) : (
-                      <button onClick={() => fileInputRef.current?.click()} className="flex h-full w-full flex-col items-center justify-center gap-3 text-sm text-slate-400 hover:text-white group transition">
-                        <div className="rounded-full border border-dashed border-white/20 p-4 group-hover:border-sky-500/50 group-hover:bg-sky-500/10 transition">
-                          <FileVideo size={32} className="text-slate-400 group-hover:text-sky-400 transition" />
-                        </div>
-                        <div className="text-center">
-                          <p className="font-medium text-slate-200 group-hover:text-sky-300">Click to import video</p>
-                          <p className="text-xs text-slate-500 mt-0.5">MP4, MOV, MKV, WebM supported</p>
-                        </div>
-                      </button>
-                    )}
+                  {/* The canvas: platform frame, background, transform and caption,
+                      all driven by the normalised design values. */}
+                  <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden">
+                    <PreviewCanvas
+                      src={previewUrl}
+                      videoRef={videoRef}
+                      onTimeUpdate={(e) => { setCurrentTime(e.currentTarget.currentTime); alignOtherPlayer('source', e.currentTarget.currentTime); }}
+                      onLoadedMetadata={(e) => setVideoDuration(e.currentTarget.duration)}
+                      onPlay={handleSourcePlay}
+                      onPause={handleSourcePause}
+                      subtitleText={activeTranslation}
+                      empty={(
+                        <button onClick={() => fileInputRef.current?.click()} className="group flex h-full w-full flex-col items-center justify-center gap-2 overflow-hidden rounded-xl border border-white/10 bg-black p-2 text-sm text-slate-400 transition hover:text-white">
+                          <div className="rounded-full border border-dashed border-white/20 p-2.5 transition group-hover:border-sky-500/50 group-hover:bg-sky-500/10">
+                            <FileVideo size={22} className="text-slate-400 transition group-hover:text-sky-400" />
+                          </div>
+                          <div className="text-center">
+                            <p className="text-xs font-medium text-slate-200 group-hover:text-sky-300">Click to import video</p>
+                            <p className="mt-0.5 text-[10px] text-slate-500">MP4, MOV, MKV, WebM supported</p>
+                          </div>
+                        </button>
+                      )}
+                    />
                   </div>
                   {previewUrl && (
-                    <div className="mt-3 flex items-center gap-2 rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2">
+                    <div className="mt-2 flex shrink-0 items-center gap-2 rounded-xl border border-white/10 bg-slate-900/80 px-2 py-1.5">
                       <button onClick={() => skipVideo(videoRef, -5)} title="Back 5 seconds" className="rounded p-1 text-slate-400 transition hover:text-white">
                         <SkipBack size={14} />
                       </button>
@@ -1609,13 +1804,34 @@ function App() {
                   )}
                 </div>
 
-                <div className="rounded-2xl border border-white/10 bg-slate-900/80 p-4">
-                  <div className="mb-4 flex items-center justify-between">
-                    <div className="flex items-center gap-2 text-sm text-slate-300">
-                      <AudioLines size={15} className="text-emerald-400" />
-                      Dubbed preview
+                {/* Drag to change the Source/Dubbed widths (25% minimum each). */}
+                <div
+                  role="separator"
+                  aria-orientation="vertical"
+                  aria-label="Resize the source and dubbed previews"
+                  tabIndex={0}
+                  title="Drag to resize the previews · double-click to balance"
+                  onDoubleClick={() => setShare(0.5)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'ArrowLeft') bumpShare(-0.02);
+                    if (event.key === 'ArrowRight') bumpShare(0.02);
+                  }}
+                  className="group hidden shrink-0 cursor-col-resize items-center justify-center rounded-full outline-none transition focus-visible:ring-2 focus-visible:ring-sky-500/60 md:flex md:w-2"
+                  {...columnResize.handleProps}
+                >
+                  <span className={`h-full w-1 rounded-full transition-colors ${columnResize.dragging ? 'bg-sky-400' : 'bg-white/10 group-hover:bg-sky-500/60'}`} />
+                </div>
+
+                <div
+                  className="flex min-h-0 min-w-0 flex-col rounded-2xl border border-white/10 bg-slate-900/80 p-3"
+                  style={{ flexGrow: 1 - previewShare, flexBasis: 0 }}
+                >
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-slate-300">
+                      <AudioLines size={14} className="text-emerald-400" />
+                      <span className="text-sm font-medium">Dubbed preview</span>
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center justify-end gap-1.5">
                       {dubbedPreviewUrl && (
                         <a
                           href={dubbedPreviewUrl}
@@ -1626,37 +1842,48 @@ function App() {
                           <span>Download</span>
                         </a>
                       )}
-                      <span className="text-xs uppercase tracking-[0.2em] text-slate-500">Dubbed output</span>
+                      <div className="flex items-center overflow-hidden rounded-md border border-white/10" role="group" aria-label="Preview size">
+                        {(['S', 'M', 'L', 'Fit'] as const).map((option) => (
+                          <button
+                            key={option}
+                            onClick={() => applySize(option)}
+                            aria-pressed={previewSize === option}
+                            title={option === 'Fit' ? 'Fill the available height' : `${option} preview size`}
+                            className={`px-1.5 py-1 text-[10px] font-semibold transition ${previewSize === option ? 'bg-emerald-500/25 text-emerald-100' : 'text-slate-400 hover:bg-white/5 hover:text-slate-200'}`}
+                          >
+                            {option}
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   </div>
-                  <div className="relative flex h-64 items-center justify-center overflow-hidden rounded-2xl border border-white/10 bg-black">
-                    {dubbedPreviewUrl ? (
-                      <video
-                        key={dubbedPreviewUrl}
-                        ref={dubbedVideoRef}
-                        src={dubbedPreviewUrl}
-                        onTimeUpdate={(e) => setDubbedTime(e.currentTarget.currentTime)}
-                        onLoadedMetadata={(e) => setDubbedDuration(e.currentTarget.duration || 0)}
-                        onPlay={() => { setDubbedPlaying(true); videoRef.current?.pause(); }}
-                        onPause={() => setDubbedPlaying(false)}
-                        className="h-full w-full object-contain"
-                      />
-                    ) : (
-                      <div className="flex flex-col items-center gap-3 text-center">
-                        <div className="rounded-full border border-dashed border-white/15 p-4">
-                          <AudioLines size={28} className="text-slate-600" />
+                  <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden">
+                    <PreviewCanvas
+                      key={dubbedPreviewUrl}
+                      src={dubbedPreviewUrl}
+                      videoRef={dubbedVideoRef}
+                      onTimeUpdate={(e) => { setDubbedTime(e.currentTarget.currentTime); alignOtherPlayer('dubbed', e.currentTarget.currentTime); }}
+                      onLoadedMetadata={(e) => setDubbedDuration(e.currentTarget.duration || 0)}
+                      onPlay={handleDubbedPlay}
+                      onPause={handleDubbedPause}
+                      subtitleText={activeTranslation}
+                      empty={(
+                        <div className="flex h-full w-full flex-col items-center justify-center gap-2 overflow-hidden rounded-xl border border-white/10 bg-black p-2 text-center">
+                          <div className="rounded-full border border-dashed border-white/15 p-2.5">
+                            <AudioLines size={22} className="text-slate-600" />
+                          </div>
+                          <div>
+                            <p className="text-xs font-medium text-slate-400">No dubbed video yet</p>
+                            <p className="mt-0.5 max-w-[260px] text-[10px] text-slate-600">
+                              Run Dub, then Export — the dubbed MP4 plays here directly.
+                            </p>
+                          </div>
                         </div>
-                        <div>
-                          <p className="text-sm font-medium text-slate-400">No dubbed video yet</p>
-                          <p className="mt-0.5 max-w-[280px] text-xs text-slate-600">
-                            Run Dub, then Export — the dubbed MP4 plays here directly, no need to save the file first.
-                          </p>
-                        </div>
-                      </div>
-                    )}
+                      )}
+                    />
                   </div>
                   {dubbedPreviewUrl && (
-                    <div className="mt-3 flex items-center gap-2 rounded-xl border border-white/10 bg-slate-900/80 px-3 py-2">
+                    <div className="mt-2 flex shrink-0 items-center gap-2 rounded-xl border border-white/10 bg-slate-900/80 px-2 py-1.5">
                       <button onClick={() => skipVideo(dubbedVideoRef, -5)} title="Back 5 seconds" className="rounded p-1 text-slate-400 transition hover:text-white">
                         <SkipBack size={14} />
                       </button>
@@ -1672,7 +1899,14 @@ function App() {
                         max={dubbedDuration || 0}
                         step={0.1}
                         value={Math.min(dubbedTime, dubbedDuration || 0)}
-                        onChange={(event) => { if (dubbedVideoRef.current) dubbedVideoRef.current.currentTime = Number(event.target.value); }}
+                        onChange={(event) => {
+                          const time = Number(event.target.value);
+                          syncMasterRef.current = 'dubbed';
+                          if (dubbedVideoRef.current) dubbedVideoRef.current.currentTime = time;
+                          if (syncPlayback && videoRef.current) {
+                            videoRef.current.currentTime = Math.max(0, Math.min(time, videoRef.current.duration || time));
+                          }
+                        }}
                         title="Seek"
                         className="min-w-0 flex-1 accent-emerald-500"
                       />
@@ -1684,62 +1918,62 @@ function App() {
                 </div>
               </div>
 
-              <div className="rounded-2xl border border-white/10 bg-slate-900/80 p-4">
-                <div className="mb-3 flex items-center justify-between">
-                  <p className="text-[10px] uppercase tracking-[0.22em] text-slate-500">Workflow</p>
-                  <FileVideo size={14} className="text-slate-400" />
-                </div>
+              {/* Controls for the canvas above: platform, background, transform, caption. */}
+              <DesignBar />
 
-                <div className="space-y-3">
-                  {workflowSteps.map((step) => (
-                    <div key={step.id} className="rounded-xl border border-white/10 bg-slate-950/80 p-3">
-                      <div className="mb-2 flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          {step.status === 'Completed' ? <CheckCircle2 size={14} className="text-emerald-400" /> : step.status === 'Active' ? <BadgeCheck size={14} className="text-sky-400" /> : <FolderOpen size={14} className="text-slate-400" />}
-                          <span className="text-sm font-medium text-slate-200">{step.label}</span>
-                        </div>
-                        <span className="text-[10px] uppercase tracking-[0.14em] text-slate-400">{step.status}</span>
-                      </div>
-                      <div className="mb-2 h-2 overflow-hidden rounded-full bg-slate-800">
-                        <div className="h-full rounded-full bg-gradient-to-r from-sky-500 to-violet-500" style={{ width: `${step.progress}%` }} />
-                      </div>
-                      <p className="text-xs text-slate-400">{step.id === 'subtitle' && !subtitleSync ? 'Subtitle sync disabled by user' : step.detail}</p>
-                      {step.id === 'subtitle' && <label className="mt-3 flex cursor-pointer items-center gap-2 text-xs text-slate-300">
-                        <input
-                          type="checkbox"
-                          checked={subtitleSync}
-                          onChange={(event) => {
-                            const enabled = event.target.checked;
-                            setSubtitleSync(enabled);
-                            localStorage.setItem('dubvibe-subtitle-sync', String(enabled));
-                            if (!enabled) {
-                              setBurnSubtitles(false);
-                              localStorage.setItem('dubvibe-burn-subtitles', 'false');
-                            }
-                            setExportFiles(null);
-                          }}
-                          className="h-4 w-4 accent-sky-500"
-                        />
-                        Include synced subtitles in export
-                      </label>}
-                      {step.id === 'subtitle' && <label className={`mt-2 flex items-center gap-2 text-xs ${subtitleSync ? 'cursor-pointer text-slate-300' : 'cursor-not-allowed text-slate-500'}`}>
-                        <input
-                          type="checkbox"
-                          checked={burnSubtitles}
-                          disabled={!subtitleSync}
-                          onChange={(event) => {
-                            setBurnSubtitles(event.target.checked);
-                            localStorage.setItem('dubvibe-burn-subtitles', String(event.target.checked));
-                            setExportFiles(null);
-                          }}
-                          className="h-4 w-4 accent-sky-500"
-                        />
-                        Burn captions into video
-                      </label>}
-                    </div>
-                  ))}
-                </div>
+              {/* Drag to change the preview height: 180 px → 70% of the window. */}
+              <div
+                role="separator"
+                aria-orientation="horizontal"
+                aria-label="Resize the preview area"
+                tabIndex={0}
+                title="Drag to resize the preview area · double-click for the default size"
+                onDoubleClick={() => applySize('M')}
+                onKeyDown={(event) => {
+                  if (event.key === 'ArrowUp') bumpHeight(-24);
+                  if (event.key === 'ArrowDown') bumpHeight(24);
+                }}
+                className="group flex h-3 shrink-0 cursor-row-resize items-center justify-center rounded-full outline-none transition focus-visible:ring-2 focus-visible:ring-sky-500/60"
+                {...rowResize.handleProps}
+              >
+                <span className={`h-1 w-full rounded-full transition-colors ${rowResize.dragging ? 'bg-sky-400' : 'bg-white/10 group-hover:bg-sky-500/60'}`} />
               </div>
+
+              {/* The timeline follows the preview row directly: its zoom, scroll
+                  and selection stay untouched by the splitter above it. */}
+              <TimelineEditor
+                projectId={project.id}
+                mode={mode}
+                busy={busy}
+                segments={transcript}
+                dubSegments={dubAudioSegments}
+                dubAudioVersion={dubAudioVersion}
+                hasMedia={hasMedia}
+                mediaName={importedFile?.name ?? project.mediaName ?? 'Imported Video'}
+                duration={projectDurationSeconds}
+                currentTime={currentTime}
+                isPlaying={isPlaying}
+                videoRef={videoRef}
+                videoChunks={videoChunks}
+                chunkSeconds={chunkSeconds}
+                selectedId={selectedSegmentId}
+                onSelect={setSelectedSegmentId}
+                onSeek={seekTo}
+                onTogglePlay={togglePlay}
+                onOpenEditor={openSegmentEditor}
+                onNotice={setNotice}
+                trackStates={trackStates}
+                onToggleMute={toggleTrackMute}
+                onToggleHide={toggleTrackHide}
+                onToggleLock={toggleTrackLock}
+                onRefresh={handleRefresh}
+                isRefreshing={isRefreshing}
+                onFixOverlaps={handleFixOverlaps}
+                fixOverlapsState={fixOverlapsState}
+                onCutRange={handleCutRange}
+                cutBusy={cutBusy}
+                targetLanguage={targetLanguage}
+              />
             </div>
 
             {/* Video parts — every chunk with live one-by-one dubbing progress */}
@@ -1822,54 +2056,83 @@ function App() {
               </div>
             )}
 
-            {transcript.length > 0 && project.id && (
-              <DubbingTrackEditor
-                projectId={project.id}
-                segments={transcript}
-                audio={dubAudioSegments}
-                targetLanguage={targetLanguage}
-                provider={ttsProvider === 'auto' ? 'edge' : ttsProvider}
-                currentTime={currentTime}
-                videoDuration={projectDurationSeconds}
-                onSeek={seekTo}
-                onNotice={setNotice}
-              />
-            )}
+            {/* Workflow and the Dubbing Track share a row and stretch to the same height. */}
+            <div className="grid items-start gap-4 xl:grid-cols-[0.7fr_1.3fr]">
+              <div ref={workflowCardRef} className="rounded-2xl border border-white/10 bg-slate-900/80 p-4">
+                <div className="mb-3 flex items-center justify-between">
+                  <p className="text-[10px] uppercase tracking-[0.22em] text-slate-500">Workflow</p>
+                  <FileVideo size={14} className="text-slate-400" />
+                </div>
 
-            {/* Timeline editor */}
-            <TimelineEditor
-              projectId={project.id}
-              mode={mode}
-              busy={busy}
-              segments={transcript}
-              dubSegments={dubAudioSegments}
-              dubAudioVersion={dubAudioVersion}
-              hasMedia={hasMedia}
-              mediaName={importedFile?.name ?? project.mediaName ?? 'Imported Video'}
-              duration={projectDurationSeconds}
-              currentTime={currentTime}
-              isPlaying={isPlaying}
-              videoRef={videoRef}
-              videoChunks={videoChunks}
-              chunkSeconds={chunkSeconds}
-              selectedId={selectedSegmentId}
-              onSelect={setSelectedSegmentId}
-              onSeek={seekTo}
-              onTogglePlay={togglePlay}
-              onOpenEditor={openSegmentEditor}
-              onNotice={setNotice}
-              trackStates={trackStates}
-              onToggleMute={toggleTrackMute}
-              onToggleHide={toggleTrackHide}
-              onToggleLock={toggleTrackLock}
-              onRefresh={handleRefresh}
-              isRefreshing={isRefreshing}
-              onFixOverlaps={handleFixOverlaps}
-              fixOverlapsState={fixOverlapsState}
-              onCutRange={handleCutRange}
-              cutBusy={cutBusy}
-              targetLanguage={targetLanguage}
-            />
+                <div className="space-y-3">
+                  {workflowSteps.map((step) => (
+                    <div key={step.id} className="rounded-xl border border-white/10 bg-slate-950/80 p-3">
+                      <div className="mb-2 flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          {step.status === 'Completed' ? <CheckCircle2 size={14} className="text-emerald-400" /> : step.status === 'Active' ? <BadgeCheck size={14} className="text-sky-400" /> : <FolderOpen size={14} className="text-slate-400" />}
+                          <span className="text-sm font-medium text-slate-200">{step.label}</span>
+                        </div>
+                        <span className="text-[10px] uppercase tracking-[0.14em] text-slate-400">{step.status}</span>
+                      </div>
+                      <div className="mb-2 h-2 overflow-hidden rounded-full bg-slate-800">
+                        <div className="h-full rounded-full bg-gradient-to-r from-sky-500 to-violet-500" style={{ width: `${step.progress}%` }} />
+                      </div>
+                      <p className="text-xs text-slate-400">{step.id === 'subtitle' && !subtitleSync ? 'Subtitle sync disabled by user' : step.detail}</p>
+                      {step.id === 'subtitle' && <label className="mt-3 flex cursor-pointer items-center gap-2 text-xs text-slate-300">
+                        <input
+                          type="checkbox"
+                          checked={subtitleSync}
+                          onChange={(event) => {
+                            const enabled = event.target.checked;
+                            setSubtitleSync(enabled);
+                            localStorage.setItem('dubvibe-subtitle-sync', String(enabled));
+                            if (!enabled) {
+                              setBurnSubtitles(false);
+                              localStorage.setItem('dubvibe-burn-subtitles', 'false');
+                            }
+                            setExportFiles(null);
+                          }}
+                          className="h-4 w-4 accent-sky-500"
+                        />
+                        Include synced subtitles in export
+                      </label>}
+                      {step.id === 'subtitle' && <label className={`mt-2 flex items-center gap-2 text-xs ${subtitleSync ? 'cursor-pointer text-slate-300' : 'cursor-not-allowed text-slate-500'}`}>
+                        <input
+                          type="checkbox"
+                          checked={burnSubtitles}
+                          disabled={!subtitleSync}
+                          onChange={(event) => {
+                            setBurnSubtitles(event.target.checked);
+                            localStorage.setItem('dubvibe-burn-subtitles', String(event.target.checked));
+                            setExportFiles(null);
+                          }}
+                          className="h-4 w-4 accent-sky-500"
+                        />
+                        Burn captions into video
+                      </label>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+
+              {transcript.length > 0 && project.id && (
+                <DubbingTrackEditor
+                  projectId={project.id}
+                  segments={transcript}
+                  audio={dubAudioSegments}
+                  targetLanguage={targetLanguage}
+                  provider={ttsProvider === 'auto' ? 'edge' : ttsProvider}
+                  currentTime={currentTime}
+                  videoDuration={projectDurationSeconds}
+                  maxHeight={workflowCardHeight || undefined}
+                  onMeasureMaxHeight={measureWorkflowCard}
+                  onSeek={seekTo}
+                  onNotice={setNotice}
+                />
+              )}
+
+            </div>
 
             {/* Processing log */}
             <div className="shrink-0 rounded-2xl border border-white/10 bg-slate-900/80 p-4">
@@ -2367,30 +2630,6 @@ function App() {
                 <p className="mt-1 text-[10px] leading-4 text-slate-500">
                   Separate parts follow the video chunking above (Part 1, Part 2, …). Without chunking, export is always one combined video.
                 </p>
-                <label className="mb-1 mt-3 block text-xs uppercase tracking-[0.18em] text-slate-500">Platform style</label>
-                <select
-                  value={platformStyle}
-                  onChange={(event) => { setPlatformStyle(event.target.value); localStorage.setItem('dubvibe-platform-style', event.target.value); setExportFiles(null); }}
-                  className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200"
-                >
-                  <option value="original">Original — no conversion</option>
-                  <option value="vertical">TikTok / Reels / Shorts (9:16 vertical)</option>
-                  <option value="standard">Standard YouTube / Facebook (16:9)</option>
-                  <option value="square">Instagram / FB Feed (1:1 square)</option>
-                </select>
-                {platformStyle !== 'original' && (
-                  <>
-                    <label className="mb-1 mt-2 block text-[10px] uppercase tracking-[0.14em] text-slate-500">Fit style</label>
-                    <select
-                      value={platformFit}
-                      onChange={(event) => { setPlatformFit(event.target.value); localStorage.setItem('dubvibe-platform-fit', event.target.value); setExportFiles(null); }}
-                      className="w-full rounded-lg border border-white/10 bg-slate-950 px-3 py-2 text-xs text-slate-200"
-                    >
-                      <option value="blur">Blurred background, video centered</option>
-                      <option value="crop">Center-crop to fill</option>
-                    </select>
-                  </>
-                )}
                 <label className="mb-1 mt-3 block text-xs uppercase tracking-[0.18em] text-slate-500">Export folder</label>
                 <div className="flex gap-2">
                   <input
