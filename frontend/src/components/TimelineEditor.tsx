@@ -26,7 +26,7 @@ import {
   ZoomOut,
 } from 'lucide-react';
 import { useStudioStore } from '../store/useStudioStore';
-import type { ProjectMode, TimelineSegment } from '../types';
+import type { TimelineSegment } from '../types';
 
 const apiBaseUrl = import.meta.env.DEV ? '' : 'http://127.0.0.1:8001';
 
@@ -63,7 +63,6 @@ interface ThumbnailSprite {
 
 interface TimelineEditorProps {
   projectId: string;
-  mode: ProjectMode;
   busy: boolean;
   segments: TimelineSegment[];
   dubSegments: TimelineSegment[];
@@ -201,7 +200,6 @@ function readSnapPreference(): boolean {
 
 export function TimelineEditor({
   projectId,
-  mode,
   busy,
   segments,
   dubSegments,
@@ -232,7 +230,7 @@ export function TimelineEditor({
   cutBusy,
   targetLanguage,
 }: TimelineEditorProps) {
-  const editable = mode === 'EDIT' && !busy;
+  const editable = !busy;
 
   const [pixelsPerSecond, setPixelsPerSecond] = useState(DEFAULT_PPS);
   const [snapEnabled, setSnapEnabled] = useState(readSnapPreference);
@@ -371,13 +369,6 @@ export function TimelineEditor({
     setSelectedRange(null);
     setRangeSelectMode(false);
   }, [projectId]);
-
-  useEffect(() => {
-    if (mode !== 'EDIT') {
-      setRangeSelectMode(false);
-      setSelectedRange(null);
-    }
-  }, [mode]);
 
   useEffect(() => {
     try {
@@ -751,7 +742,7 @@ export function TimelineEditor({
             callbacksRef.current.onSeek(start);
             callbacksRef.current.onSelect(segment.id);
           }}
-          title={`${formatTimecode(start)} – ${formatTimecode(end)}${label ? `\n${label}` : ''}${mode === 'EDIT' ? '\nDrag to move · drag an edge to trim · click to edit text' : ''}`}
+          title={`${formatTimecode(start)} – ${formatTimecode(end)}${label ? `\n${label}` : ''}\nDrag to move · drag an edge to trim · click to edit text`}
           role="button"
           tabIndex={-1}
           className={`group absolute top-[3px] bottom-[3px] overflow-hidden rounded-[5px] border text-left transition-colors ${isSelected ? styles.selected : styles.idle} ${canDrag ? 'cursor-grab active:cursor-grabbing' : 'cursor-pointer'}`}
@@ -933,7 +924,6 @@ export function TimelineEditor({
     editable,
     hasMedia,
     mediaName,
-    mode,
     peaks,
     pixelsPerSecond,
     segments,
@@ -1060,7 +1050,7 @@ export function TimelineEditor({
             <span>{isRefreshing ? 'Refreshing...' : 'Refresh'}</span>
           </button>
 
-          {mode === 'EDIT' && dubSegments.length > 0 && (
+          {dubSegments.length > 0 && (
             <button
               onClick={() => void onFixOverlaps()}
               disabled={fixOverlapsState !== 'idle'}
@@ -1072,8 +1062,8 @@ export function TimelineEditor({
             </button>
           )}
 
-          {mode === 'EDIT' && (
-            <button
+          {/* One mode: range cutting is always available. */}
+          <button
               onClick={() => {
                 setRangeSelectMode((value) => !value);
                 setSelectedRange(null);
@@ -1088,7 +1078,6 @@ export function TimelineEditor({
               <Scissors size={12} />
               <span>{rangeSelectMode ? 'Selecting range…' : 'Cut range'}</span>
             </button>
-          )}
 
           {rangeBounds && (
             <div className="flex items-center gap-1.5 rounded-md border border-amber-400/30 bg-amber-500/10 px-2 py-1">
@@ -1286,7 +1275,7 @@ export function TimelineEditor({
           <span><kbd className="rounded border border-white/10 bg-black/30 px-1 py-0.5 text-slate-400">Ctrl</kbd>+wheel zoom</span>
           <span><kbd className="rounded border border-white/10 bg-black/30 px-1 py-0.5 text-slate-400">S</kbd> snap</span>
           <span><kbd className="rounded border border-white/10 bg-black/30 px-1 py-0.5 text-slate-400">F</kbd> fit</span>
-          <span>{mode === 'EDIT' ? 'Drag clips to move · edges to trim · click to edit' : 'Click ruler to scrub · click a clip to select'}</span>
+          <span>Drag clips to move · edges to trim · click to edit</span>
         </div>
       </div>
     </div>

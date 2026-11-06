@@ -147,8 +147,6 @@ function App() {
     workflowSteps,
     mediaLibrary,
     activeTool,
-    mode,
-    setMode,
     setActiveTool,
     setProjectName,
     appendLog,
@@ -873,8 +871,9 @@ function App() {
     setProjectName(file.name.replace(/\.[^.]+$/, ''));
     setNotice(`Uploading ${file.name} to the local processing service...`);
     try {
-      // Video import only exists in EDIT and DUB.
-      const projectMode = mode === 'EDIT' ? 'EDIT' : 'DUB';
+      // One studio now: the legacy mode field is kept as 'DUB' for the project
+      // record; nothing in the app branches on it any more.
+      const projectMode = 'DUB';
       const created = await createProject(file.name.replace(/\.[^.]+$/, ''), projectMode, targetLanguage);
       await uploadMedia(created.id, file);
       setNotice(`${file.name} imported. Ready to transcribe.`);
@@ -1448,35 +1447,16 @@ function App() {
     return 'bg-slate-700/60 text-slate-200 border border-slate-600';
   }, [project.status]);
 
-  const modeSwitcher = (
-    <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-3">
-      <div />
-      <div className="flex items-center gap-2" role="tablist" aria-label="Studio mode">
-        <button
-          role="tab"
-          aria-selected={mode === 'EDIT'}
-          onClick={() => setMode('EDIT')}
-          className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'EDIT' ? 'bg-slate-800 text-white ring-1 ring-white/20' : 'bg-slate-900 text-slate-400 hover:text-slate-200'}`}
-        >
-          EDIT MODE
-        </button>
-        <button
-          role="tab"
-          aria-selected={mode === 'DUB'}
-          onClick={() => setMode('DUB')}
-          className={`rounded-lg px-3 py-2 text-sm font-medium ${mode === 'DUB' ? 'bg-sky-500 text-slate-950' : 'bg-slate-900 text-slate-400 hover:text-slate-200'}`}
-        >
-          DUB MODE
-        </button>
-      </div>
-      <div className="flex items-center justify-end gap-3">
-        <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-900 px-3 py-1.5 text-sm text-slate-300">
-          <Clock3 size={14} /> {project.duration}
-        </span>
-        <span className={`inline-flex items-center rounded-full px-3 py-1.5 text-xs font-semibold ${statusBadge}`}>
-          {project.status}
-        </span>
-      </div>
+  // The project header: duration and status. The old EDIT/DUB tabs are gone —
+  // the studio is one surface where the timeline is always editable.
+  const projectMeta = (
+    <div className="flex items-center justify-end gap-3">
+      <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-900 px-3 py-1.5 text-sm text-slate-300">
+        <Clock3 size={14} /> {project.duration}
+      </span>
+      <span className={`inline-flex items-center rounded-full px-3 py-1.5 text-xs font-semibold ${statusBadge}`}>
+        {project.status}
+      </span>
     </div>
   );
 
@@ -1647,7 +1627,7 @@ function App() {
 
         <section className="flex min-w-0 flex-col border-r border-white/10 bg-slate-950/60">
           <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5">
-            {modeSwitcher}
+            {projectMeta}
             <div className="flex items-center justify-between rounded-2xl border border-white/10 bg-slate-900/80 p-4">
               <div className="flex items-center gap-4 min-w-0">
                 <div className="rounded-xl bg-gradient-to-br from-emerald-400 to-cyan-500 p-2 text-slate-950 shrink-0">
@@ -2028,7 +2008,6 @@ function App() {
                   and selection stay untouched by the splitter above it. */}
               <TimelineEditor
                 projectId={project.id}
-                mode={mode}
                 busy={busy}
                 segments={transcript}
                 dubSegments={dubAudioSegments}
