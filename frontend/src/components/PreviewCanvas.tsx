@@ -5,6 +5,8 @@ import { DESIGN_PLATFORMS, useDesignStore } from '../store/useDesignStore';
 interface PreviewCanvasProps {
   /** The media the canvas shows (empty string = placeholder). */
   src: string;
+  /** The source video's width/height. Shared, so both previews frame identically. */
+  sourceRatio: number;
   /** The element the rest of the app (timeline, sync, seek) keeps using. */
   videoRef: React.RefObject<HTMLVideoElement>;
   onLoadedMetadata?: (event: React.SyntheticEvent<HTMLVideoElement>) => void;
@@ -43,6 +45,7 @@ function capture(event: React.PointerEvent<HTMLElement>): void {
  */
 export function PreviewCanvas({
   src,
+  sourceRatio,
   videoRef,
   onLoadedMetadata,
   onTimeUpdate,
@@ -56,9 +59,12 @@ export function PreviewCanvas({
   const backgroundRef = useRef<HTMLVideoElement>(null);
 
   const [box, setBox] = useState<{ width: number; height: number } | null>(null);
-  const [sourceRatio, setSourceRatio] = useState(16 / 9);
   const [guides, setGuides] = useState<{ x: boolean; y: boolean }>({ x: false, y: false });
 
+  // A fixed platform frame wins; "original" follows the source's own shape. This
+  // ratio is passed in, not measured per card: the dubbed preview has no video
+  // until an export exists, and it used to fall back to 16:9 while the source
+  // card showed the real shape.
   const platformRatio = DESIGN_PLATFORMS[platform].ratio ?? sourceRatio;
 
   // Largest frame of this ratio that fits the card — the same "no black bars"
@@ -321,10 +327,8 @@ export function PreviewCanvas({
               src={src}
               playsInline
               onLoadedMetadata={(event) => {
-                const element = event.currentTarget;
-                if (element.videoWidth > 0 && element.videoHeight > 0) {
-                  setSourceRatio(element.videoWidth / element.videoHeight);
-                }
+                // The ratio itself is owned by App (see sourceRatio), so both
+                // previews stay in the same frame.
                 onLoadedMetadata?.(event);
               }}
               onTimeUpdate={(event) => {

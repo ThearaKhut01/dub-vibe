@@ -455,6 +455,19 @@ function App() {
     applyTheme(theme);
   }, [theme]);
 
+  // One frame ratio for both previews. Seeded from the project's stored media
+  // resolution (so it is right before any metadata arrives), then refined by the
+  // source video itself.
+  const [sourceAspect, setSourceAspect] = useState(16 / 9);
+  useEffect(() => {
+    const resolution = project.mediaResolution;
+    if (!resolution) return;
+    const [width, height] = resolution.split('x').map(Number);
+    if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+      setSourceAspect(width / height);
+    }
+  }, [project.mediaResolution]);
+
   const projectDurationSeconds = useMemo(() => {
     if (videoDuration && videoDuration > 0) return videoDuration;
     const [hours, minutes, seconds] = project.duration.split(':').map(Number);
@@ -1773,12 +1786,23 @@ function App() {
 
                   {/* The canvas: platform frame, background, transform and caption,
                       all driven by the normalised design values. */}
+                  {!previewUrl && (
+                    // Reserve the transport row's height so both frames get the same
+                    // space: without it the empty card's frame grows ~48 px taller and
+                    // the two previews stop matching at the same S/M/L/Fit.
+                    <div className="mt-2 h-10 shrink-0" aria-hidden />
+                  )}
                   <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden">
                     <PreviewCanvas
                       src={previewUrl}
+                      sourceRatio={sourceAspect}
                       videoRef={videoRef}
                       onTimeUpdate={(e) => { setCurrentTime(e.currentTarget.currentTime); alignOtherPlayer('source', e.currentTarget.currentTime); }}
-                      onLoadedMetadata={(e) => setVideoDuration(e.currentTarget.duration)}
+                      onLoadedMetadata={(e) => {
+                        setVideoDuration(e.currentTarget.duration);
+                        const { videoWidth, videoHeight } = e.currentTarget;
+                        if (videoWidth > 0 && videoHeight > 0) setSourceAspect(videoWidth / videoHeight);
+                      }}
                       onPlay={handleSourcePlay}
                       onPause={handleSourcePause}
                       subtitleText={activeTranslation}
@@ -1876,10 +1900,14 @@ function App() {
                       </div>
                     </div>
                   </div>
+                  {!dubbedPreviewUrl && (
+                    <div className="mt-2 h-10 shrink-0" aria-hidden />
+                  )}
                   <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden">
                     <PreviewCanvas
                       key={dubbedPreviewUrl}
                       src={dubbedPreviewUrl}
+                      sourceRatio={sourceAspect}
                       videoRef={dubbedVideoRef}
                       onTimeUpdate={(e) => { setDubbedTime(e.currentTarget.currentTime); alignOtherPlayer('dubbed', e.currentTarget.currentTime); }}
                       onLoadedMetadata={(e) => setDubbedDuration(e.currentTarget.duration || 0)}
