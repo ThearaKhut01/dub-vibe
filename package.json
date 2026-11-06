@@ -3,8 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "dev": "concurrently \"npm run frontend\" \"npm run backend\"",
+    "dev": "concurrently \"npm run backend\" \"npm run frontend:ready\"",
     "frontend": "npm --prefix frontend run dev -- --host 0.0.0.0",
+    "frontend:ready": "node scripts/dev-with-backend.mjs",
     "setup:backend": "py -3.10 -m venv .venv && .venv\\Scripts\\python.exe -m pip install -r backend/requirements.txt && .venv\\Scripts\\python.exe -m pip install -r backend/requirements-resemblyzer.txt --no-deps && .venv\\Scripts\\python.exe -m pip install --no-deps voxcpm==2.0.3 && .venv\\Scripts\\python.exe -m pip install -r backend/requirements-voxcpm.txt --no-deps",
     "build:sidecar": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\build-backend-sidecar.ps1",
     "backend": ".venv\\Scripts\\python.exe -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8001 --reload",

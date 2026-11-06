@@ -1,0 +1,306 @@
+/* ===========================================================================
+   Light theme
+   ---------------------------------------------------------------------------
+   The components are written against the dark slate palette. Rather than
+   rewrite thousands of class names, light mode re-points the surface, text and
+   border utilities the app actually uses. Attribute selectors are used
+   (`[class~='...']`) so opacity variants like `bg-slate-900/80` match exactly
+   without escaping. `.media-surface` marks everything that sits on video
+   (preview frames, captions, thumbnails): those colours must NOT flip.
+   =========================================================================== */
+
+[data-theme='light'] {
+  color-scheme: light !important;
+  background: #eef2f7 !important;
+  color: #0f172a !important;
+}
+
+[data-theme='light'] body,
+[data-theme='light'] #root {
+  background: #eef2f7 !important;
+  color: #0f172a !important;
+}
+
+/* Page + panels ---------------------------------------------------------- */
+[data-theme='light'] [class~='bg-[#050b14]'],
+[data-theme='light'] [class~='bg-[#05080f]'],
+[data-theme='light'] [class~='bg-[#080d17]'],
+[data-theme='light'] [class~='bg-[#0b1018]'] {
+  background-color: #eef2f7 !important;
+}
+
+[data-theme='light'] [class~='bg-slate-950'],
+[data-theme='light'] [class~='bg-slate-950/80'],
+[data-theme='light'] [class~='bg-slate-950/70'],
+[data-theme='light'] [class~='bg-slate-950/60'] {
+  background-color: #ffffff !important;
+}
+
+[data-theme='light'] [class~='bg-slate-900'],
+[data-theme='light'] [class~='bg-slate-900/90'],
+[data-theme='light'] [class~='bg-slate-900/80'],
+[data-theme='light'] [class~='bg-slate-900/70'],
+[data-theme='light'] [class~='bg-slate-900/60'],
+[data-theme='light'] [class~='bg-slate-900/40'] {
+  background-color: #ffffff !important;
+}
+
+[data-theme='light'] [class~='bg-slate-800'],
+[data-theme='light'] [class~='bg-slate-800/80'],
+[data-theme='light'] [class~='bg-slate-800/60'] {
+  background-color: #eef2f7 !important;
+}
+
+[data-theme='light'] [class~='bg-slate-700'],
+[data-theme='light'] [class~='bg-slate-700/60'],
+[data-theme='light'] [class~='bg-slate-700/40'] {
+  background-color: #e2e8f0 !important;
+}
+
+[data-theme='light'] [class~='bg-slate-600'] {
+  background-color: #cbd5e1 !important;
+}
+
+[data-theme='light'] [class~='bg-white/5'] {
+  background-color: rgba(15, 23, 42, 0.04) !important;
+}
+
+[data-theme='light'] [class~='bg-white/10'] {
+  background-color: rgba(15, 23, 42, 0.07) !important;
+}
+
+[data-theme='light'] [class~='bg-white/20'] {
+  background-color: rgba(15, 23, 42, 0.12) !important;
+}
+
+[data-theme='light'] [class~='bg-[#0a1020]'] {
+  background-color: #eef2f7 !important;
+}
+
+[data-theme='light'] [class~='bg-[#0c1220]'] {
+  background-color: #ffffff !important;
+}
+
+[data-theme='light'] [class~='bg-[#0e1526]'] {
+  background-color: #f8fafc !important;
+}
+
+/* The timeline fades its right edge with the page colour. */
+[data-theme='light'] [class~='bg-[#05080f]/75'] {
+  background: linear-gradient(to left, #eef2f7, rgba(238, 242, 247, 0)) !important;
+}
+
+/* Inset panels that use black at low opacity as "darker than the card". */
+[data-theme='light'] [class~='bg-black/40'] {
+  background-color: #f8fafc !important;
+}
+
+[data-theme='light'] [class~='bg-black/30'] {
+  background-color: rgba(15, 23, 42, 0.06) !important;
+}
+
+[data-theme='light'] [class~='bg-rose-950/40'] {
+  background-color: rgba(244, 63, 94, 0.1) !important;
+}
+
+[data-theme='light'] [class~='bg-rose-900/60'] {
+  background-color: rgba(244, 63, 94, 0.16) !important;
+}
+
+/* Accent text -----------------------------------------------------------------
+   Chips and status pills use the *light* end of each hue (sky-200, rose-300…)
+   because they were designed on dark cards. On a white card those are almost
+   invisible, so light mode uses the dark end of the same hue. */
+[data-theme='light'] [class~='text-sky-100'],
+[data-theme='light'] [class~='text-sky-200'],
+[data-theme='light'] [class~='text-sky-300'] {
+  color: #0369a1 !important;
+}
+
+[data-theme='light'] [class~='text-sky-400'] {
+  color: #0284c7 !important;
+}
+
+[data-theme='light'] [class~='text-emerald-100'],
+[data-theme='light'] [class~='text-emerald-200'],
+[data-theme='light'] [class~='text-emerald-300'] {
+  color: #047857 !important;
+}
+
+[data-theme='light'] [class~='text-emerald-400'] {
+  color: #059669 !important;
+}
+
+[data-theme='light'] [class~='text-amber-100'],
+[data-theme='light'] [class~='text-amber-200'],
+[data-theme='light'] [class~='text-amber-300'] {
+  color: #b45309 !important;
+}
+
+[data-theme='light'] [class~='text-amber-400'] {
+  color: #d97706 !important;
+}
+
+[data-theme='light'] [class~='text-rose-100'],
+[data-theme='light'] [class~='text-rose-200'],
+[data-theme='light'] [class~='text-rose-300'] {
+  color: #be123c !important;
+}
+
+[data-theme='light'] [class~='text-rose-400'] {
+  color: #e11d48 !important;
+}
+
+[data-theme='light'] [class~='text-violet-200'] {
+  color: #6d28d9 !important;
+}
+
+[data-theme='light'] [class~='text-cyan-200'] {
+  color: #0e7490 !important;
+}
+
+[data-theme='light'] [class~='text-orange-200'] {
+  color: #c2410c !important;
+}
+
+[data-theme='light'] [class~='text-pink-200'] {
+  color: #be185d !important;
+}
+
+[data-theme='light'] [class~='text-indigo-400'] {
+  color: #4f46e5 !important;
+}
+
+/* The source preview card carries its glow as an arbitrary gradient. */
+[data-theme='light'] [class*='radial-gradient(circle_at_top'] {
+  background: radial-gradient(circle at top, rgba(56, 189, 248, 0.12), transparent 55%), #ffffff !important;
+}
+
+/* Text -------------------------------------------------------------------- */
+[data-theme='light'] [class~='text-white'] {
+  color: #0f172a !important;
+}
+
+[data-theme='light'] [class~='text-white/45'] {
+  color: rgba(15, 23, 42, 0.45) !important;
+}
+
+[data-theme='light'] [class~='text-slate-100'] {
+  color: #0f172a !important;
+}
+
+[data-theme='light'] [class~='text-slate-200'] {
+  color: #1e293b !important;
+}
+
+[data-theme='light'] [class~='text-slate-300'] {
+  color: #334155 !important;
+}
+
+[data-theme='light'] [class~='text-slate-400'] {
+  color: #475569 !important;
+}
+
+[data-theme='light'] [class~='text-slate-500'] {
+  color: #64748b !important;
+}
+
+[data-theme='light'] [class~='text-slate-600'] {
+  color: #7b8794 !important;
+}
+
+/* Borders + rings --------------------------------------------------------- */
+[data-theme='light'] [class~='border-white/10'] {
+  border-color: rgba(15, 23, 42, 0.12) !important;
+}
+
+[data-theme='light'] [class~='border-white/5'] {
+  border-color: rgba(15, 23, 42, 0.07) !important;
+}
+
+[data-theme='light'] [class~='border-white/15'] {
+  border-color: rgba(15, 23, 42, 0.16) !important;
+}
+
+[data-theme='light'] [class~='border-white/20'] {
+  border-color: rgba(15, 23, 42, 0.18) !important;
+}
+
+[data-theme='light'] [class~='border-white/40'] {
+  border-color: rgba(15, 23, 42, 0.28) !important;
+}
+
+[data-theme='light'] [class~='border-slate-600'] {
+  border-color: #cbd5e1 !important;
+}
+
+[data-theme='light'] [class~='ring-white/20'] {
+  --tw-ring-color: rgba(15, 23, 42, 0.16) !important;
+}
+
+[data-theme='light'] [class~='divide-white'] > :not([hidden]) ~ :not([hidden]) {
+  border-color: rgba(15, 23, 42, 0.1) !important;
+}
+
+/* Scrollbars + the timeline's glow ---------------------------------------- */
+[data-theme='light'] ::-webkit-scrollbar-thumb {
+  background: rgba(100, 116, 139, 0.35) !important;
+}
+
+[data-theme='light'] ::-webkit-scrollbar-track {
+  background: rgba(226, 232, 240, 0.9) !important;
+}
+
+[data-theme='light'] .timeline-container {
+  box-shadow: 0 0 30px rgba(14, 165, 233, 0.06), 0 1px 3px rgba(15, 23, 42, 0.08) !important;
+}
+
+/* Media stays media -------------------------------------------------------
+   Anything inside .media-surface sits on a video frame: the caption is white on
+   the picture, the empty-state text is grey on black, and the frame itself is
+   black. These rules come last and are more specific, so they win. */
+[data-theme='light'] .media-surface [class~='text-white'] {
+  color: #ffffff !important;
+}
+
+[data-theme='light'] .media-surface [class~='text-slate-200'] {
+  color: #e2e8f0 !important;
+}
+
+[data-theme='light'] .media-surface [class~='text-slate-300'] {
+  color: #cbd5e1 !important;
+}
+
+[data-theme='light'] .media-surface [class~='text-slate-400'] {
+  color: #94a3b8 !important;
+}
+
+[data-theme='light'] .media-surface [class~='text-slate-500'] {
+  color: #64748b !important;
+}
+
+[data-theme='light'] .media-surface [class~='text-slate-600'] {
+  color: #475569 !important;
+}
+
+[data-theme='light'] .media-surface [class~='bg-black'],
+[data-theme='light'] .media-surface [class~='bg-black/30'],
+[data-theme='light'] .media-surface [class~='bg-black/40'] {
+  background-color: #000000 !important;
+}
+
+[data-theme='light'] .media-surface [class~='border-white/10'] {
+  border-color: rgba(255, 255, 255, 0.1) !important;
+}
+
+[data-theme='light'] .media-surface [class~='border-white/20'] {
+  border-color: rgba(255, 255, 255, 0.2) !important;
+}
+
+[data-theme='light'] .media-surface [class~='bg-white/5'] {
+  background-color: rgba(255, 255, 255, 0.05) !important;
+}
+
+[data-theme='light'] .media-surface [class~='bg-white/10'] {
+  background-color: rgba(255, 255, 255, 0.1) !important;
+}

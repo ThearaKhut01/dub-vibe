@@ -27,11 +27,14 @@ import {
   Wand2,
   Link2,
   RotateCcw,
+  Sun,
+  Moon,
 } from 'lucide-react';
 import { useStudioStore } from './store/useStudioStore';
 import { usePreviewLayout } from './store/usePreviewLayout';
 import { useDesignStore } from './store/useDesignStore';
 import { captionAtTime } from './store/useDesignStore';
+import { applyTheme, useThemeStore } from './store/useThemeStore';
 import { useDragResize } from './hooks/useDragResize';
 import ApiPoolManager from './components/ApiPoolManager';
 import { DesignBar } from './components/DesignBar';
@@ -444,6 +447,13 @@ function App() {
   // The canvas platform select is the frame the user sees, and therefore the
   // frame the export makes: there is no second Platform style control any more.
   const designPlatform = useDesignStore((state) => state.platform);
+
+  // Light/dark: the attribute is what theme-light.css keys on.
+  const theme = useThemeStore((state) => state.theme);
+  const toggleTheme = useThemeStore((state) => state.toggle);
+  useEffect(() => {
+    applyTheme(theme);
+  }, [theme]);
 
   const projectDurationSeconds = useMemo(() => {
     if (videoDuration && videoDuration > 0) return videoDuration;
@@ -1457,6 +1467,15 @@ function App() {
         </div>
 
         <div className="flex items-center gap-2">
+          <button
+            onClick={toggleTheme}
+            title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            aria-pressed={theme === 'light'}
+            className="flex items-center rounded-lg border border-white/10 bg-slate-900/80 px-3 py-2 text-slate-200 transition hover:border-sky-500/60 hover:bg-slate-800"
+          >
+            {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
+          </button>
           <button
             onClick={() => setShowModels(true)}
             title="AI Model Manager"

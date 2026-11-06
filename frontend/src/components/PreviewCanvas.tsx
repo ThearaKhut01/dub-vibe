@@ -274,7 +274,7 @@ export function PreviewCanvas({
   return (
     <div ref={containerRef} className="relative flex h-full w-full items-center justify-center">
       <div
-        className="relative overflow-hidden rounded-xl bg-black shadow-[0_0_0_1px_rgba(255,255,255,0.08)]"
+        className="media-surface relative overflow-hidden rounded-xl bg-black shadow-[0_0_0_1px_rgba(255,255,255,0.08)]"
         style={{
           width: box?.width ?? '100%',
           height: box?.height ?? '100%',

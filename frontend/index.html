@@ -4,6 +4,18 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DubVibe Studio</title>
+    <script>
+      // Set the theme before the first paint, so a light-mode user never sees a
+      // dark flash while React and the persisted store boot up.
+      try {
+        var saved = JSON.parse(localStorage.getItem('dubvibe-theme') || '{}');
+        var theme = (saved.state && saved.state.theme)
+          || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+        document.documentElement.dataset.theme = theme;
+      } catch (error) {
+        document.documentElement.dataset.theme = 'dark';
+      }
+    </script>
   </head>
   <body class="bg-slate-950">
     <div id="root"></div>
