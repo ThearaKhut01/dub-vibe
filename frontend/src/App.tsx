@@ -29,12 +29,15 @@ import {
   RotateCcw,
   Sun,
   Moon,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 import { useStudioStore } from './store/useStudioStore';
 import { usePreviewLayout } from './store/usePreviewLayout';
 import { useDesignStore } from './store/useDesignStore';
 import { captionAtTime } from './store/useDesignStore';
 import { applyTheme, useThemeStore } from './store/useThemeStore';
+import { applyZoom, useZoomStore } from './store/useZoomStore';
 import { useDragResize } from './hooks/useDragResize';
 import ApiPoolManager from './components/ApiPoolManager';
 import { DesignBar } from './components/DesignBar';
@@ -454,6 +457,15 @@ function App() {
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
+
+  // Page zoom: one CSS variable scales #root (see index.css).
+  const zoom = useZoomStore((state) => state.zoom);
+  const zoomIn = useZoomStore((state) => state.zoomIn);
+  const zoomOut = useZoomStore((state) => state.zoomOut);
+  const resetZoom = useZoomStore((state) => state.reset);
+  useEffect(() => {
+    applyZoom(zoom);
+  }, [zoom]);
 
   // One frame ratio for both previews. Seeded from the project's stored media
   // resolution (so it is right before any metadata arrives), then refined by the
@@ -1469,7 +1481,7 @@ function App() {
   );
 
   return (
-    <div className="min-h-screen bg-[#050b14] text-slate-100">
+    <div data-app-shell className="min-h-screen bg-[#050b14] text-slate-100">
       <header className="flex h-16 items-center justify-between border-b border-white/10 bg-slate-950/80 px-6 backdrop-blur-xl">
         <div className="flex items-center gap-4">
           <img src="/dubvibe-icon.png" alt="" className="h-10 w-10 rounded-xl object-cover shadow-glow" />
@@ -1480,6 +1492,32 @@ function App() {
         </div>
 
         <div className="flex items-center gap-2">
+          <div className="flex items-center overflow-hidden rounded-lg border border-white/10 bg-slate-900/80">
+            <button
+              onClick={zoomOut}
+              title="Zoom out"
+              aria-label="Zoom out"
+              className="px-2 py-2 text-slate-300 transition hover:bg-slate-800 hover:text-white"
+            >
+              <ZoomOut size={15} />
+            </button>
+            <button
+              onClick={resetZoom}
+              title="Reset zoom to 100%"
+              aria-label={`Page zoom ${Math.round(zoom * 100)} percent — click to reset`}
+              className="min-w-[3.2rem] px-1 py-1.5 text-center text-[11px] font-medium tabular-nums text-slate-300 transition hover:bg-slate-800 hover:text-white"
+            >
+              {Math.round(zoom * 100)}%
+            </button>
+            <button
+              onClick={zoomIn}
+              title="Zoom in"
+              aria-label="Zoom in"
+              className="px-2 py-2 text-slate-300 transition hover:bg-slate-800 hover:text-white"
+            >
+              <ZoomIn size={15} />
+            </button>
+          </div>
           <button
             onClick={toggleTheme}
             title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
@@ -1518,7 +1556,7 @@ function App() {
         <input ref={fileInputRef} className="hidden" type="file" accept="video/*" onChange={(event) => { void handleImport(event.target.files?.[0]); event.currentTarget.value = ''; }} />
       </header>
 
-      <main className="grid h-[calc(100vh-64px)] grid-cols-[220px_minmax(0,1fr)_340px]">
+      <main data-app-main className="grid h-[calc(100vh-64px)] grid-cols-[220px_minmax(0,1fr)_340px]">
         <aside className="border-r border-white/10 bg-slate-950/80 p-4">
           <div className="mb-4">
             <p className="mb-2 text-[10px] uppercase tracking-[0.24em] text-slate-500">Tools</p>

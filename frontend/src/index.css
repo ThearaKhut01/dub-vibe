@@ -119,3 +119,35 @@ select {
 .timeline-container {
   box-shadow: 0 0 40px rgba(14, 165, 233, 0.04), 0 1px 3px rgba(0, 0, 0, 0.3);
 }
+
+/* ===========================================================================
+   Page zoom
+   ---------------------------------------------------------------------------
+   `zoom` on #root scales the whole UI the way a browser's Ctrl +/- does:
+   layout proportions stay intact, unlike scaling font sizes. Inside a zoomed
+   subtree the viewport measures 100vh / zoom, so the two viewport-sized boxes
+   divide by the same factor and the app still fits exactly one screen.
+   =========================================================================== */
+:root {
+  --app-zoom: 1;
+}
+
+#root {
+  zoom: var(--app-zoom);
+}
+
+[data-app-shell] {
+  min-height: calc(100vh / var(--app-zoom)) !important;
+}
+
+[data-app-main] {
+  height: calc(100vh / var(--app-zoom) - 64px) !important;
+}
+
+/* Modal backdrops are `fixed inset-0`, which inside a zoomed subtree resolves
+   against a viewport measured in zoomed pixels — a few pixels short at the
+   bottom. Pin their size to the real viewport instead. */
+#root [class~='fixed'][class~='inset-0'] {
+  width: calc(100vw / var(--app-zoom)) !important;
+  height: calc(100vh / var(--app-zoom)) !important;
+}
