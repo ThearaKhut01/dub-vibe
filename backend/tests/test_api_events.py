@@ -1,6 +1,8 @@
 """Live API events: no key may ever appear in an event or a snapshot."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import io
 import json
 import urllib.error
@@ -167,46 +169,70 @@ def test_gemini_failure_event_never_contains_the_key(monkeypatch):
 # Routes
 # ---------------------------------------------------------------------------
 
-def test_snapshot_route_lists_legacy_keys_without_exposing_them(monkeypatch):
+def test_snapshot_route_exposes_the_chrome_profile_and_no_key(monkeypatch):
     from fastapi.testclient import TestClient
 
     from backend.app import main
 
-    secret = 'AIzaSyLEGACYfakeKEY1234567890abcdefgh'
-    monkeypatch.setattr(main.api_pool, 'status', lambda: {'entries': []})
-    monkeypatch.setattr(main.api_keys, 'has_key', lambda provider: provider == 'gemini')
+    secret = 'sk-test-1234efgh'
+    profile = {
+        'id': 'abc123', 'profile_folder': 'Profile 5', 'display_name': 'Theara',
+        'emails': ['someone@example.com'], 'is_locked': False,
+    }
+    monkeypatch.setattr(main.chrome_profiles, 'manager', lambda: SimpleNamespace(get_selected_profile=lambda: profile))
+    monkeypatch.setattr(main.api_keys, 'has_key', lambda provider: True)
     monkeypatch.setattr(main.api_keys, 'get_key', lambda provider: secret)
 
     response = TestClient(main.app).get('/api/api-live/snapshot')
     assert response.status_code == 200, response.text
     body = response.json()
-    assert [node['id'] for node in body['nodes']] == ['legacy:gemini']
-    assert body['nodes'][0]['key_hint'] == '••••efgh'
+    assert [node['id'] for node in body['nodes']] == ['chrome:abc123']
+    assert body['nodes'][0]['provider'] == 'chrome'
+    assert body['nodes'][0]['key_hint'] == 'Theara'
     assert secret not in response.text
+    assert 'someone@example.com' not in response.text
 
 
-def test_test_route_runs_a_three_line_batch(monkeypatch):
+def test_test_route_sends_one_prompt_through_the_chrome_profile(monkeypatch):
     from fastapi.testclient import TestClient
 
     from backend.app import main
 
     seen: dict = {}
 
-    class FakeTranslator:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
+    class FakeAutomator:
+        def ask(self, prompt, timeout_s=180.0):
+            seen['prompt'] = prompt
+            seen['timeout'] = timeout_s
+            return {'success': True, 'status': 'ready', 'reply': 'OK', 'profile_id': 'abc123'}
 
-        def translate_batch(self, lines, **kwargs):
-            seen['lines'] = list(lines)
-            return ['ក', 'ខ', 'គ']
+    monkeypatch.setattr(main.gemini_web, 'GeminiWebAutomator', FakeAutomator)
 
-    monkeypatch.setattr(main, 'HybridTranslationProvider', FakeTranslator)
-    monkeypatch.setattr(main.api_keys, 'has_key', lambda provider: True)
-
-    response = TestClient(main.app).post('/api/api-live/test', json={'provider': 'gemini'})
+    response = TestClient(main.app).post('/api/api-live/test', json={'prompt': 'Say OK'})
     assert response.status_code == 200, response.text
-    assert len(seen['lines']) == 3
-    assert response.json()['translations'] == ['ក', 'ខ', 'គ']
+    assert seen['prompt'] == 'Say OK'
+    assert response.json()['ok'] is True
+    assert response.json()['reply'] == 'OK'
+
+
+def test_test_route_reports_a_signed_out_profile(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from backend.app import main
+
+    class FakeAutomator:
+        def ask(self, prompt, timeout_s=180.0):
+            return {'success': False, 'status': 'login_required', 'message': 'Gemini shows the signed-out header.'}
+
+    monkeypatch.setattr(main.gemini_web, 'GeminiWebAutomator', FakeAutomator)
+
+    response = TestClient(main.app).post('/api/api-live/test', json={'prompt': 'Say OK'})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body['ok'] is False
+    assert body['status'] == 'login_required'
+    assert 'signed-out' in body['detail']
+
 
 
 def test_reduced_motion_is_handled_in_css():

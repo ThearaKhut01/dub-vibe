@@ -39,7 +39,7 @@ import { captionAtTime } from './store/useDesignStore';
 import { applyTheme, useThemeStore } from './store/useThemeStore';
 import { applyZoom, useZoomStore } from './store/useZoomStore';
 import { useDragResize } from './hooks/useDragResize';
-import ApiPoolManager from './components/ApiPoolManager';
+import ChromeProfilesPanel from './components/ChromeProfilesPanel';
 import ApiLiveView from './components/ApiLiveView';
 import { DesignBar } from './components/DesignBar';
 import { PreviewCanvas } from './components/PreviewCanvas';
@@ -104,11 +104,6 @@ const VOICE_ENGINE_LABELS: Record<string, string> = {
   voxcpm_clone: 'VoxCPM2 Voice Clone',
   sapi5: 'System TTS',
 };
-
-/** Engines that can be served by the multi-provider API pool. */
-const POOL_ENGINES = ['gemini', 'openai', 'codecraft', 'custom'] as const;
-const isPoolEngine = (value: string): value is (typeof POOL_ENGINES)[number] =>
-  (POOL_ENGINES as readonly string[]).includes(value);
 
 /** Map the backend's audio_segments rows to the timeline's dub segments. */
 const toDubSegments = (rows: Array<Record<string, unknown>>): import('./types').TimelineSegment[] =>
@@ -245,9 +240,8 @@ function App() {
   const [deleteTarget, setDeleteTarget] = useState<ProjectSummary | null>(null);
   const [showClearAllConfirm, setShowClearAllConfirm] = useState(false);
   const [showApiKeys, setShowApiKeys] = useState(false);
-  // The API modal has two views: the single keys from API Settings, and the
-  // multi-configuration pool that sits behind online translation.
-  const [apiSettingsTab, setApiSettingsTab] = useState<'keys' | 'pool' | 'live'>('keys');
+  // The API modal holds the single keys, the Chrome profiles and the live view.
+  const [apiSettingsTab, setApiSettingsTab] = useState<'keys' | 'chrome' | 'live'>('keys');
   const [geminiKeyInput, setGeminiKeyInput] = useState('');
   const [openaiKeyInput, setOpenaiKeyInput] = useState('');
   const [codecraftKeyInput, setCodecraftKeyInput] = useState('');
@@ -807,15 +801,11 @@ function App() {
   }, [exportFiles]);
 
   const hasMedia = Boolean(importedFile || project.hasMedia);
-  // A provider can translate through its single saved key or through its API
-  // pool; the engine picker must offer it when either path can serve.
-  const poolUsable = (provider: 'gemini' | 'openai' | 'codecraft' | 'custom'): number => providerKeys[provider]?.pool_usable ?? 0;
-  const engineReady = (provider: 'gemini' | 'openai' | 'codecraft'): boolean => Boolean(providerKeys[provider]?.has_key) || poolUsable(provider) > 0;
-  const engineSuffix = (provider: 'gemini' | 'openai' | 'codecraft'): string => {
-    const pool = poolUsable(provider);
-    if (pool > 0) return ` — pool: ${pool} ready`;
-    return providerKeys[provider]?.has_key ? ' — key configured' : ' — add a key in API Settings';
-  };
+  // The engine picker offers a provider when its single saved key exists.
+  const engineReady = (provider: 'gemini' | 'openai' | 'codecraft'): boolean =>
+    Boolean(providerKeys[provider]?.has_key);
+  const engineSuffix = (provider: 'gemini' | 'openai' | 'codecraft'): string =>
+    (providerKeys[provider]?.has_key ? ' — key configured' : ' — add a key in API Settings');
   // mediaVersion busts the browser cache after a cut rewrites the media file.
   const previewUrl = videoUrl || (project.hasMedia && project.id
     ? `${apiBaseUrl}/api/projects/${project.id}/media?v=${mediaVersion}`
@@ -1160,19 +1150,18 @@ function App() {
         const used = result.model ? ` — answering with ${result.model}` : '';
         setKeyTestMessage(
           translationCount
-            ? `custom: connected via ${result.via === 'pool' ? 'the API pool' : 'the saved endpoint'} — ${translationCount} model${translationCount === 1 ? '' : 's'} available${used}`
-            : `custom: connected via ${result.via === 'pool' ? 'the API pool' : 'the saved endpoint'}${used}`,
+            ? `custom: connected via the saved endpoint — ${translationCount} model${translationCount === 1 ? '' : 's'} available${used}`
+            : `custom: connected via the saved endpoint${used}`,
         );
         return;
       }
       setKeyTestMessage(
-        `${provider}: connected via ${result.via === 'pool' ? 'the API pool' : 'the stored key'}`
+        `${provider}: connected via the stored key`
         + (voiceCount || translationCount
           ? ` — ${voiceCount} TTS model${voiceCount === 1 ? '' : 's'} and `
             + `${translationCount} translation model${translationCount === 1 ? '' : 's'} available`
           : '')
         + (result.model ? ` — answering with ${result.model}` : '')
-        + (result.poolError ? ` (pool: ${result.poolError})` : ''),
       );
       if (provider === 'gemini') {
         setGeminiModels(result.models);
@@ -2438,21 +2427,12 @@ function App() {
                   <option value="codecraft" disabled={!engineReady('codecraft')}>
                     CodeCraft (online){engineSuffix('codecraft')}
                   </option>
-                  <option value="custom" disabled={!customApi?.configured && poolUsable('custom') === 0}>
+                  <option value="custom" disabled={!customApi?.configured}>
                     Custom API (online){customApi?.configured
                       ? ` — ${customApi.primary || customApi.model}${customApi.models.length > 1 ? ` +${customApi.models.length - 1} fallback` : ''}`
-                      : poolUsable('custom') > 0
-                        ? ` — pool: ${poolUsable('custom')} ready`
-                        : ' — configure in API Settings'}
+                      : ' — configure in API Settings'}
                   </option>
                 </select>
-                {isPoolEngine(translationProvider) && poolUsable(translationProvider) > 0 && (
-                  <p className="mt-1 text-[10px] leading-4 text-sky-300/80">
-                    {`API pool: ${poolUsable(translationProvider)} configuration(s) ready. `}
-                    Lines rotate between them; a configuration that is rate-limited, out of allowance, or failing is skipped for the next one.
-                    Manage them in <span className="text-sky-200">API Keys → API Pool Manager</span>.
-                  </p>
-                )}
                 <p className="mt-1 text-[10px] leading-4 text-slate-500">
                   {translationProvider === 'gemini' || translationProvider === 'openai'
                     ? 'Paid engine: every translated line is a billed API request. Uses the same key as the voice engine.'
@@ -2942,24 +2922,22 @@ function App() {
       {showApiKeys && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={() => setShowApiKeys(false)}>
           <div
-            className={`flex max-h-[85vh] w-full flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-950 shadow-2xl ${apiSettingsTab === 'live' ? 'max-w-5xl' : apiSettingsTab === 'pool' ? 'max-w-3xl' : 'max-w-lg'}`}
+            className={`flex max-h-[85vh] w-full flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-950 shadow-2xl ${apiSettingsTab === 'live' ? 'max-w-5xl' : apiSettingsTab === 'chrome' ? 'max-w-3xl' : 'max-w-lg'}`}
             onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
               <div>
                 <h2 className="text-lg font-semibold">Online AI Providers</h2>
                 <p className="text-xs text-slate-500">
-                  {apiSettingsTab === 'pool' ? (
+                  {apiSettingsTab === 'chrome' ? (
                     <>
-                      Several API configurations per provider, scheduled and failed over automatically.
-                      Keys stay in Windows Credential Manager and are{' '}
-                      <span className="text-slate-300">never sent to the browser</span>.
+                      Pick the Chrome profile the tool may drive for Gemini web. Only Chrome's own metadata is
+                      read, and nothing leaves this PC.
                     </>
                   ) : apiSettingsTab === 'live' ? (
                     <>
-                      Live API traffic: one node per key or pool entry, updated over the local socket.
-                      Translation is batched — up to 40 lines per request — with the selected Gemini
-                      model (<span className="font-mono text-slate-400">gemini_translation_model</span>).
+                      Live activity of the Chrome profile this tool drives for Gemini web, updated over
+                      the local socket. One node per profile, and nothing leaves this PC.
                     </>
                   ) : (
                     <>
@@ -2978,7 +2956,7 @@ function App() {
             <div className="flex gap-1 border-b border-white/10 px-5 py-2">
               {([
                 { id: 'keys', label: 'Keys & endpoints' },
-                { id: 'pool', label: 'API Pool Manager' },
+                { id: 'chrome', label: 'Chrome Profiles' },
                 { id: 'live', label: 'Live' },
               ] as const).map((tab) => (
                 <button
@@ -3011,18 +2989,13 @@ function App() {
                 },
               ] as const).map(({ id: provider, label, placeholder, value, setValue }) => {
                 const keyStored = Boolean(providerKeys[provider]?.has_key);
-                const poolReady = providerKeys[provider]?.pool_usable ?? 0;
-                const configured = keyStored || poolReady > 0;
+                const configured = keyStored;
                 return (
                   <div key={provider} className="mb-4 rounded-xl border border-white/10 bg-slate-900/80 p-3">
                     <div className="mb-2 flex items-center justify-between">
                       <p className="text-sm font-medium text-slate-200">{label}</p>
                       <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${configured ? 'bg-emerald-500/20 text-emerald-200' : 'bg-slate-700/60 text-slate-300'}`}>
-                        {keyStored
-                          ? '● Key stored'
-                          : poolReady > 0
-                            ? `● API pool · ${poolReady} ready`
-                            : '○ Not configured'}
+                        {keyStored ? '● Key stored' : '○ Not configured'}
                       </span>
                     </div>
                     <input
@@ -3084,12 +3057,8 @@ function App() {
               <div className="mb-4 rounded-xl border border-violet-500/25 bg-slate-900/80 p-3">
                 <div className="mb-2 flex items-center justify-between">
                   <p className="text-sm font-medium text-slate-200">Custom API (OpenAI-compatible)</p>
-                  <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${customApi?.configured || (providerKeys.custom?.pool_usable ?? 0) > 0 ? 'bg-emerald-500/20 text-emerald-200' : 'bg-slate-700/60 text-slate-300'}`}>
-                    {customApi?.configured
-                      ? '● Configured'
-                      : (providerKeys.custom?.pool_usable ?? 0) > 0
-                        ? `● API pool · ${providerKeys.custom?.pool_usable} ready`
-                        : '○ Not configured'}
+                  <span className={`rounded-full px-2 py-1 text-[10px] font-semibold ${customApi?.configured ? 'bg-emerald-500/20 text-emerald-200' : 'bg-slate-700/60 text-slate-300'}`}>
+                    {customApi?.configured ? '● Configured' : '○ Not configured'}
                   </span>
                 </div>
                 <div className="space-y-2">
@@ -3126,7 +3095,7 @@ function App() {
                   </button>
                   <button
                     onClick={() => void handleTestKey('custom')}
-                    disabled={keyBusy !== null || (!customApi?.configured && (providerKeys.custom?.pool_usable ?? 0) === 0)}
+                    disabled={keyBusy !== null || !customApi?.configured}
                     className="rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-200 hover:bg-sky-500/20 transition disabled:opacity-40"
                   >
                     {keyBusy === 'custom' ? 'Testing…' : 'Test connection'}
@@ -3164,9 +3133,9 @@ function App() {
                 <ApiLiveView />
               </div>
             )}
-            {apiSettingsTab === 'pool' && (
+            {apiSettingsTab === 'chrome' && (
               <div className="flex-1 overflow-y-auto px-5 py-4">
-                <ApiPoolManager />
+                <ChromeProfilesPanel />
               </div>
             )}
           </div>

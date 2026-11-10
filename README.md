@@ -72,7 +72,7 @@ Choose **VoxCPM2 Voice Clone (English, own voice)** in the DUB mode voice engine
 
 **Translation engine choice:** Auto tries Qwen3 4B locally, then Argos, then Google Translate. Choosing a local engine explicitly (Qwen3 4B, NLLB-200, Argos) keeps the run local — it never sends a line to Google or a keyed API. If Qwen3 4B cannot start (its llama.cpp build needs a CUDA runtime/driver that is not installed), Auto skips it and reports the engine that actually runs, and an explicit Qwen-only choice stops with the reason instead of translating the video through Google.
 
-**Custom OpenAI-compatible API:** in **API Keys → Custom API** you can enter a base URL, a model name, and (optionally) an API key. Any endpoint that implements `POST {base_url}/chat/completions` works — OpenRouter, DeepSeek, Groq, Together, a company gateway, or a local LM Studio / vLLM / Ollama `/v1` server. A bare host gets `/v1` appended. The key (if any) is stored in Windows Credential Manager; the base URL and model are ordinary settings. The model field takes a comma- or newline-separated **fallback chain** (`mistralai/mistral-large-2512, qwen/qwen3.8-omni-flash:free`): the first model is tried first, and a busy or unavailable one (`429`, `5xx`) hands the line to the next. The model that answered is reused for the following lines, so a congested primary is not retried on every segment. The engine appears in the Translation engine list and is used only when selected (Auto stays local/free). It is translation-only: it never appears in the voice/TTS list. Local and LAN endpoints translate serially; hosted ones use the small four-line pool. **Test connection** lists the endpoint's models and asks for one tiny reply, so a wrong model name is caught immediately; it reports which model in the chain answered.
+**Custom OpenAI-compatible API:** in **API Keys → Custom API** you can enter a base URL, a model name, and (optionally) an API key. Any endpoint that implements `POST {base_url}/chat/completions` works — OpenRouter, DeepSeek, Groq, Together, a company gateway, or a local LM Studio / vLLM / Ollama `/v1` server. A bare host gets `/v1` appended. The key (if any) is stored in Windows Credential Manager; the base URL and model are ordinary settings. The model field takes a comma- or newline-separated **fallback chain** (`mistralai/mistral-large-2512, qwen/qwen3.8-omni-flash:free`): the first model is tried first, and a busy or unavailable one (`429`, `5xx`) hands the line to the next. The model that answered is reused for the following lines, so a congested primary is not retried on every segment. The engine appears in the Translation engine list and is used only when selected (Auto stays local/free). It is translation-only: it never appears in the voice/TTS list. Local and LAN endpoints translate serially; hosted ones use four parallel workers. **Test connection** lists the endpoint's models and asks for one tiny reply, so a wrong model name is caught immediately; it reports which model in the chain answered.
 
 ## AI Model Manager
 
@@ -86,18 +86,22 @@ Open **AI Models** in the header to manage Faster-Whisper transcription models �
 
 **Khmer offline voice (optional):** the fine-tuned `khmerttsopensource/khmer-tts` model (MMS-VITS, about 320 MB) is stored under `models\mms-tts\mms-tts-khm`. It is used only for Khmer, only after Edge TTS fails, and runs fully offline. Its license is **cc-by-nc-4.0 (non-commercial)**, so do not use it in commercial deployments.
 
-## API Pool Manager
+## Chrome profiles (Gemini web)
 
-**API Keys → API Pool Manager** holds several API configurations per provider (Gemini, OpenAI, CodeCraft, and any OpenAI-compatible endpoint) and schedules subtitle translation across them.
+**API Keys → Chrome Profiles** lists the Chrome profiles on this PC and lets the tool open Gemini in the one you already signed in to.
 
-- **Scheduling** — round robin (one request per configuration, in order), least used (fewest requests today first), or smart hybrid (healthy, allowance left, little recent load).
-- **Failover** — a configuration that answers 401/402/429/5xx or times out is parked and the next one translates the same line. A 429 honours the provider's own `Retry-After`; a rejection that is about the request itself (400/422) is not retried anywhere. When the whole pool is parked, the single key from **API Keys** is still the last resort.
-- **Measured usage, no invented quotas** — the panel reports requests, failures, and the token counts the provider returned (characters sent when it returned none). A daily or monthly limit exists only when you type one in; leaving it empty means “no limit known”, not “unlimited”.
-- **Persistent queue** — every pooled request is written to SQLite before it is sent. A crash leaves a retryable entry instead of a silently lost line, and **Retry failed** re-sends them.
-- **Translation cache** — a line that already passed the script/size checks is reused for the identical source text and language pair while the pool serves that provider, so repeated dialogue keeps one wording and is never paid for twice.
-- **Credentials** — pool keys go to Windows Credential Manager (service `DubVibe Studio`, one account per configuration). An entry can instead point at the key saved in **API Keys**, so importing never duplicates a secret.
+- **What is read** — only Chrome's own metadata: `Local State` (profile names and the signed-in account) and each profile's `Preferences` (`account_info`). No cookie, password, `Login Data`, `Web Data` or token file is opened, nothing is decrypted, and nothing is uploaded. Profiles are found under `%LOCALAPPDATA%\Google\Chrome\User Data` (plus Chrome Beta / Chrome SxS when present).
+- **Status** — *Ready* (the Gemini account menu is visible), *Login required* (Gemini shows its signed-out header), *Locked* (Chrome already has that profile open — `psutil` reads `chrome.exe` command lines to tell which), *Unknown* (not checked yet).
+- **What it does not do** — no automated login, no account creation, no CAPTCHA handling. When Gemini asks for a sign-in the panel says so; **Open manual login** opens the profile in normal Chrome on Gemini so you can sign in yourself, and **Validate Gemini** then re-checks it.
+- **Launching** — the profile is opened with Playwright's persistent context on the *User Data root* plus `--profile-directory=<folder>`, never on `…\Profile 1` itself, so Chrome loads the real profile. Only one profile is open at a time and the previous context is closed first.
+- **Chrome 136+** — Chrome refuses remote debugging on its default data directory. For that case the app opens a private working copy of the profile's metadata and cookie store inside `<app data>\chrome-profile-sessions`, which is deleted as soon as the session closes. Chrome decrypts its own cookies there; this app never does.
+- **Config** — `data\chrome_profile_config.json` holds `selected_profile_id`, `last_selected_profile_folder`, `last_selected_root_path` and `headless`. Nothing else is stored.
+- **Check it from a terminal** — `python test_chrome_profiles.py` lists the profiles, `--select "Profile 1"` saves a selection, and `--validate` opens that profile on Gemini and prints the login state.
+- **Live tab** — follows that profile: one node, updated over the local socket, and **Test prompt** sends one tiny question through it so the node has traffic. API keys are not drawn there.
 
-Only chat completions are pooled. Translation prompts, subtitle batching, SRT timestamps, and the translation-engine picker are unchanged, and voice dubbing still uses the provider key from **API Keys**. Pool state (journal, cache, cooldowns) lives in `<app data>\api_pool`.
+This needs `playwright` and `psutil` (`npm run setup:backend` installs them). Playwright drives your installed Chrome, so no browser download is required.
+
+Translation memory (the wording reused for an identical line) lives in `<app data>\translation-cache.sqlite3`; `DUBVIBE_TRANSLATION_CACHE=0` switches it off.
 
 ## Settings
 
@@ -107,7 +111,7 @@ Only chat completions are pooled. Translation prompts, subtitle batching, SRT ti
 | `DUBVIBE_WHISPER_MODEL` | Whisper model size (`base` default) |
 | `DUBVIBE_ALLOWED_ORIGINS` | Extra browser origins allowed to call the local API |
 | `DUBVIBE_CA_BUNDLE` | Extra PEM file of trusted root CAs, added on top of the Windows store (for corporate TLS inspection) |
-| `DUBVIBE_API_POOL_DIR` | Where the API pool keeps its journal, cache and cooldowns (default `<app data>\api_pool`; the test suite points it at a temporary folder) |
+| `DUBVIBE_CHROME_PATH` | `chrome.exe` to drive when Chrome is installed in a non-standard place |
 
 ### Corporate networks and SSL inspection
 

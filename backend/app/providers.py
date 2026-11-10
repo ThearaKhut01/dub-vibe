@@ -946,32 +946,6 @@ def _engine_parked(key: str) -> bool:
     return True
 
 
-# A pool whose entries are all down (an unavailable model, a revoked key) would
-# otherwise cost every batch a round of failing attempts before the stored key
-# takes over. One failure marks the pool down briefly; the fallback key serves
-# the run in the meantime.
-_POOL_DOWN_UNTIL: dict[str, float] = {}
-_POOL_DOWN_SECONDS = 300.0
-
-# A batch is large and few: one try per configuration and a bounded wait. A
-# healthy pool answers in seconds; a broken one must not hold up the run, and the
-# breaker above keeps the next batches off it for a while.
-BATCH_POOL_TIMEOUT = 30
-
-
-def _pool_usable(engine: str) -> bool:
-    return time.monotonic() >= _POOL_DOWN_UNTIL.get(engine, 0.0)
-
-
-def _mark_pool_down(engine: str, seconds: float = _POOL_DOWN_SECONDS) -> None:
-    _POOL_DOWN_UNTIL[engine] = time.monotonic() + seconds
-
-
-def clear_pool_breaker() -> None:
-    """Forget "this pool is down" (the panel's Clear-cooldowns action)."""
-    _POOL_DOWN_UNTIL.clear()
-
-
 def _looks_rate_limited(error: Exception) -> bool:
     message = str(error).lower()
     return '429' in message or 'rate limit' in message or 'quota' in message or 'resource_exhausted' in message
@@ -1031,35 +1005,8 @@ class OnlineLLMTranslationProvider(TranslationProvider):
     def _complete(self, messages: list[dict], key: str) -> str:  # pragma: no cover - overridden
         raise NotImplementedError
 
-    def _stored_key_missing(self) -> bool:
-        """True when no single stored credential exists either."""
-        try:
-            return not self._key()
-        except RuntimeError:
-            return True
-
     def _invoke(self, messages: list[dict]) -> str:
-        """One completion: the API pool when this engine has pool entries.
-
-        Without pool configurations the call goes through the single stored key,
-        exactly as before. When the pool exists but every configuration is parked
-        (quota, cooldown, a rejected key), a stored single key is still tried as
-        the last resort instead of failing the whole run.
-        """
-        from . import api_pool
-
-        if api_pool.has_entries(self.ENGINE):
-            try:
-                return api_pool.chat(self.ENGINE, messages)
-            except api_pool.PoolUnavailable as pool_error:
-                if self._stored_key_missing():
-                    raise RuntimeError(
-                        f'{self._provider_label()} pool is unavailable: {pool_error}'
-                    ) from pool_error
-                logger.info(
-                    'API pool unavailable for %s (%s); using the single stored key.',
-                    self.ENGINE, pool_error,
-                )
+        """One completion through this provider's stored API key."""
         return self._complete(messages, self._key())
 
     @staticmethod
@@ -1088,36 +1035,13 @@ class OnlineLLMTranslationProvider(TranslationProvider):
     def _batch_complete(self, system: str, user: str, max_tokens: int,
                         usage: dict[str, int] | None = None,
                         meta: dict[str, Any] | None = None) -> str:
-        """One batched completion: the API pool when it has entries, else the key.
-
-        The pool is what actually serves this engine at runtime (rotation, quota,
-        health), so a batch must not bypass it — otherwise two configured keys turn
-        into one, and the pool's usage numbers miss every subtitle line.
-        """
-        from . import api_events, api_pool
+        """One batched completion through this provider's stored API key."""
+        from . import api_events
 
         meta = dict(meta or {})
         meta.setdefault('node_id', f'legacy:{self.ENGINE}')
         lines = int(meta.get('lines') or 0)
         messages = self._batch_messages(system, user)
-        if api_pool.has_entries(self.ENGINE) and _pool_usable(self.ENGINE):
-            try:
-                return api_pool.chat(
-                    self.ENGINE, messages, max_tokens=max_tokens, max_attempts=1,
-                    timeout=BATCH_POOL_TIMEOUT,
-                    generation_config=self._batch_generation_config(), usage_out=usage,
-                    api_meta=meta,
-                )
-            except api_pool.PoolUnavailable as error:
-                _mark_pool_down(self.ENGINE)
-                if self._stored_key_missing():
-                    raise RuntimeError(
-                        f'{self._provider_label()} pool is unavailable: {error}'
-                    ) from error
-                logger.info(
-                    '%s pool unavailable for a batch (%s); using the stored key.',
-                    self.ENGINE, error,
-                )
         key = self._key()
         meta['key_hint'] = api_events.hint_for(key)
         request_id = api_events.start(
@@ -1229,16 +1153,6 @@ class OnlineLLMTranslationProvider(TranslationProvider):
     def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
         if not str(text or '').strip():
             return ''
-        from . import api_pool
-
-        # A line with this exact source text keeps the wording that already passed
-        # validation while the pool serves this engine: repeated dialogue stays
-        # consistent, and it is never paid for twice.
-        use_cache = api_pool.cache_enabled_for(self.ENGINE)
-        if use_cache:
-            cached = api_pool.cached_translation(text, source_language, target_language, self.style_hint)
-            if cached:
-                return cached
         # Exactly ONE engine call per line (the normal cost): cleanup and
         # salvage below are local string work and never spend tokens or time.
         raw = self._invoke(self._messages(text, target_language, source_language))
@@ -1261,11 +1175,6 @@ class OnlineLLMTranslationProvider(TranslationProvider):
                     f'{self._provider_label()} did not return {target_language} text'
                     + (f' (got: {cleaned[:60]})' if cleaned else '')
                 )
-        if use_cache:
-            api_pool.remember_translation(
-                text, result, source_language, target_language,
-                self.style_hint, provider=self.ENGINE,
-            )
         return result
 
 
@@ -1294,37 +1203,18 @@ class GeminiTranslationProvider(OnlineLLMTranslationProvider):
         return gemini_chat(key, messages, model=self.model_name())
 
     def _batch_generation_config(self) -> dict:
-        # 2.5-style models think by default and a subtitle batch never needs it;
-        # the pool forwards this verbatim, so the saving holds on both paths.
+        # 2.5-style models think by default and a subtitle batch never needs it.
         return {'temperature': self.BATCH_TEMPERATURE, 'thinkingConfig': {'thinkingBudget': 0}}
 
     def _batch_complete(self, system: str, user: str, max_tokens: int,
                         usage: dict[str, int] | None = None,
                         meta: dict[str, Any] | None = None) -> str:
-        """Batched request: instruction once, low temperature, no thinking.
-
-        The pool serves this engine at runtime, so the batch goes through it first
-        (both keys, quota, health); the stored key is the fallback.
-        """
-        from . import api_events, api_keys, api_pool
+        """Batched request: instruction once, low temperature, no thinking."""
+        from . import api_events
         from .online_providers import gemini_chat
 
         meta = dict(meta or {})
         meta.setdefault('node_id', 'legacy:gemini')
-        if api_pool.has_entries('gemini') and _pool_usable('gemini'):
-            try:
-                return api_pool.chat(
-                    'gemini', self._batch_messages(system, user), max_tokens=max_tokens,
-                    max_attempts=1, timeout=BATCH_POOL_TIMEOUT,
-                    generation_config=self._batch_generation_config(), usage_out=usage,
-                    api_meta=meta,
-                )
-            except api_pool.PoolUnavailable as error:
-                _mark_pool_down('gemini')
-                if not api_keys.has_key('gemini'):
-                    raise RuntimeError(f'Gemini pool is unavailable: {error}') from error
-                logger.info('Gemini pool unavailable for a batch (%s); using the stored key.', error)
-
         key = self._key()
         meta['key_hint'] = api_events.hint_for(key)
         text, result_meta = gemini_chat(
@@ -1354,9 +1244,9 @@ class GeminiTranslationProvider(OnlineLLMTranslationProvider):
 
     @staticmethod
     def is_available() -> bool:
-        from . import api_keys, api_pool
+        from . import api_keys
 
-        return api_keys.has_key('gemini') or api_pool.has_entries('gemini')
+        return api_keys.has_key('gemini')
 
 
 class OpenAITranslationProvider(OnlineLLMTranslationProvider):
@@ -1371,9 +1261,9 @@ class OpenAITranslationProvider(OnlineLLMTranslationProvider):
 
     @staticmethod
     def is_available() -> bool:
-        from . import api_keys, api_pool
+        from . import api_keys
 
-        return api_keys.has_key('openai') or api_pool.has_entries('openai')
+        return api_keys.has_key('openai')
 
 
 class CodeCraftTranslationProvider(OnlineLLMTranslationProvider):
@@ -1395,9 +1285,9 @@ class CodeCraftTranslationProvider(OnlineLLMTranslationProvider):
 
     @staticmethod
     def is_available() -> bool:
-        from . import api_keys, api_pool
+        from . import api_keys
 
-        return api_keys.has_key('codecraft') or api_pool.has_entries('codecraft')
+        return api_keys.has_key('codecraft')
 
 
 class CustomAPITranslationProvider(OnlineLLMTranslationProvider):
@@ -1427,25 +1317,11 @@ class CustomAPITranslationProvider(OnlineLLMTranslationProvider):
                         usage: dict[str, int] | None = None,
                         meta: dict[str, Any] | None = None) -> str:
         """Batched request with an explicit output ceiling and token accounting."""
-        from . import api_events, api_pool, custom_api
+        from . import api_events, custom_api
 
         meta = dict(meta or {})
         meta.setdefault('node_id', 'legacy:custom')
         messages = self._batch_messages(system, user)
-        if api_pool.has_entries('custom') and _pool_usable('custom'):
-            try:
-                return api_pool.chat(
-                    'custom', messages, max_tokens=max_tokens, max_attempts=1,
-                    timeout=BATCH_POOL_TIMEOUT,
-                    generation_config=self._batch_generation_config(), usage_out=usage,
-                    api_meta=meta,
-                )
-            except api_pool.PoolUnavailable as error:
-                _mark_pool_down('custom')
-                if self._stored_key_missing():
-                    raise RuntimeError(f'Custom API pool is unavailable: {error}') from error
-                logger.info('Custom API pool unavailable for a batch (%s); using the endpoint settings.', error)
-
         key = self._key()
         meta['key_hint'] = api_events.hint_for(key)
         tokens: dict[str, int] = {}
@@ -1463,15 +1339,9 @@ class CustomAPITranslationProvider(OnlineLLMTranslationProvider):
 
     @staticmethod
     def is_available() -> bool:
-        from . import api_pool, custom_api
-
-        return custom_api.is_configured() or api_pool.has_entries('custom')
-
-    def _stored_key_missing(self) -> bool:
-        """A local custom endpoint is configured even when it needs no key."""
         from . import custom_api
 
-        return not custom_api.is_configured()
+        return custom_api.is_configured()
 
 
 # Every language the app offers is supported by the hosted LLMs (unlike their TTS
@@ -1612,36 +1482,18 @@ class HybridTranslationProvider(TranslationProvider):
     def max_parallel_lines(self) -> int:
         """How many lines may translate at once.
 
-        Only a paid keyed engine benefits from a pool. Google's free endpoint
+        Only a paid keyed engine goes wider than one line. Google's free endpoint
         throttles parallel callers (parallel requests are what earns a 429), and
         local engines run one generation at a time, so they stay serial — Auto
         included, whatever its first engine happens to be. A custom endpoint on
         this machine/LAN stays serial too: four workers would fight the UI.
         """
         first = self.first_engine()
-        from . import api_pool
-
-        local_custom = False
         if first == 'custom':
             from . import custom_api
 
-            local_custom = (
-                api_pool.custom_endpoints_are_local()
-                if api_pool.has_entries('custom')
-                else custom_api.is_local()
-            )
-            limit = 1 if local_custom else 4
-        else:
-            limit = 4 if first in ONLINE_TRANSLATION_ENGINES else 1
-        if first in ONLINE_TRANSLATION_ENGINES and not local_custom:
-            # Several pool configurations are independent allowances, so the run
-            # may go wider than one key allows — never past the ceiling the user
-            # chose in the API Pool panel.
-            entries = api_pool.usable_count(first)
-            if entries >= 2:
-                ceiling = int(api_pool.settings().get('max_parallel') or 4)
-                limit = min(ceiling, max(limit, entries * 2))
-        return limit
+            return 1 if custom_api.is_local() else 4
+        return 4 if first in ONLINE_TRANSLATION_ENGINES else 1
 
     def check_preferred_engine(self, target_language: str, source_language: str = 'en') -> None:
         """Raise before any translation if the engine the user chose cannot handle the language.

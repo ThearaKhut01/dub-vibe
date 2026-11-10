@@ -58,7 +58,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from urllib.parse import quote
 
 from backend.app.chunking import SmartChunkEngine, format_timestamp, split_subtitle_cues
-from backend.app import acting, api_events, api_keys, api_pool, cuda_pack, export_design, model_manager, online_providers, speaker_diarization, translation_memory, tts_service, voxcpm_local
+from backend.app import acting, api_events, api_keys, chrome_profiles, cuda_pack, export_design, gemini_web, model_manager, online_providers, speaker_diarization, translation_memory, tts_service, voxcpm_local
 from backend.app import segment_tts
 from backend.app.models import ProjectRequest, ProjectSummary, ProviderSettings, ProcessingRequest, SegmentSplit, SegmentUpdate, WorkflowProgress
 from backend.app.providers import (
@@ -137,10 +137,6 @@ DATA_ROOT.mkdir(parents=True, exist_ok=True)
 with sqlite3.connect(PROJECT_DB) as connection:
     connection.execute('CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, data TEXT NOT NULL)')
 load_projects()
-# API pool: turn requests a crash left in flight into retryable failures and
-# keep its journal/cache bounded. Best-effort — a broken journal must never stop
-# the app from starting.
-api_pool.startup()
 # One-time: move models from the old per-install locations into the shared
 # %LOCALAPPDATA%\DubVibe Studio\models store used by web + desktop.
 model_manager.migrate_legacy_models()
@@ -636,24 +632,6 @@ async def delete_voxcpm_model() -> dict[str, str]:
 # --- Online provider keys (stored in Windows Credential Manager, never sent
 # back to the browser) --------------------------------------------------------
 
-def _pool_probe(provider: str) -> dict[str, Any]:
-    """One tiny real request through the pool; returns the model that served it."""
-    served: dict[str, Any] = {}
-    text = api_pool.chat(
-        provider,
-        [
-            {'role': 'system', 'content': 'Reply with the single word OK.'},
-            {'role': 'user', 'content': 'ping'},
-        ],
-        max_tokens=8,
-        # A test must answer quickly: one try per configuration, short timeout.
-        timeout=20,
-        max_attempts=1,
-        served_out=served,
-    )
-    return {'model': served.get('model') or '', 'sample': str(text or '').strip()[:80]}
-
-
 async def _provider_model_lists(provider: str, key: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """TTS and text model lists for a stored key (never raises)."""
     try:
@@ -679,19 +657,10 @@ async def _provider_model_lists(provider: str, key: str) -> tuple[dict[str, Any]
 
 @app.get('/api/providers/keys')
 async def provider_keys_status() -> dict[str, Any]:
-    """Which providers can translate, and whether an API pool backs them.
-
-    The translation-engine picker uses this: a provider is usable when it has a
-    single stored key *or* at least one pool configuration that can serve right
-    now, so a pool-only setup is not shown as "add a key".
-    """
+    """Which providers have a stored key (the translation-engine picker reads this)."""
     status: dict[str, Any] = {}
     for provider in api_keys.PROVIDERS:
-        status[provider] = {
-            'has_key': api_keys.has_key(provider),
-            'pool_entries': api_pool.entry_count(provider),
-            'pool_usable': api_pool.usable_count(provider),
-        }
+        status[provider] = {'has_key': api_keys.has_key(provider)}
     return status
 
 
@@ -730,39 +699,9 @@ async def remove_provider_key(provider: str) -> dict[str, Any]:
 
 @app.post('/api/providers/{provider}/test')
 async def test_provider(provider: str) -> dict[str, Any]:
-    """Live connection test through the path that will actually run.
-
-    The pool serves an engine before its single key, so the test asks the pool
-    first and only then the stored key. Otherwise a pool-only setup reports "no
-    key stored" and a working pool can look broken when its model is unavailable.
-    """
+    """Live connection test with the provider's stored key."""
     if provider not in api_keys.PROVIDERS:
         raise HTTPException(status_code=404, detail=f'Unknown provider: {provider}')
-
-    pool_errors: list[str] = []
-    if api_pool.entry_count(provider):
-        try:
-            probe = await run_in_threadpool(_pool_probe, provider)
-        except Exception as error:
-            pool_errors.append(str(error))
-        else:
-            tts: dict[str, Any] = {'models': []}
-            text: dict[str, Any] = {'models': []}
-            key = api_keys.get_key(provider)
-            if key:
-                # The probe proves the pool works; the model lists are a bonus that
-                # only a stored key can fetch, so a failure there is not a failure.
-                tts, text = await _provider_model_lists(provider, key)
-            return {
-                'status': 'ok',
-                'connected': True,
-                'provider': provider,
-                'via': 'pool',
-                'model': probe.get('model'),
-                'sample': probe.get('sample'),
-                'tts_models': tts.get('models', []),
-                'translation_models': text.get('models', []),
-            }
 
     key = api_keys.get_key(provider)
     if provider == 'custom':
@@ -790,11 +729,10 @@ async def test_provider(provider: str) -> dict[str, Any]:
             'sample': result.get('sample'),
         }
     if not key:
-        detail = f'No API key stored for {provider}. Save a key first.'
-        if pool_errors:
-            detail = f'{detail} Pool error: {pool_errors[0]}'
-            raise HTTPException(status_code=502, detail=detail)
-        raise HTTPException(status_code=400, detail=detail)
+        raise HTTPException(
+            status_code=400,
+            detail=f'No API key stored for {provider}. Save a key first.',
+        )
     try:
         if provider == 'gemini':
             from backend.app.online_providers import gemini_test, gemini_text_test
@@ -822,50 +760,37 @@ async def test_provider(provider: str) -> dict[str, Any]:
         'tts_models': result.get('models', []),
         # The same key drives translation, so report the text models too.
         'translation_models': text.get('models', []),
-        'pool_error': pool_errors[0] if pool_errors else None,
     }
 
 
-# --- Multi-provider API pool -------------------------------------------------
-# Configurations live in backend/app/api_pool; these routes are the panel's only
-# way in. A pool key is written to Windows Credential Manager and never comes
-# back to the browser — only whether one exists and its last four characters.
-
 # --- Live API activity --------------------------------------------------------
 
-_PROVIDER_LABELS = {'gemini': 'Gemini', 'openai': 'OpenAI', 'codecraft': 'CodeCraft', 'custom': 'Custom API'}
 
 
 def _live_snapshot() -> dict[str, Any]:
-    """Register the nodes that exist right now, then read the counters."""
+    """Register the one node the Live tab draws, then read its counters.
+
+    The tab follows the Chrome profile this tool drives for Gemini web. API keys
+    are not listed here: they are checked from Keys & endpoints, and their
+    traffic never passes through the browser.
+    """
     valid: set[str] = set()
     try:
-        entries = api_pool.status().get('entries') or []
+        profile = chrome_profiles.manager().get_selected_profile()
     except Exception:
-        # The live view must never 500 because the pool database is busy.
-        entries = []
-    for entry in entries:
-        try:
-            cooldown = float((entry.get('health') or {}).get('cooldown_remaining') or 0)
-            valid.add(str(entry['id']))
-            api_events.register_node(
-                str(entry['id']),
-                label=str(entry.get('display_name') or entry.get('label') or entry['id']),
-                provider=str(entry.get('provider') or ''), model=str(entry.get('model') or ''),
-                key_hint=str(entry.get('key_hint') or ''), enabled=bool(entry.get('enabled')),
-                cooldown_until=(time.time() + cooldown) if cooldown > 0 else None,
-            )
-        except Exception:
-            continue
-    for provider in api_keys.PROVIDERS:
-        if not api_keys.has_key(provider):
-            continue
-        node_id = f'legacy:{provider}'
+        # A broken Chrome install must never 500 the Live tab.
+        profile = None
+    if profile is not None:
+        node_id = f'chrome:{profile["id"]}'
         valid.add(node_id)
         api_events.register_node(
-            node_id, label=f"{_PROVIDER_LABELS.get(provider, provider)} · saved key",
-            provider=provider, model=_translation_model_hint(provider) or '',
-            key_hint=api_events.hint_for(api_keys.get_key(provider)),
+            node_id,
+            label=f'Chrome · {profile["profile_folder"]}',
+            provider='chrome',
+            model=gemini_web.MODEL_LABEL,
+            # A description, not a secret: the profile's Chrome name.
+            key_hint=str(profile.get('display_name') or ''),
+            enabled=True,
         )
     api_events.prune(valid)
     snapshot = api_events.snapshot()
@@ -881,125 +806,105 @@ async def api_live_snapshot() -> dict[str, Any]:
 
 @app.post('/api/api-live/test')
 async def api_live_test(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    """A tiny 3-line batch through the real path, so the Live view has traffic."""
+    """One tiny prompt through the selected Chrome profile, so the node has traffic."""
     body = payload or {}
-    provider = str(body.get('provider') or 'gemini').strip().lower()
-    if provider not in api_keys.PROVIDERS:
-        raise HTTPException(status_code=404, detail=f'Unknown provider: {provider}')
-    if not (api_keys.has_key(provider) or api_pool.entry_count(provider)):
-        raise HTTPException(status_code=400, detail=f'No key or pool configuration for {provider}.')
-    raw_lines = body.get('lines')
-    lines = [str(item)[:200] for item in raw_lines][:5] if isinstance(raw_lines, list) else []
-    if not lines:
-        lines = ['Where were you last night?', 'I was at the office.', 'Wang Ming, sit down.']
-    translator = HybridTranslationProvider(preference=provider)
-    usage: dict[str, int] = {}
-    target = str(body.get('target_language') or 'Khmer')
-
-    def run() -> list[str | None]:
-        return translator.translate_batch(
-            lines, context=[], glossary='', source_language='auto',
-            target_language=target, tone='test', usage=usage,
-        )
-
+    prompt = str(body.get('prompt') or 'Reply with the single word OK.').strip()[:500]
+    if not prompt:
+        raise HTTPException(status_code=400, detail='A prompt is required.')
+    automator = gemini_web.GeminiWebAutomator()
     try:
-        result = await run_in_threadpool(run)
-    except Exception as error:
-        raise HTTPException(
-            status_code=502,
-            detail=f'test request failed: {api_events.sanitize_error(error, 160)}',
-        ) from error
+        result = await run_in_threadpool(automator.ask, prompt, 90.0)
+    except gemini_web.GeminiWebError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if not result.get('success'):
+        return {
+            'status': result.get('status', 'error'),
+            'ok': False,
+            'reply': '',
+            'detail': result.get('message', ''),
+        }
     return {
         'status': 'ok',
-        'provider': provider,
-        'lines': len(lines),
-        'translations': [item or '' for item in result],
-        'usage': usage,
-        'ok': any(item for item in result),
+        'ok': True,
+        'reply': str(result.get('reply') or '')[:400],
+        'profile_id': result.get('profile_id'),
     }
 
 
-@app.get('/api/api-pool/status')
-async def api_pool_status() -> dict[str, Any]:
-    """Configurations, health, measured usage, cache and request journal."""
-    return await run_in_threadpool(api_pool.status)
+# --- Chrome profiles (reuse one already-signed-in Chrome profile) -------------
+# Scanning reads Chrome's metadata only (Local State, Preferences). No cookie,
+# password, Login Data or token file is opened, and nothing leaves this machine.
 
 
-@app.post('/api/api-pool/entries')
-async def save_api_pool_entry(payload: dict[str, Any]) -> dict[str, Any]:
-    """Create or update one pool configuration (send an id to edit)."""
+@app.get('/api/chrome/profiles')
+async def chrome_profile_list() -> dict[str, Any]:
+    """Every Chrome profile on this PC, plus the saved selection."""
+    return await run_in_threadpool(chrome_profiles.snapshot)
+
+
+@app.post('/api/chrome/profiles/refresh')
+async def chrome_profile_refresh() -> dict[str, Any]:
+    """Rescan the Chrome user-data roots (a profile can appear while the app runs)."""
+    return await run_in_threadpool(chrome_profiles.snapshot)
+
+
+@app.post('/api/chrome/profiles/select')
+async def chrome_profile_select(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remember one profile id in chrome_profile_config.json."""
+    profile_id = str(payload.get('profile_id') or '')
+    if not profile_id:
+        raise HTTPException(status_code=400, detail='A profile id is required.')
     try:
-        entry = await run_in_threadpool(api_pool.upsert_entry, payload)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        selected = await run_in_threadpool(chrome_profiles.manager().select_profile, profile_id)
+    except chrome_profiles.ChromeProfileError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return {'status': 'ok', 'selected': selected, **await run_in_threadpool(chrome_profiles.snapshot)}
+
+
+@app.get('/api/chrome/profiles/selected')
+async def chrome_profile_selected() -> dict[str, Any]:
+    """The saved selection, even when that profile is no longer installed."""
+    snapshot = await run_in_threadpool(chrome_profiles.snapshot)
     return {
-        'status': 'ok',
-        'entry': entry,
-        'pool': await run_in_threadpool(api_pool.status),
+        'selected': snapshot['selected'],
+        'profile_id': snapshot['selected_profile_id'],
+        'missing': snapshot['selected_missing'],
+        'headless': snapshot['headless'],
     }
 
 
-@app.delete('/api/api-pool/entries/{entry_id}')
-async def delete_api_pool_entry(entry_id: str) -> dict[str, Any]:
+@app.post('/api/chrome/profiles/validate')
+async def chrome_profile_validate(payload: dict[str, Any]) -> dict[str, Any]:
+    """Open the profile on gemini.google.com and report ready / login_required / locked / error."""
+    profile_id = str(payload.get('profile_id') or '')
+    if not profile_id:
+        raise HTTPException(status_code=400, detail='A profile id is required.')
+    return await run_in_threadpool(chrome_profiles.manager().validate_profile, profile_id)
+
+
+@app.post('/api/chrome/profiles/open-manual')
+async def chrome_profile_open_manual(payload: dict[str, Any]) -> dict[str, Any]:
+    """Open that profile in normal Chrome so the user can sign in themselves."""
+    profile_id = str(payload.get('profile_id') or '')
+    if not profile_id:
+        raise HTTPException(status_code=400, detail='A profile id is required.')
+    return await run_in_threadpool(chrome_profiles.manager().open_manual, profile_id)
+
+
+@app.post('/api/chrome/gemini/ask')
+async def chrome_gemini_ask(payload: dict[str, Any]) -> dict[str, Any]:
+    """One prompt through the Gemini web UI in the selected profile (manual, opt-in)."""
+    prompt = str(payload.get('prompt') or '')
+    timeout = payload.get('timeout_s')
     try:
-        result = await run_in_threadpool(api_pool.delete_entry, entry_id)
-    except ValueError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-    return {**result, 'pool': await run_in_threadpool(api_pool.status)}
-
-
-@app.post('/api/api-pool/entries/{entry_id}/test')
-async def test_api_pool_entry(entry_id: str) -> dict[str, Any]:
-    """One tiny real request, so the test proves the model and key work."""
+        timeout_s = float(timeout) if isinstance(timeout, (int, float)) else 180.0
+    except (TypeError, ValueError):
+        timeout_s = 180.0
+    automator = gemini_web.GeminiWebAutomator()
     try:
-        result = await run_in_threadpool(api_pool.test_entry, entry_id)
-    except ValueError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-    except Exception as error:
-        # The failure is already recorded against the entry's health/usage.
-        raise HTTPException(status_code=502, detail=str(error)) from error
-    return {**result, 'pool': await run_in_threadpool(api_pool.status)}
-
-
-@app.post('/api/api-pool/settings')
-async def save_api_pool_settings(payload: dict[str, Any]) -> dict[str, Any]:
-    try:
-        saved = await run_in_threadpool(api_pool.save_settings, payload)
-    except ValueError as error:
+        return await run_in_threadpool(automator.ask, prompt, timeout_s)
+    except gemini_web.GeminiWebError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    return {'status': 'ok', 'settings': saved, 'pool': await run_in_threadpool(api_pool.status)}
-
-
-@app.post('/api/api-pool/import-legacy')
-async def import_api_pool_legacy() -> dict[str, Any]:
-    """Create pool entries that reuse the keys already saved in API Settings."""
-    return await run_in_threadpool(api_pool.import_legacy)
-
-
-@app.post('/api/api-pool/queue/retry')
-async def retry_api_pool_queue() -> dict[str, Any]:
-    """Re-send the requests the journal left failed (bounded per call)."""
-    result = await run_in_threadpool(api_pool.retry_failed)
-    return {'status': 'ok', 'result': result, 'pool': await run_in_threadpool(api_pool.status)}
-
-
-@app.post('/api/api-pool/cache/clear')
-async def clear_api_pool_cache() -> dict[str, Any]:
-    result = await run_in_threadpool(api_pool.clear_cache)
-    return {**result, 'pool': await run_in_threadpool(api_pool.status)}
-
-
-@app.post('/api/api-pool/health/reset')
-async def reset_api_pool_health(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Drop cooldowns: everything, or one entry when an id is sent."""
-    entry_id = str((payload or {}).get('entry_id') or '')
-    await run_in_threadpool(api_pool.reset_health, entry_id)
-    # The batch path keeps its own short "pool is down" breaker; clearing
-    # cooldowns must clear that too, or a fixed pool stays skipped for minutes.
-    from backend.app.providers import clear_pool_breaker
-
-    clear_pool_breaker()
-    return {'status': 'ok', 'pool': await run_in_threadpool(api_pool.status)}
 
 
 @app.get('/api/tts/capabilities')

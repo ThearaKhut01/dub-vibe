@@ -1,14 +1,8 @@
-"""Translation memory that works without the API pool.
+"""Translation memory for subtitle lines that already passed validation.
 
-The pool's cache (``api_pool.pool_manager.cached_translation``) is deliberately
-gated on a pool entry being *active*: it exists to keep several rotated keys
-consistent with each other. That gate is what left a single-key or
-single-custom-endpoint install with no cache at all, so every re-run paid for
-every line again.
-
-This module writes to the same ``cache`` table (same TTL, same pruning, same
-"validated translations only" rule) but with a key that also names the model and
-a digest of the project glossary:
+The cache itself lives in :mod:`backend.app.translation_cache` (one SQLite file
+next to the project database, same TTL and pruning rules, "validated
+translations only"). This module owns the key:
 
     sha256(PROMPT_VERSION, model, src, tgt, glossary_hash, text)
 
@@ -22,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import os
 
-from .api_pool import cache
+from . import translation_cache as cache
 
 DEFAULT_TTL_DAYS = 7
 

@@ -1,9 +1,9 @@
 """Live view of API activity: node registry, counters and an event bus.
 
-One *node* is one credential that can serve a request — an API-pool entry, or the
+One *node* is one credential that can serve a request — the saved key of a
 single key stored in API Settings ("legacy:<provider>"). Everything here is in
 memory and resets on restart: the point is to watch a run happen, not to keep a
-ledger (the pool's own usage table is the ledger).
+ledger (the usage table written here is the ledger).
 
 No key material ever enters an event. A node only carries the last four
 characters (`••••ZGvo`), and every error string is passed through
@@ -84,7 +84,7 @@ def register_node(
 
 
 def prune(valid_ids: set[str]) -> None:
-    """Drop nodes whose pool entry (or key) no longer exists."""
+    """Drop nodes whose saved key no longer exists."""
     with _lock:
         for node_id in list(_nodes):
             if node_id not in valid_ids:

@@ -35,7 +35,7 @@ _STICKY: dict[str, str] = {}
 
 # Hosts that usually run on the same machine or LAN. Translation stays serial on
 # them (four parallel requests would fight the UI for CPU), while a hosted
-# endpoint keeps the small paid-engine pool.
+# endpoint keeps the small paid-engine worker pool.
 _LOCAL_HOSTS = {'localhost', '127.0.0.1', '::1', '0.0.0.0', 'host.docker.internal'}
 
 

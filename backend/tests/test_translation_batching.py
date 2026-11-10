@@ -210,7 +210,7 @@ def test_cache_key_changes_with_model_glossary_and_text():
     assert base == translation_memory.cache_key('  Hello ', 'en', 'Khmer', 'gemini-2.5-flash', 'A=B')
 
 
-def test_cache_round_trip_without_any_api_pool_entry():
+def test_cache_round_trip_without_a_provider_call():
     translation_memory.remember('Hello', 'សួស្តី', 'en', 'Khmer', 'gemini-2.5-flash', '')
     assert translation_memory.lookup('Hello', 'en', 'Khmer', 'gemini-2.5-flash', '') == 'សួស្តី'
     # Another model must not inherit the wording.

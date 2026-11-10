@@ -21,6 +21,11 @@ setuptools<81
 demucs>=4.0,<5
 pyinstaller>=6.10,<7
 keyring>=25
+# Chrome profile detection (Gemini web): psutil reads chrome.exe command lines to tell
+# which profile Chrome has open; Playwright drives the profile the user already signed in
+# to. Playwright needs no browser download here — the app launches the installed Chrome.
+psutil>=5.9
+playwright>=1.40
 # --- CUDA GPU support -------------------------------------------------------
 # torch from the cu126 index (Demucs), NVIDIA runtime DLLs (Faster-Whisper via
 # CTranslate2), and the CUDA build of llama-cpp-python (Qwen3). Everything still

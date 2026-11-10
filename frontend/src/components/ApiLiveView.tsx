@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Activity, AlertTriangle, CheckCircle2, CircleSlash, Loader2, Radio, Zap } from 'lucide-react';
 
 /**
- * Live API activity: one hub ("Translate Router") and one node per credential.
+ * Live activity: one hub and one node — the Chrome profile this tool drives
+ * for Gemini web. API keys are not drawn here; they are checked from
+ * Keys & endpoints.
  *
  * Data comes from two places only — `GET /api/api-live/snapshot` for the first
  * paint, then `api_event` frames on the existing /ws socket. No polling.
@@ -74,10 +76,6 @@ interface Flight {
   dy: number;
   color: string;
 }
-
-const PROVIDER_LABELS: Record<string, string> = {
-  gemini: 'Gemini', openai: 'OpenAI', codecraft: 'CodeCraft', custom: 'Custom API',
-};
 
 const API_BASE = import.meta.env.DEV ? '' : 'http://127.0.0.1:8001';
 const MAX_FLIGHTS = 30;
@@ -390,14 +388,15 @@ export default function ApiLiveView() {
       const response = await fetch(`${API_BASE}/api/api-live/test`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          provider: nodes.find((node) => node.provider === 'gemini')?.provider
-            ?? nodes[0]?.provider ?? 'gemini',
-        }),
+        body: JSON.stringify({ prompt: 'Reply with the single word OK.' }),
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.detail ?? `HTTP ${response.status}`);
-      setTestNote(body.ok ? 'Test batch answered — watch the nodes.' : 'Test reached the API but no line came back.');
+      setTestNote(
+        body.ok
+          ? `Gemini answered: “${String(body.reply || '').slice(0, 120)}”`
+          : `${body.detail || 'Gemini did not answer'}`,
+      );
     } catch (error) {
       setTestNote(error instanceof Error ? error.message : 'Test failed');
     } finally {
@@ -445,7 +444,7 @@ export default function ApiLiveView() {
             className="flex items-center gap-1.5 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-200 transition hover:bg-sky-500/20 disabled:opacity-40"
           >
             {testBusy ? <Loader2 size={13} className="animate-spin" /> : <Zap size={13} />}
-            {testBusy ? 'Sending…' : 'Test 3 lines'}
+            {testBusy ? 'Sending…' : 'Test prompt'}
           </button>
           <span className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold ${badgeTone}`}>{badge}</span>
         </div>
@@ -475,7 +474,7 @@ export default function ApiLiveView() {
           style={{ left: geometry.cx, top: geometry.cy, transform: 'translate(-50%,-50%)' }}
         >
           <Activity size={18} className="text-sky-300" />
-          <p className="mt-1 text-[11px] font-semibold text-slate-100">Translate Router</p>
+          <p className="mt-1 text-[11px] font-semibold text-slate-100">Gemini web</p>
           <p className="text-[10px] text-slate-400">{totals.requests} req · {formatTokens(totals.tokens_total)} tok</p>
           {ripples.map((at) => (
             <span
@@ -540,7 +539,7 @@ export default function ApiLiveView() {
                 )}
               </div>
               <p className="mt-0.5 truncate font-mono text-[10px] text-slate-400">{node.model || '—'}</p>
-              <p className="truncate font-mono text-[10px] text-slate-500">{node.key_hint || 'saved key'}</p>
+              <p className="truncate font-mono text-[10px] text-slate-500">{node.key_hint || node.provider}</p>
               <div className="mt-1 flex items-center justify-between text-[10px] text-slate-400">
                 <span>⇄ {node.requests}</span>
                 <span>{node.last_latency_ms ? `${node.last_latency_ms} ms` : '—'}</span>
@@ -556,8 +555,8 @@ export default function ApiLiveView() {
         })}
 
         {!nodes.length && (
-          <p className="absolute inset-0 flex items-center justify-center text-xs text-slate-500">
-            No credentials yet — add a key or a pool entry.
+          <p className="absolute inset-0 flex items-center justify-center px-6 text-center text-xs text-slate-500">
+            No Chrome profile selected yet — choose one in the Chrome Profiles tab.
           </p>
         )}
       </div>
@@ -596,8 +595,8 @@ export default function ApiLiveView() {
         {failed ? <AlertTriangle size={11} className="text-rose-400" />
           : coolingCount ? <CircleSlash size={11} className="text-amber-400" />
             : <CheckCircle2 size={11} className="text-emerald-400" />}
-        Keys are never shown — only the last four characters. Counters reset when the service restarts.
-        {' '}Providers: {Object.values(PROVIDER_LABELS).join(' · ')}
+        One node: the Chrome profile used for Gemini web. Nothing is uploaded and no credential is shown.
+        {' '}Counters reset when the service restarts.
       </p>
     </div>
   );

@@ -41,6 +41,13 @@ REQUIRED = {
     ('POST', '/api/projects/{project_id}/fix-overlaps'),
     ('POST', '/api/projects/{project_id}/fix-overlaps/apply'),
     ('POST', '/api/projects/{project_id}/fix-overlaps/undo'),
+    # Chrome Profiles panel (Online AI Providers -> Chrome Profiles).
+    ('GET', '/api/chrome/profiles'),
+    ('POST', '/api/chrome/profiles/refresh'),
+    ('POST', '/api/chrome/profiles/select'),
+    ('GET', '/api/chrome/profiles/selected'),
+    ('POST', '/api/chrome/profiles/validate'),
+    ('POST', '/api/chrome/profiles/open-manual'),
 }
 
 

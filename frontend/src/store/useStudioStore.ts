@@ -1,8 +1,8 @@
 import { create } from 'zustand';
 import { designPayload, useDesignStore } from './useDesignStore';
 import type {
-  ApiPoolEntry,
-  ApiPoolStatus,
+  ChromeProfileValidation,
+  ChromeProfilesSnapshot,
   CudaPackInfo,
   CustomApiConfig,
   HardwareInfo,
@@ -59,17 +59,12 @@ interface StudioState {
   dubAudioVersion: number;
   providerKeys: Record<'gemini' | 'openai' | 'codecraft' | 'custom', ProviderKeyStatus>;
   customApi: CustomApiConfig | null;
-  /** Multi-provider API pool snapshot (null until the panel first polls). */
-  apiPool: ApiPoolStatus | null;
-  refreshApiPool: () => Promise<void>;
-  savePoolEntry: (payload: Record<string, unknown>) => Promise<ApiPoolEntry>;
-  deletePoolEntry: (entryId: string) => Promise<void>;
-  testPoolEntry: (entryId: string) => Promise<string>;
-  saveApiPoolSettings: (payload: Record<string, unknown>) => Promise<void>;
-  retryPoolQueue: () => Promise<{ requeued: number; ok: number; failed: number }>;
-  clearPoolCache: () => Promise<number>;
-  importLegacyPool: () => Promise<number>;
-  resetPoolHealth: (entryId?: string) => Promise<void>;
+  /** Chrome profiles detected on this PC (null until the panel first asks). */
+  chromeProfiles: ChromeProfilesSnapshot | null;
+  refreshChromeProfiles: () => Promise<void>;
+  selectChromeProfile: (profileId: string) => Promise<void>;
+  validateChromeProfile: (profileId: string) => Promise<ChromeProfileValidation>;
+  openChromeProfileManually: (profileId: string) => Promise<ChromeProfileValidation>;
   voiceCapabilities: Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean; voices_by_language?: Record<string, Array<{ id: string; label: string; voice: string; gender: string }>> }> & { emotions?: string[] };
   characters: { speakers: string[]; characters: Record<string, Record<string, unknown>> };
   workflowSteps: WorkflowStep[];
@@ -114,7 +109,7 @@ interface StudioState {
   setProviderKey: (provider: string, key: string) => Promise<void>;
   removeProviderKey: (provider: string) => Promise<void>;
   setCustomApi: (config: { base_url: string; model: string }) => Promise<void>;
-  testProvider: (provider: string) => Promise<{ models: string[]; translationModels: string[]; model?: string | null; via?: string | null; sample?: string | null; poolError?: string | null }>;
+  testProvider: (provider: string) => Promise<{ models: string[]; translationModels: string[]; model?: string | null; sample?: string | null }>;
   previewLine: (payload: { text: string; provider: string; voice?: string; model?: string; emotion: string; intensity: number; speed?: number; language: string }) => Promise<string>;
   refreshCharacters: () => Promise<void>;
   saveCharacters: (characters: Record<string, Record<string, unknown>>) => Promise<void>;
@@ -392,7 +387,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   cudaPack: null,
   providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false }, custom: { has_key: false } },
   customApi: null,
-  apiPool: null,
+  chromeProfiles: null,
   voiceCapabilities: {},
   characters: { speakers: [], characters: {} },
   workflowSteps: initialWorkflowSteps,
@@ -893,9 +888,6 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       models: payload.tts_models ?? [],
       translationModels: payload.translation_models ?? [],
       model: payload.model ?? null,
-      via: payload.via ?? null,
-      sample: payload.sample ?? null,
-      poolError: payload.pool_error ?? null,
     };
   },
   previewLine: async (payload) => {
@@ -1362,109 +1354,60 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       cudaPack: null,
       providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false }, custom: { has_key: false } },
   customApi: null,
-  apiPool: null,
+  chromeProfiles: null,
       voiceCapabilities: {},
       characters: { speakers: [], characters: {} },
       workflowSteps: initialWorkflowSteps.map((step) => ({ ...step })),
     });
   },
-  refreshApiPool: async () => {
+  refreshChromeProfiles: async () => {
     try {
-      const pool = await readJson<ApiPoolStatus>('/api/api-pool/status');
-      set({ apiPool: pool });
+      const snapshot = await readJson<ChromeProfilesSnapshot>('/api/chrome/profiles');
+      set({ chromeProfiles: snapshot });
     } catch {
-      // Backend offline; the panel keeps the last snapshot it had.
+      // Backend offline: the panel keeps the last list it had.
     }
   },
-  savePoolEntry: async (payload) => {
-    const response = await fetch(`${apiBase}/api/api-pool/entries`, {
+  selectChromeProfile: async (profileId) => {
+    const response = await fetch(`${apiBase}/api/chrome/profiles/select`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ profile_id: profileId }),
     });
     const body = await response.json().catch(() => ({}));
-    if (body.pool) set({ apiPool: body.pool as ApiPoolStatus });
     if (!response.ok) {
-      throw new Error(body.detail ?? `Unable to save the pool configuration (HTTP ${response.status})`);
+      throw new Error(body.detail ?? `Unable to select that profile (HTTP ${response.status})`);
     }
-    get().appendLog(`Pool configuration saved (${body.entry?.provider_label ?? 'API'} · ${body.entry?.model ?? ''}).`, 'success');
-    return body.entry as ApiPoolEntry;
+    // The answer is the whole snapshot (profiles + selection), so the panel can
+    // show the highlight and the new selection in one render.
+    if (body.profiles) set({ chromeProfiles: body as ChromeProfilesSnapshot });
+    get().appendLog(`Chrome profile selected (${body.selected?.profile_folder ?? profileId}).`, 'success');
   },
-  deletePoolEntry: async (entryId) => {
-    const response = await fetch(`${apiBase}/api/api-pool/entries/${entryId}`, { method: 'DELETE' });
-    const body = await response.json().catch(() => ({}));
-    if (body.pool) set({ apiPool: body.pool as ApiPoolStatus });
-    if (!response.ok) {
-      throw new Error(body.detail ?? `Unable to delete the pool configuration (HTTP ${response.status})`);
-    }
-    get().appendLog('Pool configuration deleted.');
-  },
-  testPoolEntry: async (entryId) => {
-    const response = await fetch(`${apiBase}/api/api-pool/entries/${entryId}/test`, { method: 'POST' });
-    const body = await response.json().catch(() => ({}));
-    if (body.pool) set({ apiPool: body.pool as ApiPoolStatus });
-    if (!response.ok) {
-      // The backend recorded the failure (cooldown, last error) even though the
-      // response is an error, so re-read the pool instead of leaving a stale card.
-      await get().refreshApiPool();
-      throw new Error(body.detail ?? `Connection test failed (HTTP ${response.status})`);
-    }
-    return `Answered in ${body.latency_ms} ms: “${String(body.sample ?? '').trim()}”`;
-  },
-  saveApiPoolSettings: async (payload) => {
-    const response = await fetch(`${apiBase}/api/api-pool/settings`, {
+  validateChromeProfile: async (profileId) => {
+    const response = await fetch(`${apiBase}/api/chrome/profiles/validate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ profile_id: profileId }),
     });
     const body = await response.json().catch(() => ({}));
-    if (body.pool) set({ apiPool: body.pool as ApiPoolStatus });
     if (!response.ok) {
-      throw new Error(body.detail ?? `Unable to save the pool settings (HTTP ${response.status})`);
+      throw new Error(body.detail ?? `Gemini validation failed (HTTP ${response.status})`);
     }
+    // Opening the profile changes what Chrome holds open, so re-read the list.
+    await get().refreshChromeProfiles();
+    return body as ChromeProfileValidation;
   },
-  retryPoolQueue: async () => {
-    const response = await fetch(`${apiBase}/api/api-pool/queue/retry`, { method: 'POST' });
-    const body = await response.json().catch(() => ({}));
-    if (body.pool) set({ apiPool: body.pool as ApiPoolStatus });
-    if (!response.ok) {
-      throw new Error(body.detail ?? `Retry failed (HTTP ${response.status})`);
-    }
-    const result = body.result ?? {};
-    get().appendLog(`Queue retry: ${result.ok ?? 0} answered, ${result.failed ?? 0} still failing.`, result.failed ? 'error' : 'success');
-    return { requeued: result.requeued ?? 0, ok: result.ok ?? 0, failed: result.failed ?? 0 };
-  },
-  clearPoolCache: async () => {
-    const response = await fetch(`${apiBase}/api/api-pool/cache/clear`, { method: 'POST' });
-    const body = await response.json().catch(() => ({}));
-    if (body.pool) set({ apiPool: body.pool as ApiPoolStatus });
-    if (!response.ok) {
-      throw new Error(body.detail ?? `Unable to clear the cache (HTTP ${response.status})`);
-    }
-    return Number(body.removed ?? 0);
-  },
-  importLegacyPool: async () => {
-    const response = await fetch(`${apiBase}/api/api-pool/import-legacy`, { method: 'POST' });
-    const body = await response.json().catch(() => ({}));
-    if (body.pool) set({ apiPool: body.pool as ApiPoolStatus });
-    if (!response.ok) {
-      throw new Error(body.detail ?? `Unable to import the saved keys (HTTP ${response.status})`);
-    }
-    const created = Array.isArray(body.created) ? body.created.length : 0;
-    get().appendLog(created ? `${created} pool configuration(s) imported from API Settings.` : 'No saved key to import.', created ? 'success' : 'info');
-    return created;
-  },
-  resetPoolHealth: async (entryId) => {
-    const response = await fetch(`${apiBase}/api/api-pool/health/reset`, {
+  openChromeProfileManually: async (profileId) => {
+    const response = await fetch(`${apiBase}/api/chrome/profiles/open-manual`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entry_id: entryId ?? '' }),
+      body: JSON.stringify({ profile_id: profileId }),
     });
     const body = await response.json().catch(() => ({}));
-    if (body.pool) set({ apiPool: body.pool as ApiPoolStatus });
     if (!response.ok) {
-      throw new Error(body.detail ?? `Unable to reset the cooldown (HTTP ${response.status})`);
+      throw new Error(body.detail ?? `Chrome could not be opened (HTTP ${response.status})`);
     }
+    return body as ChromeProfileValidation;
   },
   updateDubAudioSegments: (segments) => set((state) => ({
     dubAudioSegments: segments,
