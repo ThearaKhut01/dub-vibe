@@ -48,6 +48,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="open the tool's own Chrome profile on Gemini, so you can sign in once")
     parser.add_argument('--signin', action='store_true',
                         help='--open, wait until you close that window, then validate')
+    parser.add_argument('--history', action='store_true',
+                        help="open the tool's own Chrome profile on Gemini, to browse the chats it saved")
+    parser.add_argument('--chats', type=int, nargs='?', const=15, metavar='N',
+                        help='list the last N chats Gemini has for this profile (no window stays open)')
     parser.add_argument('--reset-session', action='store_true',
                         help="delete the tool's own Chrome profile (forces a new sign-in)")
     parser.add_argument('--ask', metavar='LINE', help='send one line to Gemini web and print the answer')
@@ -114,7 +118,10 @@ def main(argv: list[str] | None = None) -> int:
         selected = target
         print(f'\nSaved selection: {target["profile_folder"]} ({target["id"]})')
 
-    if args.open or args.signin:
+    if args.open or args.signin or args.history:
+        if args.history and not (args.open or args.signin):
+            print("\nOpening the tool's own Chrome profile on Gemini, on the page that lists its chats.")
+            print('The tool\'s runs are the entries Gemini titled from the prompt ("Subtitle sentence translation…").')
         target = target_for(args.profile, 'open')
         if target is None:
             return 2
@@ -145,6 +152,26 @@ def main(argv: list[str] | None = None) -> int:
         if still_open:
             print('\nThat window is still open — close it, then run --validate again.')
         return 2
+
+    if args.chats:
+        target = target_for(args.profile, 'list chats for')
+        if target is None:
+            return 2
+        if not selected or selected['id'] != target['id']:
+            manager.select_profile(target['id'])
+            print(f'\nSaved selection: {target["profile_folder"]}')
+        print(f'\nChats Gemini has for {target["profile_folder"]} (newest first):')
+        try:
+            titles = gemini_web.recent_chats(limit=max(1, args.chats))
+        except gemini_web.GeminiWebError as error:
+            print(f'error     : {error}')
+            return 2
+        if not titles:
+            print('  (none)')
+            return 0
+        for index, title in enumerate(titles, start=1):
+            print(f'  {index:2}. {title}')
+        return 0
 
     if args.reset_session:
         target = target_for(args.profile, 'reset')

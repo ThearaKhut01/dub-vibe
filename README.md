@@ -119,6 +119,10 @@ Two ways, neither needs Vite or a desktop window:
    .venv\Scripts\python.exe test_chrome_profiles.py --ask "Where were you last night?"
    REM same line, as a subtitle translation (--to Khmer by default)
    .venv\Scripts\python.exe test_chrome_profiles.py --translate "Where were you last night?"
+   REM open the tool's own Chrome window on Gemini (browse the chats it saved)
+   .venv\Scripts\python.exe test_chrome_profiles.py --history
+   REM ... or list those chats right here, newest first (no window stays open)
+   .venv\Scripts\python.exe test_chrome_profiles.py --chats
    REM start over (forget the tool's Chrome profile)
    .venv\Scripts\python.exe test_chrome_profiles.py --reset-session
    ```

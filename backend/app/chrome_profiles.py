@@ -861,8 +861,8 @@ class ChromeProfileManager:
             'status': 'manual_login',
             'profile_id': profile['id'],
             'message': (
-                "The tool's own Chrome window opened on Gemini. Sign in there (top-right \"Sign in\"), "
-                'close that window, then press "Validate Gemini".'
+                "The tool's own Chrome window opened on Gemini. Sign in there if you have not yet, browse its "
+                'chat list to see the runs it saved, then close the window (Validate and Translate need it closed).'
             ),
         }
 

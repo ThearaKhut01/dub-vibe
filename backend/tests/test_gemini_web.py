@@ -188,7 +188,7 @@ def test_a_batch_prompt_numbers_every_line() -> None:
     assert '1. One' in prompt
     assert '2. Two' in prompt
     assert '3. Three' in prompt
-    assert 'same numbering' in prompt
+    assert 'starting with its number' in prompt
 
 
 def test_a_saved_conversation_is_waited_for(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -221,25 +221,42 @@ def test_numbered_answers_are_mapped_back_to_their_lines() -> None:
     assert gemini_web.parse_numbered_answer(reply, 4) == ['មួយ', 'ពីរ', None, 'បួន']
 
 
-def test_a_missing_line_is_retried_on_its_own(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_zero_width_spaces_are_removed_from_answers() -> None:
+    reply = 'កុំ\u200bឱ្យ\u200bគាត់\u200bចេញពីបន្ទប់នេះ។'
+
+    assert gemini_web.parse_numbered_answer(reply, 1) == ['កុំឱ្យគាត់ចេញពីបន្ទប់នេះ។']
+
+
+def test_an_unnumbered_answer_is_mapped_by_position() -> None:
+    reply = 'ថ្ងៃម្សិលមិញអ្នកទៅណា?\n\nខ្ញុំនៅការិយាល័យ។'
+
+    assert gemini_web.parse_numbered_answer(reply, 2) == ['ថ្ងៃម្សិលមិញអ្នកទៅណា?', 'ខ្ញុំនៅការិយាល័យ។']
+
+
+def test_a_wrong_count_is_not_guessed() -> None:
+    assert gemini_web.parse_numbered_answer('one\n\ntwo\n\nthree', 2) == [None, None]
+
+
+def test_the_skipped_lines_are_retried_in_one_message(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
 
     class FakeAutomator:
         def ask(self, prompt, timeout_s=180.0, lines=1):
             calls.append(prompt)
-            if '1. Where' in prompt and '2. I was' in prompt:
-                # The batch answer drops the second line.
+            if '2. I was at the office.' in prompt:
+                # First answer: numbered but drops line 2.
                 return {'success': True, 'reply': '1. យប់មិញអ្នកនៅឯណា?'}
-            if prompt.rstrip().endswith('I was at the office.'):
-                return {'success': True, 'reply': 'ខ្ញុំនៅការិយាល័យ។'}
-            return {'success': True, 'reply': '1. x'}
+            if prompt.startswith('Translate each numbered subtitle line') and prompt.rstrip().endswith('I was at the office.'):
+                # Retry message contains only the missing line.
+                return {'success': True, 'reply': '1. ខ្ញុំនៅការិយាល័យ។'}
+            return {'success': True, 'reply': 'x'}
 
     monkeypatch.setattr(gemini_web, 'GeminiWebAutomator', FakeAutomator)
 
     results = gemini_web.translate_lines(['Where were you last night?', 'I was at the office.'], 'Khmer')
 
     assert results == ['យប់មិញអ្នកនៅឯណា?', 'ខ្ញុំនៅការិយាល័យ។']
-    assert len(calls) == 2, 'one batch answer, one retry for the missing line'
+    assert len(calls) == 2, 'the batch, then one retry message — not one per line'
 
 
 def test_the_browser_engine_has_its_own_cache_namespace() -> None:
@@ -249,6 +266,24 @@ def test_the_browser_engine_has_its_own_cache_namespace() -> None:
     # Free engines share the "no model choice" key; the browser engine must not.
     assert main._translation_model_hint('google') == ''
     assert main._translation_model_hint('gemini_web') != main._translation_model_hint('google')
+
+
+def test_chat_titles_drop_navigation_and_duplicates() -> None:
+    raw = [
+        'Gemini', 'New chat', 'Library', 'Customise',
+        'ការបកប្រែប្រយោគអត្ថបទរងជាភាសាខ្មែរ',
+        'ការបកប្រែប្រយោគអត្ថបទរងជាភាសាខ្មែរ',
+        '  Where   is the station?  ',
+        'New Chat',
+    ]
+
+    titles = gemini_web.clean_chat_titles(raw, limit=10)
+
+    assert titles == ['ការបកប្រែប្រយោគអត្ថបទរងជាភាសាខ្មែរ', 'Where is the station?']
+
+
+def test_chat_titles_respect_the_limit() -> None:
+    assert gemini_web.clean_chat_titles([f'chat {i}' for i in range(30)], limit=5) == [f'chat {i}' for i in range(5)]
 
 
 def test_the_engine_needs_a_selected_profile(monkeypatch: pytest.MonkeyPatch) -> None:
