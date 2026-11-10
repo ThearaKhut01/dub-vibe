@@ -27,6 +27,8 @@ class _Box:
     def fill(self, text: str) -> None:
         self.page.typed = text
         self.page.entered = True
+        # Gemini moves the tab to the conversation id once the chat exists.
+        self.page.url = 'https://gemini.google.com/app/abc123def456'
 
     def inner_text(self) -> str:
         return self.page.answer
@@ -187,6 +189,24 @@ def test_a_batch_prompt_numbers_every_line() -> None:
     assert '2. Two' in prompt
     assert '3. Three' in prompt
     assert 'same numbering' in prompt
+
+
+def test_a_saved_conversation_is_waited_for(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(chrome_profiles, 'playwright_available', lambda: True)
+    monkeypatch.setattr(chrome_profiles, 'gemini_state', lambda page: ('ready', 'signed in', page.url))
+    page = _FakePage()
+    seen: dict = {}
+    original = gemini_web._wait_for_conversation
+
+    def spy(target_page, timeout_s=None):
+        seen['url'] = target_page.url
+        return original(target_page, 0)
+
+    monkeypatch.setattr(gemini_web, '_wait_for_conversation', spy)
+
+    gemini_web.GeminiWebAutomator(_Manager(page)).ask(SUBTITLE)
+
+    assert '/app/abc123def456' in seen['url'], 'the chat id must exist before the tab closes'
 
 
 def test_the_glossary_reaches_the_prompt() -> None:

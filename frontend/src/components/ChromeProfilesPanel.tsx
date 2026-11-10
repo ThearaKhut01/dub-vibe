@@ -53,6 +53,7 @@ export default function ChromeProfilesPanel() {
   const {
     chromeProfiles,
     refreshChromeProfiles,
+    refreshVoiceConfig,
     selectChromeProfile,
     validateChromeProfile,
     openChromeProfileManually,
@@ -65,7 +66,9 @@ export default function ChromeProfilesPanel() {
 
   useEffect(() => {
     void refreshChromeProfiles();
-  }, [refreshChromeProfiles]);
+    // Opening this tab is also the moment the engine picker may become usable.
+    void refreshVoiceConfig();
+  }, [refreshChromeProfiles, refreshVoiceConfig]);
 
   const report = (text: string, tone: Tone = 'slate') => {
     setMessage(text);

@@ -34,6 +34,11 @@ RESPONSE_SELECTORS = (
     '.model-response-text',
 )
 POLL_INTERVAL_MS = 700
+# Gemini assigns the conversation id and saves the chat right after an answer.
+# Closing the tab the instant the text stops growing loses that round trip (the
+# chat then never shows up in Gemini's history), so give it a moment first.
+CONVERSATION_SAVE_SECONDS = 2.5
+CONVERSATION_ID = re.compile(r'/app/[0-9a-z]{6,}', re.IGNORECASE)
 # Never give up on an answer sooner than this, even when a caller asks for less.
 MIN_ANSWER_SECONDS = 15.0
 MODEL_LABEL = 'gemini.google.com'
@@ -222,6 +227,8 @@ class GeminiWebAutomator:
                         'url': _url(page),
                         'profile_id': session.profile['id'],
                     }
+                # Keep the tab alive until Gemini has committed the chat.
+                _wait_for_conversation(page)
                 return {
                     'success': True,
                     'status': 'ready',
@@ -255,6 +262,24 @@ def _wait_for_prompt_box(page: Any, timeout_s: float | None = None) -> Any:
         except Exception:
             break
     return None
+
+
+def _wait_for_conversation(page: Any, timeout_s: float | None = None) -> str:
+    """Wait for ``/app/<id>`` (and a short grace period) so history keeps the chat."""
+    timeout = CONVERSATION_SAVE_SECONDS if timeout_s is None else timeout_s
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        if CONVERSATION_ID.search(_url(page)):
+            try:
+                page.wait_for_timeout(1200)
+            except Exception:
+                pass
+            return _url(page)
+        try:
+            page.wait_for_timeout(300)
+        except Exception:
+            break
+    return _url(page)
 
 
 def _first_visible(page: Any, selectors: tuple[str, ...]) -> Any:

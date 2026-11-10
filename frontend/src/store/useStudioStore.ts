@@ -1381,6 +1381,9 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     // The answer is the whole snapshot (profiles + selection), so the panel can
     // show the highlight and the new selection in one render.
     if (body.profiles) set({ chromeProfiles: body as ChromeProfilesSnapshot });
+    // The Gemini-web engine becomes available with the selection, so the engine
+    // picker must re-read the keys or it stays greyed out until a reload.
+    await get().refreshVoiceConfig();
     get().appendLog(`Chrome profile selected (${body.selected?.profile_folder ?? profileId}).`, 'success');
   },
   validateChromeProfile: async (profileId) => {
@@ -1395,6 +1398,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     }
     // Opening the profile changes what Chrome holds open, so re-read the list.
     await get().refreshChromeProfiles();
+    await get().refreshVoiceConfig();
     return body as ChromeProfileValidation;
   },
   openChromeProfileManually: async (profileId) => {
