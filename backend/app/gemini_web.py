@@ -103,18 +103,55 @@ def recent_chats(limit: int = 20) -> list[str]:
     return clean_chat_titles([str(item) for item in raw], limit)
 
 
+def srt_time(seconds: float) -> str:
+    """Seconds -> ``HH:MM:SS,mmm`` (the shape SRT uses)."""
+    total = max(0.0, float(seconds))
+    hours, rest = divmod(int(total), 3600)
+    minutes, secs = divmod(rest, 60)
+    millis = int(round((total - int(total)) * 1000))
+    if millis == 1000:
+        secs, millis = secs + 1, 0
+    return f'{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}'
+
+
 def build_batch_prompt(lines: list[str], target_language: str = 'Khmer', source_language: str = '',
-                       glossary: str = '') -> str:
-    """One message for a whole subtitle batch, numbered so the answer is parseable."""
+                       glossary: str = '', cues: list[tuple[float, float]] | None = None,
+                       context: list[str] | None = None) -> str:
+    """One message for a whole subtitle batch.
+
+    With ``cues`` the batch is sent as SRT blocks — number, timecode, text — so the
+    model can see how long each line has to be spoken and keep the translation
+    short enough. Without cues it falls back to a plain numbered list.
+    """
     source = f' from {source_language}' if source_language else ''
-    numbered = '\n'.join(f'{index + 1}. {line}' for index, line in enumerate(lines))
     terms = str(glossary or '').strip()
-    glossary_part = f'\nUse these term translations exactly: {terms}' if terms else ''
+    glossary_part = f' Use these term translations exactly: {terms}.' if terms else ''
+    earlier = [line for line in (context or []) if str(line or '').strip()][-3:]
+    context_part = (
+        ' Previous lines, for context only — do not translate them: '
+        + ' | '.join(earlier) + '.'
+    ) if earlier else ''
+
+    if cues and len(cues) == len(lines):
+        blocks = '\n\n'.join(
+            f'{index + 1}\n{srt_time(start)} --> {srt_time(end)}\n{line}'
+            for index, (line, (start, end)) in enumerate(zip(lines, cues))
+        )
+        return (
+            f'Translate the text of each subtitle block{source} into {target_language}. '
+            'Keep each block number and its timecode exactly as they are and replace only the text. '
+            'The timecode tells you how long the line is spoken: keep the translation short enough to be said in '
+            'that time, without adding words the speaker did not say. '
+            f'Reply with the blocks only — no notes, no quotes, no explanations.{glossary_part}{context_part}\n\n'
+            f'{blocks}'
+        )
+
+    numbered = '\n'.join(f'{index + 1}. {line}' for index, line in enumerate(lines))
     return (
         f'Translate each numbered subtitle line{source} into {target_language}. '
         'Reply with one line per item, each starting with its number and a period — '
         'for example "1. <translation>" — in the same order, never merged, never skipped. '
-        f'No quotes, no transliteration, no notes, no explanations.{glossary_part}\n'
+        f'No quotes, no transliteration, no notes, no explanations.{glossary_part}{context_part}\n'
         f'{numbered}'
     )
 
@@ -131,6 +168,18 @@ def parse_numbered_answer(reply: str, count: int) -> list[str | None]:
     """
     raw = str(reply or '')
     found: dict[int, str] = {}
+    # SRT blocks first: "3\n00:00:04,000 --> 00:00:05,200\ntext".
+    for block in re.split(r'\n\s*\n', raw):
+        rows = [row for row in block.strip().splitlines() if row.strip()]
+        if len(rows) < 3 or not rows[0].strip().isdigit() or '-->' not in rows[1]:
+            continue
+        index = int(rows[0].strip())
+        text = _ZERO_WIDTH.sub('', ' '.join(rows[2:])).strip().strip('"“”').strip()
+        if 1 <= index <= count and text and index not in found:
+            found[index] = text
+    if found:
+        return [found.get(index + 1) for index in range(count)]
+
     for match in _NUMBERED.finditer(raw):
         index = int(match.group(1))
         text = match.group(2).strip().strip('"“”').strip()
@@ -157,6 +206,8 @@ def translate_lines(
     source_language: str = '',
     timeout_s: float = MIN_BATCH_SECONDS,
     glossary: str = '',
+    cues: list[tuple[float, float]] | None = None,
+    context: list[str] | None = None,
 ) -> list[str | None]:
     """Translate subtitle lines through the selected profile, one message per batch.
 
@@ -167,7 +218,9 @@ def translate_lines(
     results: list[str | None] = []
     for start in range(0, len(lines), BATCH_SIZE):
         batch = lines[start:start + BATCH_SIZE]
-        prompt = build_batch_prompt(batch, target_language, source_language, glossary)
+        batch_cues = cues[start:start + BATCH_SIZE] if cues else None
+        prompt = build_batch_prompt(batch, target_language, source_language, glossary,
+                                    cues=batch_cues, context=context)
         answer = automator.ask(prompt, timeout_s=timeout_s, lines=len(batch))
         if not answer.get('success'):
             raise GeminiWebError(str(answer.get('message') or 'Gemini web did not answer.'), answer.get('status', 'error'))

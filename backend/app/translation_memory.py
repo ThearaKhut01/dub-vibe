@@ -59,6 +59,22 @@ def cache_key(
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
+def stats() -> dict:
+    """Entries/hits of the cache file (the panel shows them)."""
+    try:
+        return cache.stats()
+    except Exception:
+        return {'entries': 0, 'hits': 0, 'newest_at': None}
+
+
+def clear() -> int:
+    """Forget every remembered line; returns how many were removed."""
+    try:
+        return cache.clear()
+    except Exception:
+        return 0
+
+
 def lookup(
     text: str,
     source_lang: str = '',

@@ -30,16 +30,23 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any, Iterable
 
 from backend.app.providers import get_storage_dir
 
 GEMINI_URL = 'https://gemini.google.com/app'
+# Google's account picker; it lists the accounts this Chrome profile already
+# knows and offers "Use another account". The user picks — never this code.
+ACCOUNT_CHOOSER_URL = (
+    'https://accounts.google.com/AccountChooser?continue=https://gemini.google.com/app'
+)
 CONFIG_FILENAME = 'chrome_profile_config.json'
 SESSION_DIRNAME = 'chrome-profile-sessions'
 
@@ -52,6 +59,8 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     'last_selected_profile_folder': '',
     'last_selected_root_path': '',
     'headless': False,
+    # Keep one visible Chrome open and drive a tab in it (see Shared window).
+    'shared_window': False,
 }
 
 CHROME_EXECUTABLE_NAMES = ('chrome.exe', 'chrome-beta.exe', 'chrome-sxs.exe')
@@ -69,24 +78,18 @@ SHADOW_PROFILE_FILES = (
     'Network/Cookies',
 )
 
+# Shared window: the tool attaches to a Chrome the user also uses. Chrome only
+# honours --remote-debugging-port on a non-default data directory, which is why
+# this uses the tool's own profile (the one that holds the sign-in).
+SHARED_WINDOW_PORTS = range(9333, 9343)
+WINDOW_MARKER = 'window.json'
+DEVTOOLS_WAIT_SECONDS = 15.0
+
 PLAYWRIGHT_TIMEOUT_MS = 45_000
 GEMINI_SETTLE_SECONDS = 20.0
 LOCKED_MESSAGE = 'Chrome is currently using this profile. Close that Chrome window and try again.'
 
 
-def locked_message(folder: str = '') -> str:
-    """Only the window that runs *this* profile has to be closed.
-
-    Chrome keeps one browser process (and usually one window) per profile, and a
-    profile is locked only while that process holds it. Other profiles can stay
-    open: the session uses either the profile directory itself or a private copy
-    of it, never the whole Chrome install.
-    """
-    target = f' {folder}' if folder else ' this profile'
-    return (
-        f'Chrome is using{target} right now. Close the Chrome window that runs it '
-        '(other profiles can stay open), then try again.'
-    )
 MISSING_PLAYWRIGHT_MESSAGE = (
     'Playwright is not installed in this Python environment. '
     'Run "pip install playwright" (no browser download is needed — the app drives your installed Chrome).'
@@ -526,6 +529,33 @@ class ChromeProfileConfig:
 # --- Playwright --------------------------------------------------------------
 
 
+def _port_free(port: int) -> bool:
+    """True when nothing is listening on 127.0.0.1:<port>."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.25)
+        return probe.connect_ex(('127.0.0.1', port)) != 0
+
+
+def _devtools_ready(port: int) -> bool:
+    """Chrome's DevTools endpoint answers on this port."""
+    if not port:
+        return False
+    try:
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/json/version', timeout=1.5) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+
+def _wait_for_devtools(port: int, timeout: float = DEVTOOLS_WAIT_SECONDS) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _devtools_ready(port):
+            return True
+        time.sleep(0.3)
+    return False
+
+
 def playwright_available() -> bool:
     try:
         import playwright.sync_api  # noqa: F401
@@ -565,6 +595,37 @@ class ProfileSession:
         # The profile is intentionally kept: it holds the sign-in.
 
     def __enter__(self) -> 'ProfileSession':
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+class SharedSession:
+    """The tool's tab inside a Chrome window the user also browses in.
+
+    Closing this session closes only that tab: the browser, the user's tabs and
+    the window itself stay exactly as they were (verified with a CDP probe).
+    """
+
+    def __init__(self, profile: dict[str, Any], page: Any, playwright: Any) -> None:
+        self.profile = profile
+        self.page = page
+        self.playwright = playwright
+        self.via = 'shared_window'
+
+    def close(self) -> None:
+        try:
+            self.page.close()
+        except Exception:
+            pass
+        try:
+            # Disconnects the driver; it does not close the browser.
+            self.playwright.stop()
+        except Exception:
+            pass
+
+    def __enter__(self) -> 'SharedSession':
         return self
 
     def __exit__(self, *_exc: object) -> None:
@@ -636,15 +697,19 @@ class ChromeProfileManager:
         profile = self.get_profile(profile_id_value)
         if profile is None:
             raise ChromeProfileError('That Chrome profile is no longer available. Refresh the list.', 'error')
-        self._ensure_not_busy(profile)
+        self._ensure_usable(profile)
         if not playwright_available():
             raise ChromeProfileError(MISSING_PLAYWRIGHT_MESSAGE, 'error')
         executable = chrome_executable()
         if executable is None:
             raise ChromeProfileError(MISSING_CHROME_MESSAGE, 'error')
+        shared = self.shared_window_enabled()
         with self._lock:
             self.close()
-            session = self._open(profile, executable, headless)
+            if shared:
+                session: ProfileSession | SharedSession = self._attach_shared(profile, self.ensure_window(profile))
+            else:
+                session = self._open(profile, executable, headless)
             self._session = session
             return session
 
@@ -730,10 +795,16 @@ class ChromeProfileManager:
             self._trim_local_state(user_data / 'Local State', profile['profile_folder'])
         for relative in SHADOW_PROFILE_FILES:
             source = source_profile / relative
-            if source.is_file():
-                destination = folder_dir / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
+            if not source.is_file():
+                continue
+            destination = folder_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
                 shutil.copy2(source, destination)
+            except OSError:
+                # Chrome may hold the file for a moment; the copy stays usable and
+                # the user simply signs in inside the tool's profile.
+                continue
         # Local Storage carries the Gemini shell's own state; without it the app
         # reloads as a guest even when the cookies survive.
         local_storage = source_profile / 'Local Storage'
@@ -772,6 +843,116 @@ class ChromeProfileManager:
         except OSError:
             pass
 
+    # -- shared window ---------------------------------------------------------
+
+    def shared_window_enabled(self) -> bool:
+        return bool(self.config.read().get('shared_window', False))
+
+    def set_shared_window(self, enabled: bool) -> dict[str, Any]:
+        state = self.config.write(shared_window=bool(enabled))
+        return {'status': 'ok', 'shared_window': bool(enabled), 'config': state}
+
+    def session_account(self, profile: dict[str, Any]) -> str:
+        """The Google account Chrome records for the *tool's* copy of this profile.
+
+        Read from that copy's own ``Local State`` — the same metadata the scanner
+        uses, nothing secret — so the panel can say which account its chats belong to.
+        """
+        user_data = self.session_dir(profile)
+        state, _error = _read_json(user_data / 'Local State')
+        section = state.get('profile') if isinstance(state, dict) else None
+        cache = section.get('info_cache') if isinstance(section, dict) else None
+        entry = cache.get(profile['profile_folder']) if isinstance(cache, dict) else None
+        email = _clean_email((entry or {}).get('user_name')) if isinstance(entry, dict) else ''
+        if email:
+            return email
+        preferences, _error = _read_json(user_data / profile['profile_folder'] / 'Preferences')
+        emails = preferences_emails(preferences)
+        return emails[0] if emails else ''
+
+    def window_marker(self, profile: dict[str, Any]) -> Path:
+        return self.sessions_dir / profile['id'] / WINDOW_MARKER
+
+    def window_port(self, profile: dict[str, Any]) -> int | None:
+        data, _error = _read_json(self.window_marker(profile))
+        try:
+            port = int((data or {}).get('port') or 0)
+        except (TypeError, ValueError):
+            return None
+        return port or None
+
+    def ensure_window(self, profile: dict[str, Any]) -> int:
+        """Return the debug port of the visible window, launching it if needed."""
+        if self.session_in_use(profile):
+            port = self.window_port(profile)
+            if port and _devtools_ready(port):
+                return port
+            raise ChromeProfileError(
+                "The tool's Chrome window is open without sharing. Close that window, then try again.",
+                'locked',
+            )
+        executable = chrome_executable()
+        if executable is None:
+            raise ChromeProfileError(MISSING_CHROME_MESSAGE, 'error')
+        port = next((candidate for candidate in SHARED_WINDOW_PORTS if _port_free(candidate)), 0)
+        if not port:
+            raise ChromeProfileError('No free local port for the shared window (9333-9342).', 'error')
+        command = [
+            str(executable),
+            f'--user-data-dir={self.session_profile(profile)}',
+            f'--profile-directory={profile["profile_folder"]}',
+            f'--remote-debugging-port={port}',
+            '--no-first-run',
+            '--no-default-browser-check',
+            'about:blank',
+        ]
+        flags = 0
+        if sys.platform == 'win32':
+            flags = getattr(subprocess, 'DETACHED_PROCESS', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+        try:
+            subprocess.Popen(command, close_fds=True, creationflags=flags)
+        except OSError as error:
+            raise ChromeProfileError(f'Chrome could not be started: {error}', 'error') from error
+        marker = self.window_marker(profile)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({'port': port}), encoding='utf-8')
+        if not _wait_for_devtools(port):
+            raise ChromeProfileError('Chrome opened, but its debugging port never answered.', 'error')
+        return port
+
+    def _attach_shared(self, profile: dict[str, Any], port: int) -> SharedSession:
+        """Open the tool's own tab in the running window."""
+        from playwright.sync_api import sync_playwright
+
+        playwright = sync_playwright().start()
+        try:
+            browser = playwright.chromium.connect_over_cdp(f'http://127.0.0.1:{port}')
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = context.new_page()
+        except Exception as error:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+            raise ChromeProfileError(
+                f'The shared Chrome window could not be attached: {str(error).splitlines()[0][:200]}',
+                'error',
+            ) from error
+        return SharedSession(profile, page, playwright)
+
+    def _ensure_usable(self, profile: dict[str, Any]) -> None:
+        """Refuse a profile only when Chrome holds it in a way this mode cannot use."""
+        if self.shared_window_enabled():
+            if self.session_in_use(profile):
+                port = self.window_port(profile)
+                if not (port and _devtools_ready(port)):
+                    raise ChromeProfileError(
+                        "The tool's Chrome window is open without sharing. Close that window, then try again.",
+                        'locked',
+                    )
+            return
+        self._ensure_not_busy(profile)
+
     def reset_session_profile(self, profile_id_value: str) -> dict[str, Any]:
         """Throw the tool's profile away (forces a fresh seed and a new sign-in)."""
         profile = self.get_profile(profile_id_value)
@@ -790,14 +971,17 @@ class ChromeProfileManager:
         return False
 
     def _ensure_not_busy(self, profile: dict[str, Any]) -> None:
-        folder = profile['profile_folder']
+        """Only the tool's *own* window blocks a run.
+
+        Chrome holding the source profile does not: the tool works on its own copy
+        of it, and a copy taken while Chrome runs merely risks a slightly stale
+        cookie — the sign-in inside the tool's profile is what counts.
+        """
         if self.session_in_use(profile):
             raise ChromeProfileError(
-                f"The tool's Chrome window for {folder} is open. Close it, then try again.", 'locked',
+                f"The tool's Chrome window for {profile['profile_folder']} is open. Close it, then try again.",
+                'locked',
             )
-        if profile['is_locked'] and not self.has_session_profile(profile):
-            # Seeding needs a quiet source profile: Chrome may be mid-write.
-            raise ChromeProfileError(locked_message(folder), 'locked')
 
     # -- validation -----------------------------------------------------------
 
@@ -807,7 +991,7 @@ class ChromeProfileManager:
         if profile is None:
             return _validation(profile_id_value, 'error', 'That Chrome profile is no longer available. Refresh the list.')
         try:
-            self._ensure_not_busy(profile)
+            self._ensure_usable(profile)
         except ChromeProfileError as error:
             return _validation(profile['id'], error.status, str(error))
         if not playwright_available():
@@ -835,6 +1019,30 @@ class ChromeProfileManager:
         session usable: Validate and the Gemini prompt then open this very
         profile, and Google sees the same browser it saw at sign-in.
         """
+        return self._open_profile_window(
+            profile_id_value, GEMINI_URL,
+            "The tool's own Chrome window opened on Gemini. Sign in there if you have not yet, browse its "
+            'chat list to see the runs it saved, then close the window (Validate and Translate need it closed).',
+        )
+
+    def open_account_chooser(self, profile_id_value: str) -> dict[str, Any]:
+        """Open the tool's profile on Google's account picker.
+
+        The chooser lists the accounts this profile already knows (plus "Use
+        another account"); picking one completes the sign-in in the very profile
+        the automation uses. Nothing is typed by this code and no password is
+        ever read — the user does the picking.
+        """
+        return self._open_profile_window(
+            profile_id_value, ACCOUNT_CHOOSER_URL,
+            "Google's account chooser opened in the tool's own Chrome window. Pick the account (or "
+            '"Use another account"), wait until Gemini shows it, then close the window and press Validate Gemini.',
+            status='account_chooser',
+        )
+
+    def _open_profile_window(self, profile_id_value: str, url: str, message: str,
+                             status: str = 'manual_login') -> dict[str, Any]:
+        """Start Chrome on the tool's profile at ``url`` and return at once."""
         profile = self.get_profile(profile_id_value)
         if profile is None:
             return {'success': False, 'status': 'error',
@@ -847,8 +1055,15 @@ class ChromeProfileManager:
             str(executable),
             f'--user-data-dir={user_data_dir}',
             f'--profile-directory={profile["profile_folder"]}',
-            GEMINI_URL,
         ]
+        if self.shared_window_enabled() and not self.session_in_use(profile):
+            port = next((candidate for candidate in SHARED_WINDOW_PORTS if _port_free(candidate)), 0)
+            if port:
+                command.append(f'--remote-debugging-port={port}')
+                marker = self.window_marker(profile)
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(json.dumps({'port': port}), encoding='utf-8')
+        command.append(url)
         flags = 0
         if sys.platform == 'win32':
             flags = getattr(subprocess, 'DETACHED_PROCESS', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
@@ -856,15 +1071,7 @@ class ChromeProfileManager:
             subprocess.Popen(command, close_fds=True, creationflags=flags)
         except OSError as error:
             return {'success': False, 'status': 'error', 'message': f'Chrome could not be started: {error}'}
-        return {
-            'success': True,
-            'status': 'manual_login',
-            'profile_id': profile['id'],
-            'message': (
-                "The tool's own Chrome window opened on Gemini. Sign in there if you have not yet, browse its "
-                'chat list to see the runs it saved, then close the window (Validate and Translate need it closed).'
-            ),
-        }
+        return {'success': True, 'status': status, 'profile_id': profile['id'], 'message': message}
 
 
 def _validation(profile_id_value: str, status: str, message: str) -> dict[str, Any]:
@@ -1045,6 +1252,7 @@ def snapshot() -> dict[str, Any]:
     for profile in profiles:
         # The panel explains the first run: sign in once inside the tool's window.
         profile['session_ready'] = profile_manager.has_session_profile(profile)
+        profile['tool_window_open'] = profile_manager.session_in_use(profile)
     state = profile_manager.config.read()
     selected_id = state.get('selected_profile_id', '')
     selected = next((profile for profile in profiles if profile['id'] == selected_id), None)
@@ -1057,7 +1265,9 @@ def snapshot() -> dict[str, Any]:
         'last_selected_profile_folder': state.get('last_selected_profile_folder', ''),
         'last_selected_root_path': state.get('last_selected_root_path', ''),
         'headless': bool(state.get('headless', False)),
+        'shared_window': bool(state.get('shared_window', False)),
         'roots': [str(root) for root in chrome_roots()],
+        'session_account': profile_manager.session_account(selected) if selected else '',
         'chrome_path': str(executable) if executable else '',
         'playwright_ready': playwright_available(),
         'chrome_running': chrome_running(),

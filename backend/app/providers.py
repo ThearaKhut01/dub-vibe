@@ -1400,7 +1400,12 @@ class GeminiWebTranslationProvider(TranslationProvider):
         if not lines:
             return []
         source = '' if source_language in ('', 'auto') else source_language
-        results = gemini_web.translate_lines(list(lines), target_language, source, glossary=glossary)
+        cues = (meta or {}).get('cues') or None
+        results = gemini_web.translate_lines(
+            list(lines), target_language, source, glossary=glossary,
+            cues=[(float(start), float(end)) for start, end in cues] if cues else None,
+            context=context,
+        )
         if usage is not None:
             usage['lines'] = int(usage.get('lines', 0)) + len(lines)
         return results
@@ -1677,6 +1682,10 @@ class HybridTranslationProvider(TranslationProvider):
                     meta=meta,
                 )
             except Exception as error:
+                if key in BROWSER_TRANSLATION_ENGINES and self._preference == key:
+                    # The user picked this engine on purpose: a locked or signed-out
+                    # browser must say so, not quietly translate with another engine.
+                    raise
                 logger.info('%s batch translation failed (%s), trying the next provider.', key, error)
                 if _looks_rate_limited(error):
                     _park_engine(key)
@@ -1703,6 +1712,8 @@ class HybridTranslationProvider(TranslationProvider):
                 self._mode = modes[key]
                 return result
             except Exception as error:
+                if key in BROWSER_TRANSLATION_ENGINES and self._preference == key:
+                    raise
                 logger.info('%s translation failed (%s), trying the next provider.', key, error)
                 last_error = error
         if last_error is not None:
@@ -2090,17 +2101,34 @@ class EdgeTTSProvider(TextToSpeechProvider):
                 if attempt < 2:
                     await asyncio.sleep(1.0 * (attempt + 1))
         else:
-            # "No audio was received" is what Edge returns when its backend has no
-            # audio for that voice (seen for whole languages during an outage) —
-            # retrying the same voice will not help, so report it as unavailable.
+            tried = [selected_voice]
+            # "No audio was received" can hit one voice while its sibling still
+            # answers (different backend pools), so try the language's other voice
+            # before declaring the whole language unavailable.
+            if last_error is not None and 'No audio' in str(last_error):
+                alternate = next(
+                    (neural for (lang, _label), neural in EDGE_LANGUAGE_VOICES.items()
+                     if lang == language and neural != selected_voice),
+                    '',
+                )
+                if alternate:
+                    tried.append(alternate)
+                    try:
+                        output.unlink(missing_ok=True)
+                        await edge_tts.Communicate(text, alternate).save(str(output))
+                        selected_voice = alternate
+                        last_error = None
+                    except Exception as error:
+                        last_error = error
             if last_error is not None and 'No audio' in str(last_error):
                 raise SpeechUnavailableError(
-                    f'Edge TTS returned no audio for {language} ({selected_voice}). '
+                    f'Edge TTS returned no audio for {language} (tried {", ".join(tried)}). '
                     'Microsoft\'s Edge voice service is currently not serving this '
-                    'language — other languages still work. Retry later or pick another '
-                    'voice engine.'
+                    'language — other languages still work. Press Dub again in a minute, '
+                    'or pick another voice engine.'
                 ) from last_error
-            raise RuntimeError(f'Edge TTS failed after 3 attempts: {last_error}') from last_error
+            if last_error is not None:
+                raise RuntimeError(f'Edge TTS failed after 3 attempts: {last_error}') from last_error
         # Some failures skip the loop's break but still leave an empty file.
         if not _audio_has_sound(output):
             output.unlink(missing_ok=True)

@@ -153,6 +153,48 @@ export interface FixOverlapsResponse {
   proposals: OverlapProposal[];
 }
 
+/** One quality problem found before export. */
+export interface QualityProblem {
+  id: string;
+  start: number;
+  text: string;
+  slot?: number;
+  clip?: number;
+  overrun?: number;
+  chars?: number;
+  per_second?: number;
+  message?: string;
+}
+
+/** `GET /api/projects/{id}/quality`. */
+export interface QualityReport {
+  summary: {
+    segments: number;
+    translated: number;
+    with_audio: number;
+    missing_translation: number;
+    missing_audio: number;
+    overruns: number;
+    long_lines: number;
+    overlaps: number;
+  };
+  problems: {
+    missing_translation: QualityProblem[];
+    missing_audio: QualityProblem[];
+    overruns: QualityProblem[];
+    long_lines: QualityProblem[];
+    overlaps: QualityProblem[];
+  };
+}
+
+/** What the translation memory holds (the panel shows it, and can clear it). */
+export interface TranslationCacheStats {
+  entries: number;
+  hits: number;
+  newest_at: number | null;
+  enabled?: boolean;
+}
+
 /** One provider's credential state, as the translation-engine picker needs it. */
 export interface ProviderKeyStatus {
   has_key: boolean;
@@ -180,6 +222,8 @@ export interface ChromeProfile {
   is_last_used: boolean;
   /** True once the tool's own profile exists for this Chrome profile. */
   session_ready?: boolean;
+  /** True while the tool's own Chrome window holds this profile open. */
+  tool_window_open?: boolean;
   warnings: string[];
 }
 
@@ -204,6 +248,10 @@ export interface ChromeProfilesSnapshot {
   last_selected_profile_folder: string;
   last_selected_root_path: string;
   headless: boolean;
+  /** Keep one visible Chrome window and drive a tab in it. */
+  shared_window: boolean;
+  /** Google account recorded in the tool's own copy of the selected profile. */
+  session_account: string;
   roots: string[];
   chrome_path: string;
   playwright_ready: boolean;

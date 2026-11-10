@@ -263,7 +263,8 @@ def test_translate_route_batches_and_dedupes(monkeypatch, tmp_path):
             return True
 
         def translate_batch(self, lines, context=None, glossary='', *, source_language='auto',
-                            target_language='Khmer', tone='natural and consistent', usage=None):
+                            target_language='Khmer', tone='natural and consistent', usage=None,
+                            meta=None):
             calls.append({'lines': list(lines), 'context': list(context or []), 'glossary': glossary, 'tone': tone})
             table = {'Hello': 'សួស្តី', 'Bye': 'លាហើយ', 'See you': 'ជួបគ្នាថ្ងៃក្រោយ'}
             if usage is not None:
@@ -320,7 +321,8 @@ def test_second_run_is_served_from_cache(monkeypatch, tmp_path):
             return True
 
         def translate_batch(self, lines, context=None, glossary='', *, source_language='auto',
-                            target_language='Khmer', tone='natural and consistent', usage=None):
+                            target_language='Khmer', tone='natural and consistent', usage=None,
+                            meta=None):
             calls.append(list(lines))
             return ['សួស្តី' if line == 'Hello' else 'លាហើយ' for line in lines]
 
@@ -472,7 +474,8 @@ def test_route_falls_back_to_one_line_for_an_unfilled_batch(monkeypatch, tmp_pat
             return True
 
         def translate_batch(self, lines, context=None, glossary='', *, source_language='auto',
-                            target_language='Khmer', tone='natural and consistent', usage=None):
+                            target_language='Khmer', tone='natural and consistent', usage=None,
+                            meta=None):
             return ['សួស្តី', None]
 
         def translate(self, text, target_language, source_language='en'):

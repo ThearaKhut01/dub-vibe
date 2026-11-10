@@ -10,6 +10,7 @@ successfully. A failed regeneration leaves the previous audio in place.
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +143,77 @@ def fit_report(clip_seconds: float | None, slot_seconds: float) -> dict[str, Any
         'overrun_seconds': overrun,
         'fits': overrun <= 0.05,
     }
+
+
+# How far a line may be time-compressed before it is reported instead. 1.2 keeps
+# speech natural (atempo preserves pitch); past that the text itself must shrink.
+MAX_FIT_TEMPO = 1.2
+MIN_FIT_RATIO = 1.02
+
+
+def _probe_seconds(ffprobe: str, media_path: str) -> float:
+    completed = subprocess.run(
+        [ffprobe, '-v', 'error', '-show_entries', 'format=duration',
+         '-of', 'default=noprint_wrappers=1:nokey=1', media_path],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    return float(completed.stdout.strip())
+
+
+def _media_tool(name: str) -> str | None:
+    """ffmpeg/ffprobe from PATH (main passes the bundled ones when it has them)."""
+    return shutil.which(name) or shutil.which(f'{name}.exe')
+
+
+def fit_clip_to_slot(clip_path: str, slot_seconds: float, *,
+                     max_tempo: float = MAX_FIT_TEMPO,
+                     ffmpeg: str | None = None, ffprobe: str | None = None) -> dict[str, Any]:
+    """Time-compress a clip that runs past its cue; never cut speech, never speed past ``max_tempo``.
+
+    ``atempo`` is used (pitch preserved). The file is only rewritten when it really
+    overruns, and the returned report says what happened either way.
+    """
+    slot = max(0.05, float(slot_seconds))
+    empty = {'clip_seconds': None, 'slot_seconds': round(slot, 3), 'overrun_seconds': 0.0,
+             'fits': True, 'tempo': 1.0}
+    ffprobe = ffprobe or _media_tool('ffprobe')
+    ffmpeg = ffmpeg or _media_tool('ffmpeg')
+    target = Path(str(clip_path or ''))
+    if not ffprobe or not ffmpeg or not target.is_file():
+        return empty
+    try:
+        clip_seconds = _probe_seconds(ffprobe, str(target))
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return empty
+
+    tempo = 1.0
+    if clip_seconds > slot * MIN_FIT_RATIO:
+        tempo = round(min(clip_seconds / slot, max_tempo), 3)
+        temp = target.with_name(f'{target.stem}.fit{target.suffix}')
+        try:
+            subprocess.run(
+                [ffmpeg, '-y', '-i', str(target), '-vn', '-filter:a', f'atempo={tempo:.4f}',
+                 '-c:a', 'libmp3lame' if target.suffix.lower() == '.mp3' else 'pcm_s16le', str(temp)],
+                capture_output=True, text=True, check=True, timeout=120,
+            )
+            temp.replace(target)
+            clip_seconds = _probe_seconds(ffprobe, str(target))
+        except (subprocess.SubprocessError, OSError):
+            temp.unlink(missing_ok=True)
+            tempo = 1.0
+    report = fit_report(clip_seconds, slot)
+    report['tempo'] = tempo
+    return report
+
+
+def fit_entry(entry: dict[str, Any], *, max_tempo: float = MAX_FIT_TEMPO,
+              ffmpeg: str | None = None, ffprobe: str | None = None) -> dict[str, Any]:
+    """Fit one stored clip to its cue and record the report on the entry."""
+    slot = float(entry.get('end') or 0) - float(entry.get('start') or 0)
+    report = fit_clip_to_slot(str(entry.get('path') or ''), slot, max_tempo=max_tempo,
+                              ffmpeg=ffmpeg, ffprobe=ffprobe)
+    entry['fit'] = report
+    return report
 
 
 def engine_of_clip(clip: dict[str, Any] | None, fallback: str = 'auto') -> str:

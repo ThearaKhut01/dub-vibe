@@ -263,7 +263,10 @@ def test_generate_route_stores_fit_on_the_clip(tmp_path, monkeypatch):
 
     monkeypatch.setattr(main, 'DATA_ROOT', tmp_path / 'data')
     monkeypatch.setattr(main, 'find_media_tool', lambda name: 'ffprobe' if name == 'ffprobe' else None)
-    monkeypatch.setattr(main, '_probe_duration', lambda ffprobe, path: 3.5)
+    monkeypatch.setattr(
+        segment_tts, 'fit_clip_to_slot',
+        lambda path, slot, **kwargs: {**segment_tts.fit_report(3.5, slot), 'tempo': 1.2},
+    )
 
     def fake_synthesize_line(text, out_path, **kwargs):
         Path(out_path).write_bytes(b'mp3')

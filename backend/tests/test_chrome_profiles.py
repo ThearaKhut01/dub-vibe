@@ -13,6 +13,15 @@ import pytest
 from backend.app import chrome_profiles as cp
 
 
+@pytest.fixture(autouse=True)
+def _no_real_chrome_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scans must not depend on the machine's process table (psutil is slow there).
+
+    Tests that simulate Chrome override this inside the test itself.
+    """
+    monkeypatch.setattr(cp, 'chrome_processes', lambda: [])
+
+
 def _write_json(path: Path, data: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data), encoding='utf-8')
@@ -200,6 +209,7 @@ def test_config_stores_only_the_selection(tmp_path: Path) -> None:
         'last_selected_profile_folder': 'Profile 1',
         'last_selected_root_path': r'C:\Users\me\AppData\Local\Google\Chrome\User Data',
         'headless': True,
+        'shared_window': False,
     }
     assert config.read()['selected_profile_id'] == 'abc123'
 
@@ -226,8 +236,9 @@ def test_validate_unknown_profile_reports_error(manager: cp.ChromeProfileManager
     assert 'no longer available' in result['message']
 
 
-def test_validate_locked_profile_does_not_launch(monkeypatch: pytest.MonkeyPatch,
-                                                 chrome_root: Path, tmp_path: Path) -> None:
+def test_chrome_using_the_source_profile_does_not_block(monkeypatch: pytest.MonkeyPatch,
+                                                        chrome_root: Path, tmp_path: Path) -> None:
+    """The tool works on its own copy, so an open Chrome window is not an error."""
     monkeypatch.setattr(cp, 'scan_profiles', lambda errors=None: cp.scan_root(chrome_root, errors))
     monkeypatch.setattr(cp, 'chrome_processes', lambda: [
         (1, f'chrome.exe --user-data-dir="{chrome_root}" --profile-directory=Default'),
@@ -235,12 +246,9 @@ def test_validate_locked_profile_does_not_launch(monkeypatch: pytest.MonkeyPatch
     profile_manager = cp.ChromeProfileManager(config_path=tmp_path / 'config.json',
                                               sessions_dir=tmp_path / 'sessions')
     profile = profile_manager.list_profiles()[0]
+    assert profile['is_locked'] is True
 
-    result = profile_manager.validate_profile(profile['id'])
-
-    assert result['status'] == 'locked'
-    assert result['success'] is False
-    assert 'Close the Chrome window' in result['message']
+    profile_manager._ensure_usable(profile)  # must not raise
 
 
 def test_the_tool_window_makes_the_profile_busy(monkeypatch: pytest.MonkeyPatch,
@@ -281,6 +289,35 @@ def test_launch_without_a_selection_is_an_error(manager: cp.ChromeProfileManager
         manager.launch_selected_profile()
 
 
+def test_open_account_chooser_uses_googles_picker(monkeypatch: pytest.MonkeyPatch,
+                                                   tmp_path: Path) -> None:
+    root = tmp_path / 'User Data'
+    _write_json(root / 'Local State', {'profile': {'info_cache': {'Default': {'name': 'Copy'}}}})
+    _write_json(root / 'Default' / 'Preferences', {'account_info': []})
+    monkeypatch.setattr(cp, 'scan_profiles', lambda errors=None: cp.scan_root(root, errors))
+    fake_chrome = tmp_path / 'chrome.exe'
+    fake_chrome.write_text('', encoding='utf-8')
+    monkeypatch.setattr(cp, 'chrome_executable', lambda: fake_chrome)
+    started: list[list[str]] = []
+
+    def fake_popen(command, **_kwargs):
+        started.append(command)
+        return object()
+
+    monkeypatch.setattr(cp.subprocess, 'Popen', fake_popen)
+    profile_manager = cp.ChromeProfileManager(config_path=tmp_path / 'config.json',
+                                              sessions_dir=tmp_path / 'sessions')
+    profile = profile_manager.list_profiles()[0]
+
+    result = profile_manager.open_account_chooser(profile['id'])
+
+    assert result['success'] is True
+    assert result['status'] == 'account_chooser'
+    assert 'Use another account' in result['message']
+    assert started[0][-1] == cp.ACCOUNT_CHOOSER_URL
+    assert 'accounts.google.com/AccountChooser' in cp.ACCOUNT_CHOOSER_URL
+
+
 def test_open_manual_reports_a_missing_chrome(manager: cp.ChromeProfileManager,
                                               monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cp, 'chrome_executable', lambda: None)
@@ -318,6 +355,90 @@ def test_open_manual_builds_a_profile_scoped_command(manager: cp.ChromeProfileMa
     assert command[0] == str(fake_chrome)
     assert f'--profile-directory={profile["profile_folder"]}' in command
     assert cp.GEMINI_URL in command
+
+
+def test_the_shared_window_flag_is_stored(tmp_path: Path) -> None:
+    profile_manager = cp.ChromeProfileManager(config_path=tmp_path / 'config.json',
+                                              sessions_dir=tmp_path / 'sessions')
+    assert profile_manager.shared_window_enabled() is False
+
+    profile_manager.set_shared_window(True)
+
+    assert profile_manager.shared_window_enabled() is True
+    assert json.loads((tmp_path / 'config.json').read_text(encoding='utf-8'))['shared_window'] is True
+
+
+def test_ensure_window_launches_chrome_with_a_debug_port(monkeypatch: pytest.MonkeyPatch,
+                                                         tmp_path: Path) -> None:
+    root = tmp_path / 'User Data'
+    _write_json(root / 'Local State', {'profile': {'info_cache': {'Default': {'name': 'Copy'}}}})
+    _write_json(root / 'Default' / 'Preferences', {'account_info': []})
+    monkeypatch.setattr(cp, 'scan_profiles', lambda errors=None: cp.scan_root(root, errors))
+    fake_chrome = tmp_path / 'chrome.exe'
+    fake_chrome.write_text('', encoding='utf-8')
+    monkeypatch.setattr(cp, 'chrome_executable', lambda: fake_chrome)
+    monkeypatch.setattr(cp, '_port_free', lambda port: port == 9335)
+    monkeypatch.setattr(cp, '_wait_for_devtools', lambda port, timeout=None: True)
+    started: list[list[str]] = []
+
+    def fake_popen(command, **_kwargs):
+        started.append(command)
+        return object()
+
+    monkeypatch.setattr(cp.subprocess, 'Popen', fake_popen)
+    profile_manager = cp.ChromeProfileManager(config_path=tmp_path / 'config.json',
+                                              sessions_dir=tmp_path / 'sessions')
+    profile = profile_manager.list_profiles()[0]
+
+    port = profile_manager.ensure_window(profile)
+
+    assert port == 9335
+    assert '--remote-debugging-port=9335' in started[0]
+    assert started[0][-1] == 'about:blank'
+    marker = json.loads((tmp_path / 'sessions' / profile['id'] / 'window.json').read_text(encoding='utf-8'))
+    assert marker['port'] == 9335
+
+
+def test_shared_mode_attaches_to_the_open_window(monkeypatch: pytest.MonkeyPatch,
+                                                 tmp_path: Path) -> None:
+    root = tmp_path / 'User Data'
+    _write_json(root / 'Local State', {'profile': {'info_cache': {'Default': {'name': 'Copy'}}}})
+    _write_json(root / 'Default' / 'Preferences', {'account_info': []})
+    monkeypatch.setattr(cp, 'scan_profiles', lambda errors=None: cp.scan_root(root, errors))
+    monkeypatch.setattr(cp, 'playwright_available', lambda: True)
+    (tmp_path / 'chrome.exe').write_text('', encoding='utf-8')
+    monkeypatch.setattr(cp, 'chrome_executable', lambda: tmp_path / 'chrome.exe')
+    profile_manager = cp.ChromeProfileManager(config_path=tmp_path / 'config.json',
+                                              sessions_dir=tmp_path / 'sessions')
+    profile_manager.set_shared_window(True)
+    profile = profile_manager.list_profiles()[0]
+    marker = tmp_path / 'sessions' / profile['id'] / 'window.json'
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({'port': 9333}), encoding='utf-8')
+
+    attached: list[int] = []
+
+    class FakeSession:
+        page = object()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(cp, 'chrome_processes', lambda: [
+        (7, f'chrome.exe "--user-data-dir={profile_manager.session_dir(profile)}"'),
+    ])
+    monkeypatch.setattr(cp, '_devtools_ready', lambda port: port == 9333)
+
+    def fake_attach(target_profile, port):
+        attached.append(port)
+        return FakeSession()
+
+    monkeypatch.setattr(profile_manager, '_attach_shared', fake_attach)
+
+    session = profile_manager.launch_profile(profile['id'])
+
+    assert attached == [9333], 'the open window must be attached to, not relaunched'
+    assert session.page is not None
 
 
 def test_session_profile_is_seeded_once_and_then_reused(tmp_path: Path) -> None:

@@ -31,8 +31,10 @@ import {
   Moon,
   ZoomIn,
   ZoomOut,
+  ShieldCheck,
 } from 'lucide-react';
 import { useStudioStore } from './store/useStudioStore';
+import type { QualityReport } from './types';
 import { usePreviewLayout } from './store/usePreviewLayout';
 import { useDesignStore } from './store/useDesignStore';
 import { captionAtTime } from './store/useDesignStore';
@@ -252,6 +254,15 @@ function App() {
   const [keyBusy, setKeyBusy] = useState<string | null>(null);
   const [ttsProvider, setTtsProvider] = useState(() => localStorage.getItem('dubvibe-tts-provider') ?? 'auto');
   const [translationProvider, setTranslationProvider] = useState(() => localStorage.getItem('dubvibe-translation-provider') ?? 'auto');
+  // One-shot: ignore the saved translations and the cache for the next run.
+  const [retranslateAll, setRetranslateAll] = useState(false);
+  const [quality, setQuality] = useState<QualityReport | null>(null);
+  const [qualityBusy, setQualityBusy] = useState(false);
+  const { translationCache, refreshTranslationCache, clearTranslationCache } = useStudioStore();
+
+  useEffect(() => {
+    void refreshTranslationCache();
+  }, [refreshTranslationCache]);
   const [ttsModel, setTtsModel] = useState(() => localStorage.getItem('dubvibe-tts-model') ?? '');
   const [geminiModels, setGeminiModels] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem('dubvibe-gemini-models') ?? '[]'); } catch { return []; }
@@ -940,6 +951,21 @@ function App() {
     }
   };
 
+  const handleQualityCheck = async () => {
+    if (!project.id) return;
+    setQualityBusy(true);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/projects/${project.id}/quality`);
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail ?? `Quality check failed (HTTP ${response.status})`);
+      setQuality(body as QualityReport);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Quality check failed.');
+    } finally {
+      setQualityBusy(false);
+    }
+  };
+
   const handleWorkflow = async (action: string) => {
     if (!hasMedia) {
       setNotice('Import a video before running this step.');
@@ -958,6 +984,7 @@ function App() {
         transcribeLanguage: transcribeLanguage || undefined,
         beamSize,
         translationProvider,
+        retranslate: retranslateAll,
         ttsProvider,
         ttsModel: ttsModel || undefined,
         emotion: voiceEmotion,
@@ -1330,7 +1357,7 @@ function App() {
       if (chunkSelection && videoChunks.length === 0) {
         await runChunk(Number(chunkSelection) * 60);
       }
-      const voiceOptions = { targetLanguage, voice: selectedVoice, transcribeLanguage: transcribeLanguage || undefined, beamSize, translationProvider, ttsProvider, ttsModel: ttsModel || undefined, emotion: voiceEmotion, intensity: voiceIntensity, speed: voiceSpeed, acting: actingEnabled, openaiActing, openaiReview };
+      const voiceOptions = { targetLanguage, voice: selectedVoice, transcribeLanguage: transcribeLanguage || undefined, beamSize, translationProvider, retranslate: retranslateAll, ttsProvider, ttsModel: ttsModel || undefined, emotion: voiceEmotion, intensity: voiceIntensity, speed: voiceSpeed, acting: actingEnabled, openaiActing, openaiReview };
       await runWorkflowStep('transcribe', undefined, voiceOptions);
       await runWorkflowStep('translate', undefined, voiceOptions);
       await runWorkflowStep('tts', undefined, voiceOptions);
@@ -1726,13 +1753,68 @@ function App() {
                   : 'Transcription runs locally via Faster-Whisper. Translation: offline (Argos) or online (Google). TTS: online (Edge) with offline fallback (SAPI5).'}
             </div>
 
-            <div className="flex gap-3 rounded-2xl border border-white/10 bg-slate-900/80 p-4">
+            <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-white/10 bg-slate-900/80 p-4">
               {actionButtons.map(({ label, icon: Icon }) => (
                 <button key={label} onClick={() => void handleWorkflow(label)} disabled={busy || apiAvailable !== true || !hasMedia} className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-slate-950/70 px-3 py-2 text-sm text-slate-200 hover:border-sky-500/50 disabled:cursor-not-allowed disabled:opacity-40">
                   <Icon size={15} /> {label}
                 </button>
               ))}
+              <button
+                onClick={() => void handleQualityCheck()}
+                disabled={qualityBusy || !project.id}
+                className="ml-auto inline-flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200 hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                title="Check overruns, long lines, missing audio before exporting"
+              >
+                <ShieldCheck size={15} /> {qualityBusy ? 'Checking…' : 'Quality check'}
+              </button>
             </div>
+
+            {quality && (
+              <div className="rounded-xl border border-white/10 bg-slate-950/70 p-3 text-[11px] text-slate-300">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                  <span className="font-medium text-slate-200">Quality check</span>
+                  <span>{quality.summary.segments} segments</span>
+                  <span>{quality.summary.with_audio} with audio</span>
+                  <span className={quality.summary.overruns ? 'text-amber-300' : 'text-emerald-300'}>
+                    {quality.summary.overruns} overrun{quality.summary.overruns === 1 ? '' : 's'}
+                  </span>
+                  <span className={quality.summary.long_lines ? 'text-amber-300' : 'text-emerald-300'}>
+                    {quality.summary.long_lines} too long for the cue
+                  </span>
+                  <span className={quality.summary.missing_translation ? 'text-rose-300' : 'text-emerald-300'}>
+                    {quality.summary.missing_translation} missing translation
+                  </span>
+                  <span className={quality.summary.missing_audio ? 'text-rose-300' : 'text-emerald-300'}>
+                    {quality.summary.missing_audio} without audio
+                  </span>
+                  <span className={quality.summary.overlaps ? 'text-amber-300' : 'text-emerald-300'}>
+                    {quality.summary.overlaps} overlap{quality.summary.overlaps === 1 ? '' : 's'}
+                  </span>
+                </div>
+                {quality.problems.overruns.slice(0, 5).map((item) => (
+                  <p key={`ov-${item.id}`} className="mt-1 text-amber-300">
+                    {new Date(item.start * 1000).toISOString().slice(14, 19)} · over by {item.overrun}s
+                    {' '}(slot {item.slot}s, clip {item.clip}s) — {item.text}
+                  </p>
+                ))}
+                {quality.problems.long_lines.slice(0, 5).map((item) => (
+                  <p key={`ll-${item.id}`} className="mt-1 text-amber-200">
+                    {new Date(item.start * 1000).toISOString().slice(14, 19)} · {item.per_second} chars/s
+                    {' '}({item.chars} chars in {item.slot}s) — {item.text}
+                  </p>
+                ))}
+                {quality.problems.missing_translation.slice(0, 5).map((item) => (
+                  <p key={`mt-${item.id}`} className="mt-1 text-rose-300">
+                    {new Date(item.start * 1000).toISOString().slice(14, 19)} · no translation — {item.text}
+                  </p>
+                ))}
+                {quality.problems.missing_audio.slice(0, 5).map((item) => (
+                  <p key={`ma-${item.id}`} className="mt-1 text-rose-300">
+                    {new Date(item.start * 1000).toISOString().slice(14, 19)} · no audio yet — {item.text}
+                  </p>
+                ))}
+              </div>
+            )}
 
             {/* Preview row + draggable splitters ---------------------------------
                 Source and Dubbed share one row; the bar under it resizes the row
@@ -2457,6 +2539,27 @@ function App() {
                         : 'Auto tries Qwen3 4B (local) first, then Argos, then Google Translate. Online API keys are only used when you pick that engine.'}
                   {' '}A line that fails moves to the next engine in this chain.
                 </p>
+                <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-slate-500">
+                  <label className="flex items-center gap-1.5" title="Ignore the saved translations and the memory for this run">
+                    <input
+                      type="checkbox"
+                      checked={retranslateAll}
+                      onChange={(event) => setRetranslateAll(event.target.checked)}
+                    />
+                    Re-translate every line
+                  </label>
+                  <span>
+                    Memory: {translationCache?.entries ?? 0} line{(translationCache?.entries ?? 0) === 1 ? '' : 's'}
+                  </span>
+                  <button
+                    onClick={() => void clearTranslationCache()}
+                    disabled={(translationCache?.entries ?? 0) === 0}
+                    className="rounded border border-white/10 bg-slate-900 px-2 py-0.5 text-[10px] text-slate-300 transition hover:bg-slate-800 disabled:opacity-40"
+                    title="Forget every remembered line, so the next run goes to the engine"
+                  >
+                    Clear cache
+                  </button>
+                </div>
               </div>
               <div className="border-t border-white/10 pt-3">
                 <label className="mb-1 block text-xs uppercase tracking-[0.18em] text-slate-500">Video chunking</label>

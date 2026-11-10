@@ -322,3 +322,44 @@ def test_auto_never_picks_the_browser_engine(monkeypatch: pytest.MonkeyPatch) ->
     chain = [key for key, _provider in translator._chain()]
     assert 'gemini_web' not in chain
 
+
+def test_a_batch_with_cues_is_sent_as_srt_blocks() -> None:
+    prompt = gemini_web.build_batch_prompt(
+        ['Where were you?', 'At the office.'],
+        'Khmer', 'Chinese',
+        cues=[(1.0, 2.4), (2.4, 3.2)],
+    )
+
+    assert '1\n00:00:01,000 --> 00:00:02,400\nWhere were you?' in prompt
+    assert '2\n00:00:02,400 --> 00:00:03,200\nAt the office.' in prompt
+    assert 'Keep each block number and its timecode' in prompt
+
+
+def test_an_srt_answer_is_parsed_back() -> None:
+    reply = (
+        '1\n00:00:01,000 --> 00:00:02,400\nយប់មិញអ្នកនៅឯណា?\n\n'
+        '2\n00:00:02,400 --> 00:00:03,200\nខ្ញុំនៅការិយាល័យ។'
+    )
+
+    assert gemini_web.parse_numbered_answer(reply, 2) == ['យប់មិញអ្នកនៅឯណា?', 'ខ្ញុំនៅការិយាល័យ។']
+
+
+def test_cues_and_context_reach_the_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    prompts: list[str] = []
+
+    class FakeAutomator:
+        def ask(self, prompt, timeout_s=180.0, lines=1):
+            prompts.append(prompt)
+            return {'success': True, 'reply': '1\n00:00:01,000 --> 00:00:02,400\nមួយ'}
+
+    monkeypatch.setattr(gemini_web, 'GeminiWebAutomator', FakeAutomator)
+
+    gemini_web.translate_lines(
+        ['Where were you?'], 'Khmer', 'Chinese',
+        cues=[(1.0, 2.4)], context=['Earlier line.'],
+    )
+
+    assert '00:00:01,000 --> 00:00:02,400' in prompts[0]
+    assert 'Earlier line.' in prompts[0]
+
+

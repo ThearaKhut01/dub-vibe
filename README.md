@@ -91,14 +91,17 @@ Open **AI Models** in the header to manage Faster-Whisper transcription models �
 **API Keys → Chrome Profiles** lists the Chrome profiles on this PC and lets the tool open Gemini in the one you already signed in to.
 
 - **What is read** — only Chrome's own metadata: `Local State` (profile names and the signed-in account) and each profile's `Preferences` (`account_info`). No cookie, password, `Login Data`, `Web Data` or token file is opened, nothing is decrypted, and nothing is uploaded. Profiles are found under `%LOCALAPPDATA%\Google\Chrome\User Data` (plus Chrome Beta / Chrome SxS when present).
-- **Status** — *Ready* (the Gemini account menu is visible), *Login required* (Gemini shows its signed-out header), *Locked* (Chrome already has that profile open — `psutil` reads `chrome.exe` command lines to tell which), *Unknown* (not checked yet).
+- **Status** — *Ready* (signed in), *Login required* (Gemini shows its signed-out header), *Window open* (the **tool's own** Chrome window for that profile is open — close it), *Unknown* (not checked yet). Your own Chrome having the profile open is *not* a problem: the tool works on its own copy, and `psutil` only uses `chrome.exe` command lines to say which window is which.
 - **What it does not do** — no automated login, no account creation, no CAPTCHA handling. When Gemini asks for a sign-in the panel says so; **Open manual login** opens the profile in normal Chrome on Gemini so you can sign in yourself, and **Validate Gemini** then re-checks it.
+- **Choose account** — opens Google's own account picker in the tool's profile; it lists the accounts that profile knows, plus "Use another account". You pick the account; the tool never types a credential, reads a password or bypasses a challenge.
+- **Shared window** — one visible Chrome stays open; Validate and Translate attach to it over CDP and work in a tab of their own, so you can browse in yours at the same time. It uses the tool's own profile (Chrome refuses debugging on the default one), the port listens on 127.0.0.1 only, and closing the tool's tab ends that run — not your browsing. Off by default; toggle it in the panel or with `--shared-window on|off`.
 - **Launching** — the profile is opened with Playwright's persistent context on the *User Data root* plus `--profile-directory=<folder>`, never on `…\Profile 1` itself, so Chrome loads the real profile. Only one profile is open at a time and the previous context is closed first.
 - **Chrome 136+** — Chrome refuses remote debugging on its default data directory, and a fresh copy of a profile is a *new device* for Google, so it lands signed out. The app therefore keeps **one profile of its own** per detected profile in `<app data>\chrome-profile-sessions` (seeded once from Chrome's metadata + cookie store, then reused). **Sign in once there** — *Open manual login* opens exactly that profile — and Validate / the Gemini prompt reuse the same browser afterwards. *Reset* throws it away and forces a new sign-in. Your normal Chrome profile is never written to, and this app never decrypts a cookie.
 - **Config** — `data\chrome_profile_config.json` holds `selected_profile_id`, `last_selected_profile_folder`, `last_selected_root_path` and `headless`. Nothing else is stored.
 - **Check it from a terminal** — `python test_chrome_profiles.py` lists the profiles, `--select "Profile 1"` saves a selection, and `--validate` opens that profile on Gemini and prints the login state.
 - **Live tab** — follows that profile: one node, updated over the local socket, and **Test prompt** sends one tiny question through it so the node has traffic. API keys are not drawn there.
 - **Subtitle translation** — pick *Gemini web (Chrome profile)* in the Translation engine list (it only appears once a profile is selected). Lines go out in one numbered message (up to 20 per batch), the reply is parsed back to the matching lines, a line the answer skipped is retried on its own, and the run stays serial because there is one browser. Auto never chooses it. Expect roughly 35–40 s per batch: that is Gemini answering, not Chrome starting.
+- **SRT-shaped prompts** — a batch leaves as real SRT blocks (number, `00:00:02,000 --> 00:00:03,400`, text) using the project's own cue times, plus the previous few lines for context, so the model can see how long each line has to be spoken. Its answer is parsed back as SRT (a numbered list is accepted too); the timecodes it writes are ignored — your timings are the ones applied.
 
 This needs `playwright` and `psutil` (`npm run setup:backend` installs them). Playwright drives your installed Chrome, so no browser download is required.
 
@@ -113,6 +116,10 @@ Two ways, neither needs Vite or a desktop window:
    .venv\Scripts\python.exe test_chrome_profiles.py
    REM pick the profile that is signed in to Gemini
    .venv\Scripts\python.exe test_chrome_profiles.py --select "Profile 2"
+   REM keep one Chrome window open while the tool works in its own tab
+   .venv\Scripts\python.exe test_chrome_profiles.py --shared-window on
+   REM pick a Google account in the tool's own Chrome window
+   .venv\Scripts\python.exe test_chrome_profiles.py --choose-account
    REM open the tool's window, wait for you to sign in there, then validate
    .venv\Scripts\python.exe test_chrome_profiles.py --signin
    REM translate one subtitle line through Gemini (chat answer)
@@ -137,6 +144,25 @@ Two ways, neither needs Vite or a desktop window:
 
 
 Translation memory (the wording reused for an identical line) lives in `<app data>\translation-cache.sqlite3`; `DUBVIBE_TRANSLATION_CACHE=0` switches it off.
+
+## Dubbing quality pass (fit, loudness, QC)
+
+Three things run automatically so an episode sounds finished without hand-editing:
+
+- **Per-line fitting** — after a line is synthesized it is measured against its cue. If it overruns, it is time-compressed with `atempo` (pitch preserved) up to **1.2×**; past that the line is left as-is and reported, because the text itself must get shorter. Reused clips keep the fit they already had.
+- **Loudness** — the final mix and every exported part end with `loudnorm=I=-16:TP=-1.5:LRA=11`. A test export measured **−16.0 LUFS** integrated, so episodes ship at the same level instead of drifting.
+- **Quality check** — the button next to Transcribe/Translate/Dub (or `GET /api/projects/{id}/quality`) reports, before you export: lines whose audio **overruns** its cue, lines **too dense** for their cue (more than ~14 characters a second), **missing translations**, lines **without audio**, and **overlapping** timecodes.
+
+Measured on a 4-line test project: one line fitted at 1.078× (1.395 s into a 1.4 s cue), one capped at 1.2× and still 0.3 s over (reported), QC summary `overruns: 1, long_lines: 2, missing: 0`, export loudness −16.0 LUFS.
+
+## Translation memory (and forcing a fresh run)
+
+Every translated line is remembered in `<app data>\translation-cache.sqlite3`, keyed by prompt version, model, language pair, glossary digest and the exact source line. A re-run of the same video therefore answers instantly and **does not call the engine at all** — no cost, identical wording, and (with the Gemini-web engine) no new chat.
+
+Two ways to override that, both next to the Translation engine picker:
+
+- **Clear cache** — forgets every remembered line. Measured: `removed: 75, entries: 0`. Also available as `GET /api/translation-cache` (entries/hits/enabled) and `POST /api/translation-cache/clear`, or by deleting the file / starting with `DUBVIBE_TRANSLATION_CACHE=0`.
+- **Re-translate every line** (one-shot checkbox) — clears the project's saved translations and skips the memory for that run, so every line goes to the engine again. Measured on a 2-line project: first run 11.6 s, plain re-run 0.0 s (saved lines reused), re-translate run 10.2 s with new wording and a new Gemini chat.
 
 ## Settings
 

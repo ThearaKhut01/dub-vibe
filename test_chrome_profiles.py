@@ -46,10 +46,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--select', metavar='FOLDER', help='save this profile folder (or id) as the selection')
     parser.add_argument('--open', action='store_true',
                         help="open the tool's own Chrome profile on Gemini, so you can sign in once")
+    parser.add_argument('--choose-account', action='store_true',
+                        help="open Google's account picker in the tool's own Chrome profile")
     parser.add_argument('--signin', action='store_true',
                         help='--open, wait until you close that window, then validate')
     parser.add_argument('--history', action='store_true',
                         help="open the tool's own Chrome profile on Gemini, to browse the chats it saved")
+    parser.add_argument('--shared-window', choices=('on', 'off'), metavar='on|off',
+                        help='keep one Chrome window open and drive a tab in it')
     parser.add_argument('--chats', type=int, nargs='?', const=15, metavar='N',
                         help='list the last N chats Gemini has for this profile (no window stays open)')
     parser.add_argument('--reset-session', action='store_true',
@@ -117,6 +121,22 @@ def main(argv: list[str] | None = None) -> int:
         manager.select_profile(target['id'])
         selected = target
         print(f'\nSaved selection: {target["profile_folder"]} ({target["id"]})')
+
+    if args.shared_window:
+        manager.set_shared_window(args.shared_window == 'on')
+        state = 'on' if args.shared_window == 'on' else 'off'
+        print(f'\nShared window {state}.')
+        print('  on  — Validate/Translate keep one Chrome open and use their own tab')
+        print('  off — the tool opens and closes its own window again')
+        return 0
+
+    if args.choose_account:
+        target = target_for(args.profile, 'choose an account for')
+        if target is None:
+            return 2
+        result = manager.open_account_chooser(target['id'])
+        print(f'\n{result["message"]}')
+        return 0 if result['success'] else 2
 
     if args.open or args.signin or args.history:
         if args.history and not (args.open or args.signin):

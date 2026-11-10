@@ -12,6 +12,7 @@ import type {
   ProviderKeyStatus,
   ProviderStatus,
   TimelineSegment,
+  TranslationCacheStats,
   WhisperModelInfo,
   WorkflowStep,
 } from '../types';
@@ -65,6 +66,12 @@ interface StudioState {
   selectChromeProfile: (profileId: string) => Promise<void>;
   validateChromeProfile: (profileId: string) => Promise<ChromeProfileValidation>;
   openChromeProfileManually: (profileId: string) => Promise<ChromeProfileValidation>;
+  chooseChromeAccount: (profileId: string) => Promise<ChromeProfileValidation>;
+  setChromeSharedWindow: (enabled: boolean) => Promise<void>;
+  loadChromeChats: (limit?: number) => Promise<string[]>;
+  translationCache: TranslationCacheStats | null;
+  refreshTranslationCache: () => Promise<void>;
+  clearTranslationCache: () => Promise<number>;
   voiceCapabilities: Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean; voices_by_language?: Record<string, Array<{ id: string; label: string; voice: string; gender: string }>> }> & { emotions?: string[] };
   characters: { speakers: string[]; characters: Record<string, Record<string, unknown>> };
   workflowSteps: WorkflowStep[];
@@ -121,7 +128,7 @@ interface StudioState {
   createProject: (name: string, mode: 'EDIT' | 'DUB', targetLanguage?: string) => Promise<ProjectSummary>;
   uploadMedia: (projectId: string, file: File) => Promise<void>;
   runChunk: (chunkSeconds: number | null) => Promise<{ message?: string } | undefined>;
-  runWorkflowStep: (workflow: 'transcribe' | 'translate' | 'tts', projectId?: string, options?: { targetLanguage?: string; voice?: string; transcribeLanguage?: string; beamSize?: number; ttsProvider?: string; ttsModel?: string; emotion?: string; intensity?: number; speed?: number; acting?: boolean; openaiActing?: boolean; openaiReview?: boolean; translationProvider?: string }) => Promise<void>;
+  runWorkflowStep: (workflow: 'transcribe' | 'translate' | 'tts', projectId?: string, options?: { targetLanguage?: string; voice?: string; transcribeLanguage?: string; beamSize?: number; ttsProvider?: string; ttsModel?: string; emotion?: string; intensity?: number; speed?: number; acting?: boolean; openaiActing?: boolean; openaiReview?: boolean; translationProvider?: string; retranslate?: boolean }) => Promise<void>;
   runExport: (options: {
     includeSubtitles: boolean;
     burnSubtitles: boolean;
@@ -388,6 +395,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false }, custom: { has_key: false }, gemini_web: { has_key: false } },
   customApi: null,
   chromeProfiles: null,
+  translationCache: null,
   voiceCapabilities: {},
   characters: { speakers: [], characters: {} },
   workflowSteps: initialWorkflowSteps,
@@ -1184,6 +1192,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
           openai_acting: options?.openaiActing ?? false,
           openai_review: options?.openaiReview ?? false,
           translation_provider: options?.translationProvider ?? 'auto',
+          retranslate: Boolean(options?.retranslate),
         }),
       });
 
@@ -1355,6 +1364,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false }, custom: { has_key: false }, gemini_web: { has_key: false } },
   customApi: null,
   chromeProfiles: null,
+  translationCache: null,
       voiceCapabilities: {},
       characters: { speakers: [], characters: {} },
       workflowSteps: initialWorkflowSteps.map((step) => ({ ...step })),
@@ -1399,6 +1409,60 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     // Opening the profile changes what Chrome holds open, so re-read the list.
     await get().refreshChromeProfiles();
     await get().refreshVoiceConfig();
+    return body as ChromeProfileValidation;
+  },
+  refreshTranslationCache: async () => {
+    try {
+      const stats = await readJson<TranslationCacheStats>('/api/translation-cache');
+      set({ translationCache: stats });
+    } catch {
+      // Backend offline; the panel keeps what it had.
+    }
+  },
+  clearTranslationCache: async () => {
+    const response = await fetch(`${apiBase}/api/translation-cache/clear`, { method: 'POST' });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(body.detail ?? `Unable to clear the translation memory (HTTP ${response.status})`);
+    }
+    set({ translationCache: { entries: body.entries ?? 0, hits: body.hits ?? 0, newest_at: body.newest_at ?? null } });
+    get().appendLog(`Translation memory cleared (${body.removed ?? 0} line(s)).`, 'success');
+    return Number(body.removed ?? 0);
+  },
+  loadChromeChats: async (limit = 15) => {
+    const response = await fetch(`${apiBase}/api/chrome/profiles/chats?limit=${limit}`);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(body.detail ?? `Gemini's chat list could not be read (HTTP ${response.status})`);
+    }
+    return Array.isArray(body.chats) ? (body.chats as string[]) : [];
+  },
+  setChromeSharedWindow: async (enabled) => {
+    const response = await fetch(`${apiBase}/api/chrome/profiles/shared-window`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(body.detail ?? `Unable to change the shared window mode (HTTP ${response.status})`);
+    }
+    if (body.profiles) set({ chromeProfiles: body as ChromeProfilesSnapshot });
+    get().appendLog(
+      enabled ? 'Shared window on: one Chrome stays open, the tool uses its own tab.' : 'Shared window off.',
+      'info',
+    );
+  },
+  chooseChromeAccount: async (profileId) => {
+    const response = await fetch(`${apiBase}/api/chrome/profiles/choose-account`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profile_id: profileId }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(body.detail ?? `Google's account chooser could not be opened (HTTP ${response.status})`);
+    }
     return body as ChromeProfileValidation;
   },
   openChromeProfileManually: async (profileId) => {

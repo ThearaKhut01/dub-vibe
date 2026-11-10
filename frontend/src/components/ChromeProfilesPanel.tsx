@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Check, Chrome, LogIn, RefreshCw } from 'lucide-react';
+import { Check, Chrome, History, LogIn, RefreshCw, UserRoundPlus } from 'lucide-react';
 import { useStudioStore } from '../store/useStudioStore';
 import type { ChromeProfile, ChromeProfileValidation } from '../types';
 
@@ -28,12 +28,12 @@ type StatusKey = 'ready' | 'login_required' | 'locked' | 'unknown';
 const STATUS_META: Record<StatusKey, { label: string; tone: Tone }> = {
   ready: { label: 'Ready', tone: 'emerald' },
   login_required: { label: 'Login required', tone: 'amber' },
-  locked: { label: 'Locked', tone: 'rose' },
+  locked: { label: 'Window open', tone: 'rose' },
   unknown: { label: 'Unknown', tone: 'slate' },
 };
 
 function lockedText(folder: string): string {
-  return `Chrome is using ${folder} right now. Close the Chrome window that runs it (other profiles can stay open), then try again.`;
+  return `The tool's own Chrome window for ${folder} is open. Close that window, then try again.`;
 }
 
 /** `example@gmail.com` -> `ex****@gmail.com`: enough to recognise, not to leak. */
@@ -57,12 +57,16 @@ export default function ChromeProfilesPanel() {
     selectChromeProfile,
     validateChromeProfile,
     openChromeProfileManually,
+    chooseChromeAccount,
+    setChromeSharedWindow,
+    loadChromeChats,
   } = useStudioStore();
 
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState('');
   const [messageTone, setMessageTone] = useState<Tone>('slate');
   const [results, setResults] = useState<Record<string, ChromeProfileValidation>>({});
+  const [chats, setChats] = useState<string[] | null>(null);
 
   useEffect(() => {
     void refreshChromeProfiles();
@@ -97,6 +101,32 @@ export default function ChromeProfilesPanel() {
     report(result.message, result.status === 'ready' ? 'emerald' : result.status === 'locked' ? 'rose' : 'amber');
   });
 
+  const handleSharedWindow = (enabled: boolean) => run('shared-window', async () => {
+    await setChromeSharedWindow(enabled);
+    report(
+      enabled
+        ? 'Shared window on — Validate and Translate keep one Chrome open and work in their own tab.'
+        : 'Shared window off — the tool opens and closes its own window again.',
+      enabled ? 'sky' : 'slate',
+    );
+  });
+
+  const handleChats = () => run('chats', async () => {
+    const titles = await loadChromeChats(15);
+    setChats(titles);
+    report(
+      titles.length
+        ? `${titles.length} chat(s) in this profile — newest first. Gemini titles them from the prompt.`
+        : 'This profile has no chats yet.',
+      titles.length ? 'slate' : 'amber',
+    );
+  });
+
+  const handleChooseAccount = (profile: ChromeProfile) => run(`choose-${profile.id}`, async () => {
+    const result = await chooseChromeAccount(profile.id);
+    report(result.message, result.success ? 'sky' : 'rose');
+  });
+
   const handleManual = (profile: ChromeProfile) => run(`manual-${profile.id}`, async () => {
     const result = await openChromeProfileManually(profile.id);
     report(result.message, result.success ? 'sky' : 'rose');
@@ -119,6 +149,15 @@ export default function ChromeProfilesPanel() {
           </p>
         </div>
         <button
+          onClick={() => void handleChats()}
+          disabled={busy !== null || !selected}
+          className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-slate-900 px-2.5 py-1.5 text-[11px] font-medium text-slate-300 transition hover:bg-slate-800 disabled:opacity-40"
+          title="Read this profile's Gemini chat list"
+        >
+          <History size={12} className={busy === 'chats' ? 'animate-spin' : ''} />
+          {busy === 'chats' ? 'Reading…' : 'Recent chats'}
+        </button>
+        <button
           onClick={() => void run('refresh', refreshChromeProfiles)}
           disabled={busy !== null}
           className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-slate-800 px-2.5 py-1.5 text-[11px] font-medium text-slate-200 transition hover:bg-slate-700 disabled:opacity-40"
@@ -129,11 +168,51 @@ export default function ChromeProfilesPanel() {
         </button>
       </div>
 
+      <label className="mt-2 flex items-start gap-2 rounded-lg border border-white/10 bg-slate-950/60 px-2 py-1.5">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={Boolean(chromeProfiles?.shared_window)}
+          disabled={busy !== null}
+          onChange={(event) => void handleSharedWindow(event.target.checked)}
+        />
+        <span className="min-w-0">
+          <span className="text-[11px] text-slate-200">Shared window</span>
+          <span className="mt-0.5 block text-[9px] leading-4 text-slate-500">
+            Keep one Chrome window open: you browse in your tabs while the tool chats in its own tab. Closing the
+            tool's tab mid-run stops that run; turning this off closes nothing.
+          </span>
+        </span>
+      </label>
+
+      {chats && (
+        <div className="mt-2 rounded-lg border border-white/10 bg-slate-950/60 p-2">
+          <p className="text-[9px] uppercase tracking-wide text-slate-500">Gemini chats in this profile</p>
+          {chats.length === 0 ? (
+            <p className="mt-1 text-[10px] text-slate-500">None yet — translate something first.</p>
+          ) : (
+            <ol className="mt-1 space-y-0.5">
+              {chats.map((title, index) => (
+                <li key={`${index}-${title}`} className="truncate text-[10px] text-slate-300">
+                  {index + 1}. {title}
+                </li>
+              ))}
+            </ol>
+          )}
+        </div>
+      )}
+
       {selected && (
         <p className="mt-2 rounded-lg border border-sky-500/25 bg-sky-500/10 px-2 py-1.5 text-[11px] text-sky-100">
           Selected profile: <span className="font-medium">{profileLabel(selected)}</span>
           {selected.display_name && selected.display_name !== selected.profile_folder && (
             <span className="text-sky-300/80"> · {selected.display_name}</span>
+          )}
+          {chromeProfiles?.session_account && (
+            <span className="block text-[9px] text-sky-300/70">
+              Gemini account in the tool's browser: {maskEmail(chromeProfiles.session_account)} — chats belong to
+              this Google account, not to your other Chrome window.
+            </span>
           )}
         </p>
       )}
@@ -178,7 +257,7 @@ export default function ChromeProfilesPanel() {
       <div className="mt-2 space-y-2">
         {profiles.map((profile) => {
           const validation = results[profile.id];
-          const statusKey: StatusKey = profile.is_locked
+          const statusKey: StatusKey = profile.tool_window_open
             ? 'locked'
             : validation?.status === 'ready'
               ? 'ready'
@@ -217,17 +296,20 @@ export default function ChromeProfilesPanel() {
                     {' · '}
                     {email ? maskEmail(email) : 'no account e-mail in Chrome metadata'}
                   </p>
-                  {selected?.id === profile.id && profile.session_ready === false && !profile.is_locked && (
+                  {selected?.id === profile.id && profile.session_ready === false && (
                     <p className="mt-1 text-[10px] leading-4 text-amber-200">
                       First run for this profile: press <span className="font-medium">Open manual login</span>, sign in
                       to Gemini in the Chrome window that opens, then Validate.
                     </p>
                   )}
                   {profile.is_locked && (
+                    <p className="mt-1 text-[10px] leading-4 text-slate-500">
+                      Chrome has this profile open. That is fine — the tool works on its own copy of it.
+                    </p>
+                  )}
+                  {profile.tool_window_open && (
                     <p className="mt-1 text-[10px] leading-4 text-rose-300">
-                      {profile.locked_reason === 'chrome_running'
-                        ? `Chrome is running, so ${profile.profile_folder} may be in use. Close the window that runs it (other profiles can stay open), then try again.`
-                        : lockedText(profile.profile_folder)}
+                      {lockedText(profile.profile_folder)}
                     </p>
                   )}
                   {validation && (
@@ -264,6 +346,14 @@ export default function ChromeProfilesPanel() {
                     title="Open this profile on gemini.google.com and check whether it is signed in"
                   >
                     {busy === `validate-${profile.id}` ? 'Checking…' : 'Validate Gemini'}
+                  </button>
+                  <button
+                    onClick={() => void handleChooseAccount(profile)}
+                    disabled={busy !== null}
+                    className="flex items-center gap-1 rounded-md border border-violet-500/30 bg-violet-500/10 px-2 py-1 text-[10px] font-medium text-violet-200 transition hover:bg-violet-500/20 disabled:opacity-40"
+                    title="Open Google's account picker in the tool's own Chrome window"
+                  >
+                    <UserRoundPlus size={11} /> {busy === `choose-${profile.id}` ? 'Opening…' : 'Choose account'}
                   </button>
                   <button
                     onClick={() => void handleManual(profile)}

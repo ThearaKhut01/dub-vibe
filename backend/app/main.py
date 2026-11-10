@@ -841,6 +841,21 @@ async def api_live_test(payload: dict[str, Any] | None = None) -> dict[str, Any]
 # password, Login Data or token file is opened, and nothing leaves this machine.
 
 
+@app.get('/api/translation-cache')
+async def translation_cache_status() -> dict[str, Any]:
+    """How many translated lines this PC remembers (and whether it is on)."""
+    stats = await run_in_threadpool(translation_memory.stats)
+    return {**stats, 'enabled': translation_memory.enabled()}
+
+
+@app.post('/api/translation-cache/clear')
+async def translation_cache_clear() -> dict[str, Any]:
+    """Forget every remembered line, so the next run goes to the engine."""
+    removed = await run_in_threadpool(translation_memory.clear)
+    stats = await run_in_threadpool(translation_memory.stats)
+    return {'status': 'ok', 'removed': removed, **stats}
+
+
 @app.get('/api/chrome/profiles')
 async def chrome_profile_list() -> dict[str, Any]:
     """Every Chrome profile on this PC, plus the saved selection."""
@@ -894,6 +909,33 @@ async def chrome_profile_open_manual(payload: dict[str, Any]) -> dict[str, Any]:
     if not profile_id:
         raise HTTPException(status_code=400, detail='A profile id is required.')
     return await run_in_threadpool(chrome_profiles.manager().open_manual, profile_id)
+
+
+@app.get('/api/chrome/profiles/chats')
+async def chrome_profile_chats(limit: int = 15) -> dict[str, Any]:
+    """The chats Gemini has for the selected profile (the tool's runs included)."""
+    try:
+        titles = await run_in_threadpool(gemini_web.recent_chats, max(1, min(int(limit), 50)))
+    except gemini_web.GeminiWebError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {'chats': titles, 'count': len(titles)}
+
+
+@app.post('/api/chrome/profiles/shared-window')
+async def chrome_profile_shared_window(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep one visible Chrome open and drive a tab in it (or stop doing that)."""
+    enabled = bool(payload.get('enabled'))
+    await run_in_threadpool(chrome_profiles.manager().set_shared_window, enabled)
+    return await run_in_threadpool(chrome_profiles.snapshot)
+
+
+@app.post('/api/chrome/profiles/choose-account')
+async def chrome_profile_choose_account(payload: dict[str, Any]) -> dict[str, Any]:
+    """Open Google's account picker in the tool's own profile (the user chooses)."""
+    profile_id = str(payload.get('profile_id') or '')
+    if not profile_id:
+        raise HTTPException(status_code=400, detail='A profile id is required.')
+    return await run_in_threadpool(chrome_profiles.manager().open_account_chooser, profile_id)
 
 
 @app.post('/api/chrome/gemini/ask')
@@ -1234,15 +1276,12 @@ async def generate_segment_audio(project_id: str, segment_id: str, payload: dict
     except RuntimeError as error:
         raise HTTPException(status_code=502, detail=f'Audio not replaced: {error}') from error
 
-    clip_seconds = None
-    ffprobe = find_media_tool('ffprobe')
-    if ffprobe:
-        try:
-            clip_seconds = await run_in_threadpool(_probe_duration, ffprobe, entry['path'])
-        except (subprocess.CalledProcessError, ValueError, KeyError, TypeError, OSError):
-            clip_seconds = None
     slot_seconds = float(segment['end']) - float(segment['start'])
-    entry['fit'] = segment_tts.fit_report(clip_seconds, slot_seconds)
+    # Compress an overrunning line into its cue (pitch kept) and record what happened.
+    entry['fit'] = await run_in_threadpool(
+        segment_tts.fit_clip_to_slot, entry['path'], slot_seconds,
+        ffmpeg=find_media_tool('ffmpeg'), ffprobe=find_media_tool('ffprobe'),
+    )
     audio = [item for item in project.get('audio_segments', []) if str(item.get('id')) != str(segment_id)]
     audio.append({key: value for key, value in entry.items() if key != 'previous_path'})
     audio.sort(key=lambda item: float(item.get('start') or 0))
@@ -1290,6 +1329,109 @@ async def get_segment_audio(project_id: str, segment_id: str, request: Request):
         raise HTTPException(status_code=404, detail='This line has no generated audio yet')
     media_type = 'audio/wav' if str(clip['path']).lower().endswith('.wav') else 'audio/mpeg'
     return _file_response_with_range(request, Path(str(clip['path'])), media_type)
+
+def _error_text(error: BaseException | None) -> str:
+    """An exception that carries no text still has to say what it was."""
+    if error is None:
+        return 'no error reported'
+    if error.__class__.__name__ == 'CancelledError':
+        # The thread pool was shut down under the run: the backend reloaded
+        # (dev --reload) or the browser request was cancelled.
+        return ('the run was interrupted (the backend restarted or the request was cancelled); '
+                'finished lines are kept, press Translate again')
+    text = str(error).strip()
+    return text or f'{error.__class__.__name__} (no message)'
+
+
+def _quality_report(project: dict[str, Any]) -> dict[str, Any]:
+    """Missing translations/audio, lines that overrun their cue, long text, overlaps."""
+    segments = [segment for segment in (project.get('segments') or []) if isinstance(segment, dict)]
+    audio_by_id = {str(item.get('id')): item for item in (project.get('audio_segments') or [])
+                   if isinstance(item, dict)}
+    ffprobe = find_media_tool('ffprobe')
+    duration = _media_duration_seconds(project)
+
+    missing_translation: list[dict[str, Any]] = []
+    missing_audio: list[dict[str, Any]] = []
+    overruns: list[dict[str, Any]] = []
+    long_lines: list[dict[str, Any]] = []
+    with_audio = 0
+
+    for segment in segments:
+        sid = str(segment.get('id'))
+        source = str(segment.get('text') or '').strip()
+        if not source:
+            continue
+        translation = str(segment.get('translation') or '').strip()
+        cue = max(0.05, float(segment.get('end') or 0) - float(segment.get('start') or 0))
+        if not translation:
+            missing_translation.append({'id': sid, 'start': float(segment.get('start') or 0),
+                                        'text': source[:80]})
+            continue
+
+        clip = audio_by_id.get(sid)
+        # A stored fit is a measurement already made, even when the file has since
+        # been moved; only probe again when there is no report.
+        fit = (clip or {}).get('fit') or {}
+        clip_seconds = fit.get('clip_seconds')
+        if clip and Path(str(clip.get('path') or '')).is_file():
+            with_audio += 1
+            if clip_seconds is None and ffprobe:
+                try:
+                    clip_seconds = _probe_duration(ffprobe, str(clip['path']))
+                except (subprocess.SubprocessError, ValueError, OSError):
+                    clip_seconds = None
+        else:
+            missing_audio.append({'id': sid, 'start': float(segment.get('start') or 0),
+                                  'text': translation[:80]})
+
+        if clip_seconds is not None and clip_seconds - cue > 0.05:
+            overruns.append({
+                'id': sid, 'start': float(segment.get('start') or 0),
+                'slot': round(cue, 2), 'clip': round(float(clip_seconds), 2),
+                'overrun': round(float(clip_seconds) - cue, 2),
+                'text': translation[:60],
+            })
+        # ~14 characters a second is already fast for subtitles.
+        if len(translation) / cue > 14:
+            long_lines.append({
+                'id': sid, 'start': float(segment.get('start') or 0),
+                'chars': len(translation), 'slot': round(cue, 2),
+                'per_second': round(len(translation) / cue, 1), 'text': translation[:60],
+            })
+
+    overlaps = [item for item in segment_tts.timing_problems(segments, duration)
+                if item.get('kind') == 'overlap']
+    return {
+        'summary': {
+            'segments': len(segments),
+            'translated': len(segments) - len(missing_translation) - sum(
+                1 for segment in segments if not str(segment.get('text') or '').strip()),
+            'with_audio': with_audio,
+            'missing_translation': len(missing_translation),
+            'missing_audio': len(missing_audio),
+            'overruns': len(overruns),
+            'long_lines': len(long_lines),
+            'overlaps': len(overlaps),
+        },
+        'problems': {
+            'missing_translation': missing_translation[:15],
+            'missing_audio': missing_audio[:15],
+            'overruns': sorted(overruns, key=lambda item: -item['overrun'])[:15],
+            'long_lines': sorted(long_lines, key=lambda item: -item['per_second'])[:15],
+            'overlaps': overlaps[:15],
+        },
+    }
+
+
+@app.get('/api/projects/{project_id}/quality')
+async def project_quality(project_id: str) -> dict[str, Any]:
+    """A pre-export check: the lines a viewer would notice are wrong."""
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail='Project not found')
+    return await run_in_threadpool(_quality_report, project)
+
 
 @app.get('/api/projects/{project_id}/segment-timing')
 async def get_segment_timing(project_id: str) -> dict[str, Any]:
@@ -2288,6 +2430,15 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
     # that carries no words) must not cost a request or make the run look failed.
     translatable = [segment for segment in segments if str(segment.get('text') or '').strip()]
     total = len(translatable)
+    if payload.retranslate:
+        # "Translate again" from scratch: the saved lines are cleared so the run
+        # cannot finish instantly on work an earlier run already did.
+        for segment in translatable:
+            segment['translation'] = ''
+        await emit_progress(
+            payload.project_id, 'Translating', 52,
+            'Re-translating every line from scratch (saved translations ignored).',
+        )
     # Resume support: segments that already carry a translation are kept, so
     # re-running after a failure continues instead of starting over.
     pending = [segment for segment in translatable if not segment.get('translation')]
@@ -2376,7 +2527,8 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
             remaining.setdefault(segment['text'], []).append(segment)
 
         # 1) Cache: a line this model already translated (same glossary) is free.
-        for text in list(remaining):
+        # A re-translate run skips it, otherwise the "fresh" run would be a no-op.
+        for text in ([] if payload.retranslate else list(remaining)):
             cached = translation_memory.lookup(
                 text, source_language, payload.target_language, model_hint, glossary,
             )
@@ -2405,6 +2557,12 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
 
         def run_batch(batch: list[str]):
             local: dict[str, int] = {}
+            # Real cue times: the engine renders the batch as SRT blocks so the
+            # model can see how long each line has to be spoken.
+            cues = [
+                (float(remaining[text][0].get('start') or 0), float(remaining[text][0].get('end') or 0))
+                for text in batch
+            ]
             result = translator.translate_batch(
                 batch,
                 context=context_for(batch),
@@ -2413,6 +2571,7 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
                 target_language=payload.target_language,
                 tone=tone,
                 usage=local,
+                meta={'lines': len(batch), 'cues': cues},
             )
             return batch, result, local
 
@@ -2479,7 +2638,7 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
             update_project(payload.project_id, status='Ready', progress=52)
             raise HTTPException(
                 status_code=502,
-                detail=f'Translation failed: {error}. Press Translate again to resume where it stopped.',
+                detail=f'Translation failed: {_error_text(error)}. Press Translate again to resume where it stopped.',
             ) from error
 
     persist_project(payload.project_id)
@@ -2489,7 +2648,7 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
         raise HTTPException(
             status_code=502,
             detail=(
-                f'Translation failed on some segments: {first_error}. '
+                f'Translation failed on some segments: {_error_text(first_error)}. '
                 f'{done} of {total} are saved. Press Translate again to resume the remaining {total - done}.'
             ),
         )
@@ -2648,6 +2807,7 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
                     'text': segment['translation'],
                     'voice': previous.get('voice', payload.voice),
                     'path': previous['path'],
+                    'fit': previous.get('fit'),
                 })
                 reused += 1
             elif clone_references is not None:
@@ -2737,6 +2897,26 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
         payload.project_id, 'Generating Voice', 95,
         'Fitting each dubbed line into the timeline...',
     )
+    ffmpeg_tool = find_media_tool('ffmpeg')
+    ffprobe_tool = find_media_tool('ffprobe')
+    squeezed = 0
+    for entry in audio_segments:
+        if entry.get('fit') or not str(entry.get('path') or ''):
+            continue
+        try:
+            report = await run_in_threadpool(
+                segment_tts.fit_entry, entry, ffmpeg=ffmpeg_tool, ffprobe=ffprobe_tool,
+            )
+            if float(report.get('tempo') or 1.0) > 1.0:
+                squeezed += 1
+        except Exception:
+            # A line that cannot be measured stays as it is; the QC report lists it.
+            continue
+    if squeezed:
+        await emit_progress(
+            payload.project_id, 'Generating Voice', 95,
+            f'{squeezed} line(s) time-compressed to fit their cue.',
+        )
     audio_segments = await run_in_threadpool(
         _resolve_speech_overlaps, audio_segments, _media_duration_seconds(project),
     )
@@ -3046,6 +3226,8 @@ async def process_export(payload: ProcessingRequest) -> dict[str, Any]:
 
                 filter_parts.append(
                     f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:duration=longest:normalize=0,"
+                    # Platform loudness: speech sits at -16 LUFS with true-peak headroom.
+                    'loudnorm=I=-16:TP=-1.5:LRA=11,'
                     f'apad=whole_dur={export_duration:.3f}[dubbed]'
                 )
                 video_path = export_dir / 'dubbed-video.mp4'
@@ -3226,6 +3408,7 @@ async def process_export(payload: ProcessingRequest) -> dict[str, Any]:
                             mix_labels.extend(voice_labels)
                         part_filters.append(
                             f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:duration=longest:normalize=0,"
+                            'loudnorm=I=-16:TP=-1.5:LRA=11,'
                             f'apad=whole_dur={chunk_duration:.3f}[dubbed]'
                         )
                         part_command.extend([

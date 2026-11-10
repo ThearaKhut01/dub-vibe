@@ -74,7 +74,10 @@ class ProcessingRequest(BaseModel):
     beam_size: int = Field(default=5, ge=1, le=10)
     word_timestamps: bool = False
     # Translation engine: which provider goes first (the chain still falls back).
-    translation_provider: str = 'auto'   # auto | qwen | nllb | argos | google | gemini | openai | codecraft
+    translation_provider: str = 'auto'   # auto | qwen | nllb | argos | google | gemini | openai | codecraft | gemini_web
+    # Ignore both the saved translations on the segments and the translation
+    # memory: every line goes to the engine again (used to force a fresh run).
+    retranslate: bool = False
     # Per-run glossary override ("王明=វ៉ាង មីង" lines). None = use the project's own.
     glossary: str | None = None
     # Canvas design values from the preview: platform frame, background,

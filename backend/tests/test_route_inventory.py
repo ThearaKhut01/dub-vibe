@@ -48,6 +48,7 @@ REQUIRED = {
     ('GET', '/api/chrome/profiles/selected'),
     ('POST', '/api/chrome/profiles/validate'),
     ('POST', '/api/chrome/profiles/open-manual'),
+    ('POST', '/api/chrome/profiles/choose-account'),
 }
 
 
