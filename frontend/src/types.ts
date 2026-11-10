@@ -178,6 +178,8 @@ export interface ChromeProfile {
   /** 'in_use' when Chrome has this profile open; 'chrome_running' when that cannot be told. */
   locked_reason: '' | 'in_use' | 'chrome_running';
   is_last_used: boolean;
+  /** True once the tool's own profile exists for this Chrome profile. */
+  session_ready?: boolean;
   warnings: string[];
 }
 
@@ -191,7 +193,7 @@ export interface ChromeProfileValidation {
   message: string;
   url?: string;
   /** 'working_copy' when Chrome's remote-debugging restriction forced a private copy. */
-  via?: 'direct' | 'working_copy';
+  via?: 'session_profile' | 'direct';
 }
 
 export interface ChromeProfilesSnapshot {

@@ -32,7 +32,9 @@ const STATUS_META: Record<StatusKey, { label: string; tone: Tone }> = {
   unknown: { label: 'Unknown', tone: 'slate' },
 };
 
-const LOCKED_TEXT = 'Chrome is currently using this profile. Close all Chrome windows and try again.';
+function lockedText(folder: string): string {
+  return `Chrome is using ${folder} right now. Close the Chrome window that runs it (other profiles can stay open), then try again.`;
+}
 
 /** `example@gmail.com` -> `ex****@gmail.com`: enough to recognise, not to leak. */
 export function maskEmail(email: string): string {
@@ -212,11 +214,17 @@ export default function ChromeProfilesPanel() {
                     {' · '}
                     {email ? maskEmail(email) : 'no account e-mail in Chrome metadata'}
                   </p>
+                  {selected?.id === profile.id && profile.session_ready === false && !profile.is_locked && (
+                    <p className="mt-1 text-[10px] leading-4 text-amber-200">
+                      First run for this profile: press <span className="font-medium">Open manual login</span>, sign in
+                      to Gemini in the Chrome window that opens, then Validate.
+                    </p>
+                  )}
                   {profile.is_locked && (
                     <p className="mt-1 text-[10px] leading-4 text-rose-300">
                       {profile.locked_reason === 'chrome_running'
-                        ? 'Chrome is running, so this profile is probably in use. Close all Chrome windows and try again.'
-                        : LOCKED_TEXT}
+                        ? `Chrome is running, so ${profile.profile_folder} may be in use. Close the window that runs it (other profiles can stay open), then try again.`
+                        : lockedText(profile.profile_folder)}
                     </p>
                   )}
                   {validation && (
@@ -230,7 +238,7 @@ export default function ChromeProfilesPanel() {
                       }`}
                     >
                       {validation.message}
-                      {validation.via === 'working_copy' ? ' (checked on a temporary private copy)' : ''}
+                      {validation.via === 'session_profile' ? ' (checked in the tool\'s own Chrome profile)' : ''}
                     </p>
                   )}
                   {profile.warnings.length > 0 && (
@@ -284,9 +292,9 @@ export default function ChromeProfilesPanel() {
       )}
 
       <p className="mt-2 text-[9px] leading-4 text-slate-600">
-        Validating opens the profile for a moment and closes it again. Chrome 136+ refuses remote debugging on the
-        real default profile folder, so the check runs on a private copy of the profile&apos;s metadata that is
-        deleted as soon as it closes — Chrome decrypts its own cookies, this app never does.
+        The app keeps its own Chrome profile per detection (<span className="font-mono">data\chrome-profile-sessions</span>):
+        sign in once in that window and the session is reused for every check and prompt. It is a separate profile
+        from your normal Chrome, so your browsing session is never touched — and this app never decrypts a cookie.
       </p>
     </section>
   );

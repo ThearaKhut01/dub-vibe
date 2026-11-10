@@ -164,8 +164,16 @@ def test_flag_value_handles_every_chrome_command_line_shape() -> None:
     assert cp._flag_value(f'chrome.exe --user-data-dir="{root}"', '--user-data-dir') == root
     # Two-token form.
     assert cp._flag_value(f'chrome.exe --profile-directory "Profile 2"', '--profile-directory') == 'Profile 2'
-    # Plain form.
-    assert cp._flag_value('chrome.exe --profile-directory=Profile 1', '--profile-directory') == 'Profile'
+    # Chrome's child processes leave the value bare even with a space in it.
+    assert cp._flag_value(
+        r'chrome.exe --type=renderer --user-data-dir=C:\a\User Data --lang=en-US',
+        '--user-data-dir',
+    ) == r'C:\a\User Data'
+    assert cp._flag_value(
+        r'chrome.exe --profile-directory=Default /prefetch:1',
+        '--profile-directory',
+    ) == 'Default'
+    # Plain form (a bare two-word value still cannot be told from two arguments).
     assert cp._flag_value('chrome.exe', '--profile-directory') == ''
     # ... while the profile-folder reader still sees the whole folder name.
     assert cp._profile_folder('chrome.exe --profile-directory=Profile 1') == 'Profile 1'
@@ -232,7 +240,27 @@ def test_validate_locked_profile_does_not_launch(monkeypatch: pytest.MonkeyPatch
 
     assert result['status'] == 'locked'
     assert result['success'] is False
-    assert 'Close all Chrome windows' in result['message']
+    assert 'Close the Chrome window' in result['message']
+
+
+def test_the_tool_window_makes_the_profile_busy(monkeypatch: pytest.MonkeyPatch,
+                                                tmp_path: Path) -> None:
+    root = tmp_path / 'User Data'
+    _write_json(root / 'Local State', {'profile': {'info_cache': {'Default': {'name': 'Copy'}}}})
+    _write_json(root / 'Default' / 'Preferences', {'account_info': []})
+    monkeypatch.setattr(cp, 'scan_profiles', lambda errors=None: cp.scan_root(root, errors))
+    profile_manager = cp.ChromeProfileManager(config_path=tmp_path / 'config.json',
+                                              sessions_dir=tmp_path / 'sessions')
+    profile = profile_manager.list_profiles()[0]
+    user_data = profile_manager.session_profile(profile)
+    monkeypatch.setattr(cp, 'chrome_processes', lambda: [
+        (99, f'chrome.exe "--user-data-dir={user_data}" --profile-directory=Default'),
+    ])
+
+    result = profile_manager.validate_profile(profile['id'])
+
+    assert result['status'] == 'locked'
+    assert "tool's Chrome window" in result['message']
 
 
 def test_validate_without_playwright_explains_what_to_install(manager: cp.ChromeProfileManager,
@@ -292,19 +320,70 @@ def test_open_manual_builds_a_profile_scoped_command(manager: cp.ChromeProfileMa
     assert cp.GEMINI_URL in command
 
 
-def test_debug_directory_is_blocked_only_for_the_default_root(monkeypatch: pytest.MonkeyPatch,                                                              tmp_path: Path) -> None:
+def test_session_profile_is_seeded_once_and_then_reused(tmp_path: Path) -> None:
     root = tmp_path / 'User Data'
-    root.mkdir()
-    monkeypatch.setattr(cp, 'default_chrome_root', lambda: root)
-    monkeypatch.setattr(cp, 'chrome_major_version', lambda _root: 155)
-    assert cp._debug_directory_blocked(root) is True
+    _write_json(root / 'Local State', {'profile': {'info_cache': {'Default': {'name': 'Copy'}}}})
+    profile_dir = root / 'Default'
+    _write_json(profile_dir / 'Preferences', {'account_info': []})
+    (profile_dir / 'Cookies').write_text('chrome cookies live here', encoding='utf-8')
+    profile_manager = cp.ChromeProfileManager(config_path=tmp_path / 'config.json',
+                                              sessions_dir=tmp_path / 'sessions')
+    profile = {'id': 'fake', 'root_path': str(root), 'profile_folder': 'Default', 'path': str(profile_dir)}
 
-    other = tmp_path / 'Automation'
-    other.mkdir()
-    assert cp._debug_directory_blocked(other) is False
+    first = profile_manager.session_profile(profile)
+    assert profile_manager.has_session_profile(profile) is True
+    # A sign-in written into the tool's profile must survive the next run.
+    (first / 'Default' / 'signed-in.txt').write_text('session', encoding='utf-8')
 
-    monkeypatch.setattr(cp, 'chrome_major_version', lambda _root: 120)
-    assert cp._debug_directory_blocked(root) is False
+    second = profile_manager.session_profile(profile)
+
+    assert second == first
+    assert (second / 'Default' / 'signed-in.txt').is_file()
+
+
+def test_the_tool_profile_does_not_offer_the_other_chrome_profiles(tmp_path: Path) -> None:
+    """Chrome's profile menu comes from info_cache: only the copied folder may stay."""
+    root = tmp_path / 'User Data'
+    _write_json(root / 'Local State', {
+        'profile': {
+            'last_used': 'Default',
+            'info_cache': {
+                'Default': {'name': 'Main', 'user_name': 'main@example.com'},
+                'Profile 1': {'name': 'Work', 'user_name': 'work@example.com'},
+            },
+        },
+    })
+    _write_json(root / 'Profile 1' / 'Preferences', {'account_info': []})
+    profile_manager = cp.ChromeProfileManager(config_path=tmp_path / 'config.json',
+                                              sessions_dir=tmp_path / 'sessions')
+    profile = {'id': 'fake', 'root_path': str(root), 'profile_folder': 'Profile 1',
+               'path': str(root / 'Profile 1')}
+
+    user_data = profile_manager.session_profile(profile)
+
+    import json as _json
+    state = _json.loads((user_data / 'Local State').read_text(encoding='utf-8'))
+    assert list(state['profile']['info_cache']) == ['Profile 1']
+    assert state['profile']['last_used'] == 'Profile 1'
+    assert state['profile']['info_cache']['Profile 1']['name'] == 'Work'
+
+
+def test_resetting_the_session_profile_removes_it(monkeypatch: pytest.MonkeyPatch,
+                                                  tmp_path: Path) -> None:
+    root = tmp_path / 'User Data'
+    _write_json(root / 'Local State', {'profile': {'info_cache': {'Default': {'name': 'Copy'}}}})
+    _write_json(root / 'Default' / 'Preferences', {'account_info': []})
+    monkeypatch.setattr(cp, 'scan_profiles', lambda errors=None: cp.scan_root(root, errors))
+    profile_manager = cp.ChromeProfileManager(config_path=tmp_path / 'config.json',
+                                              sessions_dir=tmp_path / 'sessions')
+    profile = profile_manager.list_profiles()[0]
+    profile_manager.session_profile(profile)
+    assert profile_manager.has_session_profile(profile) is True
+
+    profile_manager.reset_session_profile(profile['id'])
+
+    assert profile_manager.has_session_profile(profile) is False
+
 
 
 class _Node:
@@ -327,6 +406,10 @@ class _Nodes:
 
     def nth(self, index: int) -> _Node:
         return _Node(self._boxes[index])
+
+    @property
+    def first(self) -> _Node:
+        return _Node(self._boxes[0])
 
 
 class _FakePage:
@@ -358,7 +441,9 @@ FOOTER_SIGN_IN = {'x': 16, 'y': 808, 'width': 258, 'height': 36}
 
 
 def test_gemini_reports_ready_when_the_account_menu_is_present() -> None:
-    page = _FakePage(markers=('a[href*="SignOutOptions"]',))
+    # A session needs a visible account menu *and* a rendered composer: an
+    # account node on a half-loaded shell is not a signed-in profile.
+    page = _FakePage(markers=('a[href*="SignOutOptions"]', 'rich-textarea'))
     state, message, url = cp.gemini_state(page)
     assert state == 'ready'
     assert url == cp.GEMINI_URL
@@ -393,8 +478,7 @@ def test_gemini_reports_login_required_on_the_google_sign_in_page() -> None:
     assert 'accounts.google.com' in url
 
 
-def test_working_copy_contains_metadata_but_never_login_data(tmp_path: Path,
-                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+def test_session_profile_contains_metadata_but_never_login_data(tmp_path: Path) -> None:
     root = tmp_path / 'User Data'
     _write_json(root / 'Local State', {'profile': {'info_cache': {'Default': {'name': 'Copy'}}}})
     profile_dir = root / 'Default'
@@ -411,7 +495,7 @@ def test_working_copy_contains_metadata_but_never_login_data(tmp_path: Path,
         'path': str(profile_dir),
     }
 
-    copy_root = profile_manager._prepare_working_copy(profile)
+    copy_root = profile_manager.session_profile(profile)
 
     assert (copy_root / 'Local State').is_file()
     assert (copy_root / 'Default' / 'Preferences').is_file()

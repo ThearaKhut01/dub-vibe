@@ -21,17 +21,104 @@ from typing import Any
 from backend.app import api_events, chrome_profiles
 
 PROMPT_SELECTORS = (
-    'rich-textarea',
+    'rich-textarea div.ql-editor[contenteditable="true"]',
     'div.ql-editor[contenteditable="true"]',
-    '[contenteditable="true"]',
+    '[role="textbox"][contenteditable="true"]',
+    'rich-textarea',
+    'textarea',
 )
+PROMPT_WAIT_SECONDS = 15.0
 RESPONSE_SELECTORS = (
     'model-response',
     'message-content',
     '.model-response-text',
 )
 POLL_INTERVAL_MS = 700
+# Never give up on an answer sooner than this, even when a caller asks for less.
+MIN_ANSWER_SECONDS = 15.0
 MODEL_LABEL = 'gemini.google.com'
+# Gemini web answers a numbered list reliably up to about this many lines; more
+# than that and it starts merging or skipping entries.
+BATCH_SIZE = 20
+MIN_BATCH_SECONDS = 120.0
+
+
+def build_batch_prompt(lines: list[str], target_language: str = 'Khmer', source_language: str = '',
+                       glossary: str = '') -> str:
+    """One message for a whole subtitle batch, numbered so the answer is parseable."""
+    source = f' from {source_language}' if source_language else ''
+    numbered = '\n'.join(f'{index + 1}. {line}' for index, line in enumerate(lines))
+    terms = str(glossary or '').strip()
+    glossary_part = f'\nUse these term translations exactly: {terms}' if terms else ''
+    return (
+        f'Translate each numbered subtitle line{source} into {target_language}. '
+        'Keep the same numbering, one translation per number, and reply with the list only — '
+        f'no quotes, no transliteration, no notes, no explanations.{glossary_part}\n'
+        f'{numbered}'
+    )
+
+
+_NUMBERED = re.compile(r'^\s*(\d{1,3})\s*[.)\]:-]\s*(.+?)\s*$', re.MULTILINE)
+
+
+def parse_numbered_answer(reply: str, count: int) -> list[str | None]:
+    """Map a numbered answer back to the lines it belongs to (None when missing)."""
+    found: dict[int, str] = {}
+    for match in _NUMBERED.finditer(str(reply or '')):
+        index = int(match.group(1))
+        text = match.group(2).strip().strip('"“”').strip()
+        if 1 <= index <= count and text and index not in found:
+            found[index] = text
+    return [found.get(index + 1) for index in range(count)]
+
+
+def translate_lines(
+    lines: list[str],
+    target_language: str = 'Khmer',
+    source_language: str = '',
+    timeout_s: float = MIN_BATCH_SECONDS,
+    glossary: str = '',
+) -> list[str | None]:
+    """Translate subtitle lines through the selected profile, one message per batch.
+
+    A line the answer skipped is retried once on its own; if it is still missing
+    the entry stays ``None`` so the caller can fall back for that line only.
+    """
+    automator = GeminiWebAutomator()
+    results: list[str | None] = []
+    for start in range(0, len(lines), BATCH_SIZE):
+        batch = lines[start:start + BATCH_SIZE]
+        prompt = build_batch_prompt(batch, target_language, source_language, glossary)
+        answer = automator.ask(prompt, timeout_s=timeout_s, lines=len(batch))
+        if not answer.get('success'):
+            raise GeminiWebError(str(answer.get('message') or 'Gemini web did not answer.'), answer.get('status', 'error'))
+        parsed = parse_numbered_answer(answer.get('reply', ''), len(batch))
+        for offset, item in enumerate(parsed):
+            if item is not None:
+                continue
+            single = automator.ask(
+                build_translation_prompt(batch[offset], target_language, source_language),
+                timeout_s=timeout_s,
+            )
+            if single.get('success'):
+                parsed[offset] = str(single.get('reply') or '').strip().strip('"“”') or None
+        results.extend(parsed)
+    return results
+
+
+def build_translation_prompt(text: str, target_language: str = 'Khmer', source_language: str = '') -> str:
+    """A subtitle-ready prompt: one line in, one translation out.
+
+    Subtitles need the line itself, not a conversation about it, so the
+    instruction asks for the translation only and forbids commentary.
+    """
+    source = f' from {source_language}' if source_language else ''
+    return (
+        f'Translate this subtitle line{source} into {target_language}. '
+        'Reply with the translation only — no quotes, no transliteration, no notes, '
+        'no explanation, nothing else.\n'
+        f'Line: {text}'
+    )
 
 
 class GeminiWebError(RuntimeError):
@@ -62,7 +149,7 @@ class GeminiWebAutomator:
             'ready': bool(selected) and chrome_profiles.playwright_available(),
         }
 
-    def ask(self, prompt: str, timeout_s: float = 180.0) -> dict[str, Any]:
+    def ask(self, prompt: str, timeout_s: float = 180.0, lines: int = 1) -> dict[str, Any]:
         """Send one prompt and return Gemini's answer as plain text."""
         text = (prompt or '').strip()
         if not text:
@@ -77,7 +164,7 @@ class GeminiWebAutomator:
 
         # One node per profile, so the Live tab can show this request travelling.
         node_id = f'chrome:{profile_id}'
-        request_id = api_events.start(node_id, provider='chrome', model=MODEL_LABEL, lines=1)
+        request_id = api_events.start(node_id, provider='chrome', model=MODEL_LABEL, lines=max(1, int(lines)))
         started = time.monotonic()
         try:
             result = self._ask_in_profile(text, timeout_s)
@@ -85,7 +172,7 @@ class GeminiWebAutomator:
             self._finish(request_id, node_id, started, ok=False, error=error)
             raise
         self._finish(
-            request_id, node_id, started, ok=bool(result.get('success')),
+            request_id, node_id, started, ok=bool(result.get('success')), lines=max(1, int(lines)),
             error='' if result.get('success') else str(result.get('message') or ''),
         )
         return result
@@ -104,9 +191,18 @@ class GeminiWebAutomator:
                         'profile_id': session.profile['id'],
                     }
                 before = _response_count(page)
-                _submit(page, text)
                 try:
+                    _submit(page, text)
                     reply = _read_answer(page, before, timeout_s)
+                except GeminiWebError as error:
+                    # A page we cannot drive is a result for the panel, not a crash.
+                    return {
+                        'success': False,
+                        'status': error.status,
+                        'message': str(error),
+                        'url': _url(page),
+                        'profile_id': session.profile['id'],
+                    }
                 except Exception as error:
                     return {
                         'success': False,
@@ -138,11 +234,27 @@ class GeminiWebAutomator:
             return {'success': False, 'status': error.status, 'message': str(error)}
 
     @staticmethod
-    def _finish(request_id: str, node_id: str, started: float, *, ok: bool, error: object = '') -> None:
+    def _finish(request_id: str, node_id: str, started: float, *, ok: bool, lines: int = 1,
+                error: object = '') -> None:
         api_events.finish(
-            request_id, node_id, ok=ok, provider='chrome', model=MODEL_LABEL, lines=1,
+            request_id, node_id, ok=ok, provider='chrome', model=MODEL_LABEL, lines=lines,
             latency_ms=int((time.monotonic() - started) * 1000), error=error,
         )
+
+
+def _wait_for_prompt_box(page: Any, timeout_s: float | None = None) -> Any:
+    # Read the module constant at call time so tests (and callers) can shorten it.
+    timeout = PROMPT_WAIT_SECONDS if timeout_s is None else timeout_s
+    deadline = time.monotonic() + max(0.1, timeout)
+    while time.monotonic() < deadline:
+        box = _first_visible(page, PROMPT_SELECTORS)
+        if box is not None:
+            return box
+        try:
+            page.wait_for_timeout(300)
+        except Exception:
+            break
+    return None
 
 
 def _first_visible(page: Any, selectors: tuple[str, ...]) -> Any:
@@ -175,7 +287,9 @@ def _response_count(page: Any) -> int:
 
 
 def _submit(page: Any, text: str) -> None:
-    box = _first_visible(page, PROMPT_SELECTORS)
+    # The editor hydrates after the shell: wait for it instead of failing on the
+    # first paint.
+    box = _wait_for_prompt_box(page)
     if box is None:
         raise GeminiWebError('The Gemini prompt box was not found; the page layout may have changed.', 'error')
     try:
@@ -188,7 +302,7 @@ def _submit(page: Any, text: str) -> None:
 
 def _read_answer(page: Any, before: int, timeout_s: float) -> str:
     """Wait until a new answer stops growing, then return its text."""
-    deadline = time.monotonic() + max(15.0, timeout_s)
+    deadline = time.monotonic() + max(MIN_ANSWER_SECONDS, timeout_s)
     last_text = ''
     stable_reads = 0
     while time.monotonic() < deadline:
@@ -213,7 +327,9 @@ def _last_answer_text(page: Any) -> str:
             if locator.count() > 0:
                 text = locator.last.inner_text().strip()
                 if text:
-                    return re.sub(r'\n{3,}', '\n\n', text)
+                    # Gemini prefixes its answers with a "Gemini said" label.
+                    text = re.sub(r'^Gemini\s+said\s*\n+', '', text, flags=re.IGNORECASE)
+                    return re.sub(r'\n{3,}', '\n\n', text).strip()
         except Exception:
             continue
     return ''

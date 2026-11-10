@@ -1,0 +1,269 @@
+"""The prompt→answer mechanics, against a stand-in for Gemini's DOM.
+
+The real end-to-end test needs a profile that is signed in to Gemini; these
+tests cover everything around that: the line is typed into the prompt box, Enter
+is pressed, the new answer is read once it stops growing, and the Live node
+records one success.
+"""
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from backend.app import api_events, chrome_profiles, gemini_web
+
+SUBTITLE = "Where were you last night?"
+ANSWER = "តើអ្នកនៅឯណាពេលយប់មិញ?"
+
+
+class _Box:
+    def __init__(self, page) -> None:
+        self.page = page
+
+    def click(self) -> None:
+        self.page.clicked = True
+
+    def fill(self, text: str) -> None:
+        self.page.typed = text
+        self.page.entered = True
+
+    def inner_text(self) -> str:
+        return self.page.answer
+
+
+class _Nodes:
+    def __init__(self, page, count: int) -> None:
+        self.page = page
+        self._count = count
+
+    def count(self) -> int:
+        return self._count
+
+    @property
+    def first(self) -> _Box:
+        return _Box(self.page)
+
+    @property
+    def last(self) -> _Box:
+        return _Box(self.page)
+
+
+class _FakePage:
+    """What the automator uses: goto, wait, locator, keyboard, url."""
+
+    def __init__(self, answer: str = ANSWER) -> None:
+        self.url = 'https://gemini.google.com/app'
+        self.answer = answer
+        self.typed = ''
+        self.clicked = False
+        self.entered = False
+        self.keyboard = SimpleNamespace(press=lambda key: setattr(self, 'key', key))
+
+    def goto(self, url: str, **_kwargs) -> None:
+        self.url = url
+
+    def wait_for_timeout(self, _ms: int) -> None:
+        return None
+
+    def locator(self, selector: str) -> _Nodes:
+        if selector == 'rich-textarea':
+            return _Nodes(self, 1)
+        if selector in gemini_web.RESPONSE_SELECTORS:
+            return _Nodes(self, 1 if self.entered else 0)
+        return _Nodes(self, 0)
+
+    def get_by_role(self, _role: str, name=None) -> _Nodes:
+        return _Nodes(self, 0)
+
+
+class _Session:
+    def __init__(self, page: _FakePage) -> None:
+        self.page = page
+        self.profile = {'id': 'abc123'}
+        self.via = 'working_copy'
+
+    def __enter__(self) -> '_Session':
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        return None
+
+
+class _Manager:
+    def __init__(self, page: _FakePage) -> None:
+        self.page = page
+        self.config = SimpleNamespace(read=lambda: {'selected_profile_id': 'abc123'})
+
+    def launch_selected_profile(self, headless=None) -> _Session:
+        return _Session(self.page)
+
+
+@pytest.fixture(autouse=True)
+def _clean_events():
+    api_events.reset_for_tests()
+    yield
+    api_events.reset_for_tests()
+
+
+def test_a_subtitle_line_is_typed_and_the_answer_is_returned(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(chrome_profiles, 'playwright_available', lambda: True)
+    monkeypatch.setattr(chrome_profiles, 'gemini_state', lambda page: ('ready', 'signed in', page.url))
+    page = _FakePage()
+
+    result = gemini_web.GeminiWebAutomator(_Manager(page)).ask(SUBTITLE)
+
+    assert result['success'] is True
+    assert result['reply'] == ANSWER
+    assert page.typed == SUBTITLE, 'the subtitle must go into the prompt box verbatim'
+    assert page.clicked and page.key == 'Enter'
+
+
+def test_the_success_is_recorded_on_the_profile_node(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(chrome_profiles, 'playwright_available', lambda: True)
+    monkeypatch.setattr(chrome_profiles, 'gemini_state', lambda page: ('ready', 'signed in', page.url))
+
+    gemini_web.GeminiWebAutomator(_Manager(_FakePage())).ask(SUBTITLE)
+
+    node = api_events.snapshot()['nodes'][0]
+    assert node['id'] == 'chrome:abc123'
+    assert node['requests'] == 1
+    assert node['successes'] == 1
+    assert node['failures'] == 0
+
+
+def test_a_missing_prompt_box_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(chrome_profiles, 'playwright_available', lambda: True)
+    monkeypatch.setattr(chrome_profiles, 'gemini_state', lambda page: ('ready', 'signed in', page.url))
+
+    monkeypatch.setattr(gemini_web, 'PROMPT_WAIT_SECONDS', 0.1)
+
+    class EmptyPage(_FakePage):
+        def locator(self, selector: str) -> _Nodes:
+            return _Nodes(self, 0)
+
+    result = gemini_web.GeminiWebAutomator(_Manager(EmptyPage())).ask(SUBTITLE)
+
+    assert result['success'] is False
+    assert result['status'] == 'error'
+    assert 'prompt box was not found' in result['message']
+
+
+def test_an_empty_answer_is_not_reported_as_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(chrome_profiles, 'playwright_available', lambda: True)
+    monkeypatch.setattr(chrome_profiles, 'gemini_state', lambda page: ('ready', 'signed in', page.url))
+    monkeypatch.setattr(gemini_web, 'MIN_ANSWER_SECONDS', 0.2)
+    page = _FakePage(answer='')
+
+    result = gemini_web.GeminiWebAutomator(_Manager(page)).ask(SUBTITLE, timeout_s=0.2)
+
+    assert result['success'] is False
+    assert 'no answer appeared' in result['message']
+
+
+def test_translation_prompt_asks_for_the_line_only() -> None:
+    prompt = gemini_web.build_translation_prompt('Hello', 'Khmer')
+
+    assert 'Translate this subtitle line' in prompt
+    assert 'into Khmer' in prompt
+    assert 'translation only' in prompt
+    assert prompt.rstrip().endswith('Hello')
+
+
+def test_the_gemini_said_label_is_not_part_of_the_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(chrome_profiles, 'playwright_available', lambda: True)
+    monkeypatch.setattr(chrome_profiles, 'gemini_state', lambda page: ('ready', 'signed in', page.url))
+    page = _FakePage(answer='Gemini said\n\nយប់មិញអ្នកនៅឯណា?')
+
+    result = gemini_web.GeminiWebAutomator(_Manager(page)).ask(SUBTITLE)
+
+    assert result['reply'] == 'យប់មិញអ្នកនៅឯណា?'
+
+
+def test_a_batch_prompt_numbers_every_line() -> None:
+    prompt = gemini_web.build_batch_prompt(['One', 'Two', 'Three'], 'Khmer')
+
+    assert '1. One' in prompt
+    assert '2. Two' in prompt
+    assert '3. Three' in prompt
+    assert 'same numbering' in prompt
+
+
+def test_the_glossary_reaches_the_prompt() -> None:
+    prompt = gemini_web.build_batch_prompt(['One'], 'Khmer', glossary='Bye = លាហើយ')
+
+    assert 'Use these term translations exactly: Bye = លាហើយ' in prompt
+
+
+def test_numbered_answers_are_mapped_back_to_their_lines() -> None:
+    reply = '1. មួយ\n2) ពីរ\n4: បួន'
+
+    assert gemini_web.parse_numbered_answer(reply, 4) == ['មួយ', 'ពីរ', None, 'បួន']
+
+
+def test_a_missing_line_is_retried_on_its_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    class FakeAutomator:
+        def ask(self, prompt, timeout_s=180.0, lines=1):
+            calls.append(prompt)
+            if '1. Where' in prompt and '2. I was' in prompt:
+                # The batch answer drops the second line.
+                return {'success': True, 'reply': '1. យប់មិញអ្នកនៅឯណា?'}
+            if prompt.rstrip().endswith('I was at the office.'):
+                return {'success': True, 'reply': 'ខ្ញុំនៅការិយាល័យ។'}
+            return {'success': True, 'reply': '1. x'}
+
+    monkeypatch.setattr(gemini_web, 'GeminiWebAutomator', FakeAutomator)
+
+    results = gemini_web.translate_lines(['Where were you last night?', 'I was at the office.'], 'Khmer')
+
+    assert results == ['យប់មិញអ្នកនៅឯណា?', 'ខ្ញុំនៅការិយាល័យ។']
+    assert len(calls) == 2, 'one batch answer, one retry for the missing line'
+
+
+def test_the_browser_engine_has_its_own_cache_namespace() -> None:
+    from backend.app import main
+
+    assert main._translation_model_hint('gemini_web') == gemini_web.MODEL_LABEL
+    # Free engines share the "no model choice" key; the browser engine must not.
+    assert main._translation_model_hint('google') == ''
+    assert main._translation_model_hint('gemini_web') != main._translation_model_hint('google')
+
+
+def test_the_engine_needs_a_selected_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    from backend.app import providers
+
+    monkeypatch.setattr(chrome_profiles, 'playwright_available', lambda: True)
+    monkeypatch.setattr(
+        chrome_profiles, 'manager',
+        lambda: SimpleNamespace(config=SimpleNamespace(read=lambda: {'selected_profile_id': ''})),
+    )
+    assert providers.GeminiWebTranslationProvider.is_available() is False
+
+    monkeypatch.setattr(
+        chrome_profiles, 'manager',
+        lambda: SimpleNamespace(config=SimpleNamespace(read=lambda: {'selected_profile_id': 'abc'})),
+    )
+    assert providers.GeminiWebTranslationProvider.is_available() is True
+
+
+def test_the_browser_engine_runs_one_batch_at_a_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    from backend.app import providers
+
+    monkeypatch.setattr(providers.GeminiWebTranslationProvider, 'is_available', staticmethod(lambda: True))
+    translator = providers.HybridTranslationProvider(preference='gemini_web')
+
+    assert translator.first_engine() == 'gemini_web'
+    assert translator.max_parallel_lines() == 1
+
+
+def test_auto_never_picks_the_browser_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    from backend.app import providers
+
+    monkeypatch.setattr(providers.GeminiWebTranslationProvider, 'is_available', staticmethod(lambda: True))
+    translator = providers.HybridTranslationProvider(preference='auto')
+
+    chain = [key for key, _provider in translator._chain()]
+    assert 'gemini_web' not in chain
+

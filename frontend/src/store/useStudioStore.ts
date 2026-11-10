@@ -57,7 +57,7 @@ interface StudioState {
    * preview discards audio elements holding the previous clip.
    */
   dubAudioVersion: number;
-  providerKeys: Record<'gemini' | 'openai' | 'codecraft' | 'custom', ProviderKeyStatus>;
+  providerKeys: Record<'gemini' | 'openai' | 'codecraft' | 'custom' | 'gemini_web', ProviderKeyStatus>;
   customApi: CustomApiConfig | null;
   /** Chrome profiles detected on this PC (null until the panel first asks). */
   chromeProfiles: ChromeProfilesSnapshot | null;
@@ -385,7 +385,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   voxcpmModel: null,
   genderModel: null,
   cudaPack: null,
-  providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false }, custom: { has_key: false } },
+  providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false }, custom: { has_key: false }, gemini_web: { has_key: false } },
   customApi: null,
   chromeProfiles: null,
   voiceCapabilities: {},
@@ -833,7 +833,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   refreshVoiceConfig: async () => {
     try {
       const [keys, capabilities, customConfig] = await Promise.all([
-        readJson<Record<'gemini' | 'openai' | 'codecraft' | 'custom', ProviderKeyStatus>>('/api/providers/keys').catch(() => null),
+        readJson<Record<'gemini' | 'openai' | 'codecraft' | 'custom' | 'gemini_web', ProviderKeyStatus>>('/api/providers/keys').catch(() => null),
         readJson<Record<string, { voices: Array<{ id: string; style: string }>; emotions: string[]; style_control: boolean; khmer_supported: boolean; languages: string[]; default_model: string; label: string; installed?: boolean; voices_by_language?: Record<string, Array<{ id: string; label: string; voice: string; gender: string }>> }> & { emotions?: string[] }>('/api/tts/capabilities').catch(() => null),
         readJson<CustomApiConfig>('/api/providers/custom/config').catch(() => null),
       ]);
@@ -1352,7 +1352,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       voxcpmModel: null,
       genderModel: null,
       cudaPack: null,
-      providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false }, custom: { has_key: false } },
+      providerKeys: { gemini: { has_key: false }, openai: { has_key: false }, codecraft: { has_key: false }, custom: { has_key: false }, gemini_web: { has_key: false } },
   customApi: null,
   chromeProfiles: null,
       voiceCapabilities: {},

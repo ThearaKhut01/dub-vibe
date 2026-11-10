@@ -94,12 +94,43 @@ Open **AI Models** in the header to manage Faster-Whisper transcription models �
 - **Status** — *Ready* (the Gemini account menu is visible), *Login required* (Gemini shows its signed-out header), *Locked* (Chrome already has that profile open — `psutil` reads `chrome.exe` command lines to tell which), *Unknown* (not checked yet).
 - **What it does not do** — no automated login, no account creation, no CAPTCHA handling. When Gemini asks for a sign-in the panel says so; **Open manual login** opens the profile in normal Chrome on Gemini so you can sign in yourself, and **Validate Gemini** then re-checks it.
 - **Launching** — the profile is opened with Playwright's persistent context on the *User Data root* plus `--profile-directory=<folder>`, never on `…\Profile 1` itself, so Chrome loads the real profile. Only one profile is open at a time and the previous context is closed first.
-- **Chrome 136+** — Chrome refuses remote debugging on its default data directory. For that case the app opens a private working copy of the profile's metadata and cookie store inside `<app data>\chrome-profile-sessions`, which is deleted as soon as the session closes. Chrome decrypts its own cookies there; this app never does.
+- **Chrome 136+** — Chrome refuses remote debugging on its default data directory, and a fresh copy of a profile is a *new device* for Google, so it lands signed out. The app therefore keeps **one profile of its own** per detected profile in `<app data>\chrome-profile-sessions` (seeded once from Chrome's metadata + cookie store, then reused). **Sign in once there** — *Open manual login* opens exactly that profile — and Validate / the Gemini prompt reuse the same browser afterwards. *Reset* throws it away and forces a new sign-in. Your normal Chrome profile is never written to, and this app never decrypts a cookie.
 - **Config** — `data\chrome_profile_config.json` holds `selected_profile_id`, `last_selected_profile_folder`, `last_selected_root_path` and `headless`. Nothing else is stored.
 - **Check it from a terminal** — `python test_chrome_profiles.py` lists the profiles, `--select "Profile 1"` saves a selection, and `--validate` opens that profile on Gemini and prints the login state.
 - **Live tab** — follows that profile: one node, updated over the local socket, and **Test prompt** sends one tiny question through it so the node has traffic. API keys are not drawn there.
+- **Subtitle translation** — pick *Gemini web (Chrome profile)* in the Translation engine list (it only appears once a profile is selected). Lines go out in one numbered message (up to 20 per batch), the reply is parsed back to the matching lines, a line the answer skipped is retried on its own, and the run stays serial because there is one browser. Auto never chooses it. Expect roughly 35–40 s per batch: that is Gemini answering, not Chrome starting.
 
 This needs `playwright` and `psutil` (`npm run setup:backend` installs them). Playwright drives your installed Chrome, so no browser download is required.
+
+### Test it without the dev server
+
+Two ways, neither needs Vite or a desktop window:
+
+1. **Terminal only** — the whole profile → Gemini flow:
+
+   ```bat
+   REM list profiles
+   .venv\Scripts\python.exe test_chrome_profiles.py
+   REM pick the profile that is signed in to Gemini
+   .venv\Scripts\python.exe test_chrome_profiles.py --select "Profile 2"
+   REM open the tool's window, wait for you to sign in there, then validate
+   .venv\Scripts\python.exe test_chrome_profiles.py --signin
+   REM translate one subtitle line through Gemini (chat answer)
+   .venv\Scripts\python.exe test_chrome_profiles.py --ask "Where were you last night?"
+   REM same line, as a subtitle translation (--to Khmer by default)
+   .venv\Scripts\python.exe test_chrome_profiles.py --translate "Where were you last night?"
+   REM start over (forget the tool's Chrome profile)
+   .venv\Scripts\python.exe test_chrome_profiles.py --reset-session
+   ```
+
+   `--ask` prints the answer Gemini returns for that one subtitle line (or the exact reason it stopped: locked, login required, prompt box not found).
+
+2. **One process + your browser** — `npm run build` writes `frontend/dist`, and the backend serves it:
+   ```bat
+   npm run backend
+   ```
+   then open <http://127.0.0.1:8001> — same UI as the desktop app, no `npm run dev`, no Vite.
+
 
 Translation memory (the wording reused for an identical line) lives in `<app data>\translation-cache.sqlite3`; `DUBVIBE_TRANSLATION_CACHE=0` switches it off.
 

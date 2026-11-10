@@ -1347,6 +1347,64 @@ class CustomAPITranslationProvider(OnlineLLMTranslationProvider):
 # Every language the app offers is supported by the hosted LLMs (unlike their TTS
 # voices, which do not officially list Khmer).
 ONLINE_TRANSLATION_ENGINES = ('gemini', 'openai', 'codecraft', 'custom')
+# Engines that need a browser instead of a key. They are never chosen by Auto:
+# each line costs seconds and a chat turn.
+BROWSER_TRANSLATION_ENGINES = ('gemini_web',)
+
+
+class GeminiWebTranslationProvider(TranslationProvider):
+    """Subtitle translation through the Gemini web app in the selected Chrome profile.
+
+    Deliberately serial (one browser, one conversation): the batching that makes
+    this fast happens inside one message, not across parallel browsers.
+    """
+
+    ENGINE = 'gemini_web'
+
+    def __init__(self, style_hint: str | None = None) -> None:
+        self.style_hint = style_hint
+
+    @staticmethod
+    def is_available() -> bool:
+        from . import chrome_profiles
+
+        if not chrome_profiles.playwright_available():
+            return False
+        try:
+            return bool(chrome_profiles.manager().config.read().get('selected_profile_id'))
+        except Exception:
+            return False
+
+    def supports_batch(self) -> bool:
+        return True
+
+    def translate(self, text: str, target_language: str, source_language: str = 'en') -> str:
+        from . import gemini_web
+
+        if not str(text or '').strip():
+            return ''
+        result = gemini_web.GeminiWebAutomator().ask(
+            gemini_web.build_translation_prompt(text, target_language, source_language),
+        )
+        if not result.get('success'):
+            raise RuntimeError(str(result.get('message') or 'Gemini web did not answer.'))
+        return str(result.get('reply') or '').strip()
+
+    def translate_batch(self, lines: list[str], context: list[str] | None = None,
+                        glossary: str = '', *, source_language: str = 'auto',
+                        target_language: str = 'Khmer', tone: str = 'natural and consistent',
+                        usage: dict[str, int] | None = None,
+                        meta: dict[str, Any] | None = None) -> list[str | None]:
+        from . import gemini_web
+
+        if not lines:
+            return []
+        source = '' if source_language in ('', 'auto') else source_language
+        results = gemini_web.translate_lines(list(lines), target_language, source, glossary=glossary)
+        if usage is not None:
+            usage['lines'] = int(usage.get('lines', 0)) + len(lines)
+        return results
+
 
 
 class HybridTranslationProvider(TranslationProvider):
@@ -1369,9 +1427,10 @@ class HybridTranslationProvider(TranslationProvider):
         self._openai: TranslationProvider | None = None
         self._codecraft: TranslationProvider | None = None
         self._custom: TranslationProvider | None = None
+        self._gemini_web: TranslationProvider | None = None
         self._mode: str = 'online'
         self._preference = preference if preference in (
-            'qwen', 'nllb', 'argos', 'google', *ONLINE_TRANSLATION_ENGINES,
+            'qwen', 'nllb', 'argos', 'google', *ONLINE_TRANSLATION_ENGINES, *BROWSER_TRANSLATION_ENGINES,
         ) else 'auto'
 
         try:
@@ -1397,6 +1456,12 @@ class HybridTranslationProvider(TranslationProvider):
                 self._custom = CustomAPITranslationProvider(style_hint)
         except Exception as error:
             logger.info('Custom API translation unavailable: %s', error)
+
+        try:
+            if GeminiWebTranslationProvider.is_available():
+                self._gemini_web = GeminiWebTranslationProvider(style_hint)
+        except Exception as error:
+            logger.info('Gemini web translation unavailable: %s', error)
 
         try:
             from . import qwen_local
@@ -1452,7 +1517,7 @@ class HybridTranslationProvider(TranslationProvider):
             # user's own configured endpoint is the fallback they expect, before
             # the free/local engines take over.
             if (
-                self._preference in ONLINE_TRANSLATION_ENGINES
+                self._preference in (*ONLINE_TRANSLATION_ENGINES, *BROWSER_TRANSLATION_ENGINES)
                 and self._preference != 'custom'
                 and self._custom is not None
             ):
@@ -1466,6 +1531,7 @@ class HybridTranslationProvider(TranslationProvider):
             'openai': self._openai,
             'codecraft': self._codecraft,
             'custom': self._custom,
+            'gemini_web': self._gemini_web,
         }
         chain: list[tuple[str, TranslationProvider]] = []
         for key in order:
@@ -1489,6 +1555,8 @@ class HybridTranslationProvider(TranslationProvider):
         this machine/LAN stays serial too: four workers would fight the UI.
         """
         first = self.first_engine()
+        if first in BROWSER_TRANSLATION_ENGINES:
+            return 1
         if first == 'custom':
             from . import custom_api
 
@@ -1503,8 +1571,9 @@ class HybridTranslationProvider(TranslationProvider):
         """
         if self._preference == 'auto' or self._preference == 'google':
             return
-        if self._preference in ONLINE_TRANSLATION_ENGINES:
+        if self._preference in (*ONLINE_TRANSLATION_ENGINES, *BROWSER_TRANSLATION_ENGINES):
             online = {
+                'gemini_web': (self._gemini_web, 'Gemini web'),
                 'gemini': (self._gemini, 'Gemini'),
                 'openai': (self._openai, 'OpenAI'),
                 'codecraft': (self._codecraft, 'CodeCraft'),
@@ -1512,6 +1581,11 @@ class HybridTranslationProvider(TranslationProvider):
             }
             provider, label = online[self._preference]
             if provider is None:
+                if self._preference == 'gemini_web':
+                    raise RuntimeError(
+                        'Gemini web needs a selected Chrome profile. Pick one in Chrome Profiles, '
+                        'sign in once, then choose this engine again.'
+                    )
                 if self._preference == 'custom':
                     raise RuntimeError(
                         'Custom API is not configured. Set its base URL and model in '
@@ -1587,7 +1661,7 @@ class HybridTranslationProvider(TranslationProvider):
         modes = {
             'qwen': 'qwen', 'nllb': 'nllb', 'argos': 'offline', 'google': 'online',
             'gemini': 'gemini', 'openai': 'openai', 'codecraft': 'codecraft',
-            'custom': 'custom',
+            'custom': 'custom', 'gemini_web': 'gemini_web',
         }
         last_error: Exception | None = None
         for key, provider in self._chain():
@@ -1620,7 +1694,7 @@ class HybridTranslationProvider(TranslationProvider):
         modes = {
             'qwen': 'qwen', 'nllb': 'nllb', 'argos': 'offline', 'google': 'online',
             'gemini': 'gemini', 'openai': 'openai', 'codecraft': 'codecraft',
-            'custom': 'custom',
+            'custom': 'custom', 'gemini_web': 'gemini_web',
         }
         last_error: Exception | None = None
         for key, provider in self._chain():

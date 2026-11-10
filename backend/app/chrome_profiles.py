@@ -71,7 +71,22 @@ SHADOW_PROFILE_FILES = (
 
 PLAYWRIGHT_TIMEOUT_MS = 45_000
 GEMINI_SETTLE_SECONDS = 20.0
-LOCKED_MESSAGE = 'Chrome is currently using this profile. Close all Chrome windows and try again.'
+LOCKED_MESSAGE = 'Chrome is currently using this profile. Close that Chrome window and try again.'
+
+
+def locked_message(folder: str = '') -> str:
+    """Only the window that runs *this* profile has to be closed.
+
+    Chrome keeps one browser process (and usually one window) per profile, and a
+    profile is locked only while that process holds it. Other profiles can stay
+    open: the session uses either the profile directory itself or a private copy
+    of it, never the whole Chrome install.
+    """
+    target = f' {folder}' if folder else ' this profile'
+    return (
+        f'Chrome is using{target} right now. Close the Chrome window that runs it '
+        '(other profiles can stay open), then try again.'
+    )
 MISSING_PLAYWRIGHT_MESSAGE = (
     'Playwright is not installed in this Python environment. '
     'Run "pip install playwright" (no browser download is needed — the app drives your installed Chrome).'
@@ -355,14 +370,19 @@ def _split_command_line(command_line: str) -> list[str]:
 
 
 def _flag_value(command_line: str, flag: str) -> str:
-    """Value of ``--flag=value``, ``--flag value`` or ``"--flag=value with spaces"``."""
-    tokens = _split_command_line(command_line)
-    for index, token in enumerate(tokens):
-        if token == flag and index + 1 < len(tokens):
-            return tokens[index + 1].strip()
-        if token.startswith(flag + '='):
-            return token[len(flag) + 1:].strip()
-    return ''
+    """Value of ``--flag=value``, ``--flag value`` or ``"--flag=value with spaces"``.
+
+    Chrome is inconsistent: the browser process quotes a path with spaces, child
+    processes leave it bare (``--user-data-dir=<root> --type=renderer``),
+    so the value runs until the next option rather than the next space.
+    """
+    pattern = re.compile(
+        rf'{re.escape(flag)}(?:=|\s+)(?:"([^"]*)"|(.*?))(?=\s+[-/][-\w]|\s*$)',
+    )
+    match = pattern.search(command_line)
+    if not match:
+        return ''
+    return (match.group(1) or match.group(2) or '').strip().strip('"')
 
 
 # Chrome writes "Profile 1" either quoted or bare, so the folder name cannot
@@ -514,14 +534,6 @@ def playwright_available() -> bool:
     return True
 
 
-def _debug_directory_blocked(root: Path) -> bool:
-    """True when Chrome will ignore Playwright's debugging pipe for this root."""
-    if _key(root) != _key(default_chrome_root()):
-        return False
-    major = chrome_major_version(root)
-    return major is None or major >= CHROME_REMOTE_DEBUG_MIN_BLOCK
-
-
 class ProfileSession:
     """One Playwright persistent context.
 
@@ -529,13 +541,12 @@ class ProfileSession:
     opened, used and closed inside one call (see :meth:`ChromeProfileManager.validate_profile`).
     """
 
-    def __init__(self, profile: dict[str, Any], context: Any, playwright: Any,
-                 shadow_dir: Path | None = None) -> None:
+    def __init__(self, profile: dict[str, Any], context: Any, playwright: Any) -> None:
         self.profile = profile
         self.context = context
         self.playwright = playwright
-        self.shadow_dir = shadow_dir
-        self.via = 'working_copy' if shadow_dir else 'direct'
+        # The session profile is the tool's own, so a sign-in inside it survives.
+        self.via = 'session_profile'
 
     @property
     def page(self) -> Any:
@@ -551,13 +562,7 @@ class ProfileSession:
             self.playwright.stop()
         except Exception:
             pass
-        if self.shadow_dir is not None:
-            shutil.rmtree(self.shadow_dir.parent, ignore_errors=True)
-            # Drop the container folder too when nothing else is left behind.
-            try:
-                self.shadow_dir.parent.parent.rmdir()
-            except OSError:
-                pass
+        # The profile is intentionally kept: it holds the sign-in.
 
     def __enter__(self) -> 'ProfileSession':
         return self
@@ -631,8 +636,7 @@ class ChromeProfileManager:
         profile = self.get_profile(profile_id_value)
         if profile is None:
             raise ChromeProfileError('That Chrome profile is no longer available. Refresh the list.', 'error')
-        if profile['is_locked']:
-            raise ChromeProfileError(LOCKED_MESSAGE, 'locked')
+        self._ensure_not_busy(profile)
         if not playwright_available():
             raise ChromeProfileError(MISSING_PLAYWRIGHT_MESSAGE, 'error')
         executable = chrome_executable()
@@ -660,13 +664,10 @@ class ChromeProfileManager:
             session.close()
 
     def _open(self, profile: dict[str, Any], executable: Path, headless: bool | None) -> ProfileSession:
-        root = Path(profile['root_path'])
         folder = profile['profile_folder']
-        user_data_dir = root
-        shadow_dir: Path | None = None
-        if _debug_directory_blocked(root):
-            shadow_dir = self._prepare_working_copy(profile)
-            user_data_dir = shadow_dir
+        # The tool's own profile: a stable data directory Chrome accepts for
+        # remote debugging, and the place a sign-in survives.
+        user_data_dir = self.session_profile(profile)
 
         from playwright.sync_api import sync_playwright  # imported lazily: optional dependency
 
@@ -693,21 +694,32 @@ class ChromeProfileManager:
                 playwright.stop()
             except Exception:
                 pass
-            if shadow_dir is not None:
-                shutil.rmtree(shadow_dir.parent, ignore_errors=True)
             raise ChromeProfileError(_launch_error_message(error), _launch_error_status(error)) from error
-        return ProfileSession(profile, context, playwright, shadow_dir)
+        return ProfileSession(profile, context, playwright)
 
-    def _prepare_working_copy(self, profile: dict[str, Any]) -> Path:
-        """Private copy of the profile's metadata + cookie store, in app storage.
+    def session_dir(self, profile: dict[str, Any]) -> Path:
+        """The tool's own Chrome profile for this Chrome profile (kept between runs)."""
+        return self.sessions_dir / profile['id'] / 'User Data'
 
-        Needed only because Chrome 136+ ignores remote debugging on the real
-        default profile. Chrome decrypts its own cookies here; this code never
-        reads their contents, and the copy is deleted when the session closes.
+    def has_session_profile(self, profile: dict[str, Any]) -> bool:
+        marker = self.sessions_dir / profile['id'] / 'session.json'
+        user_data = self.session_dir(profile)
+        return marker.is_file() and (user_data / profile['profile_folder']).is_dir()
+
+    def session_profile(self, profile: dict[str, Any]) -> Path:
+        """Seed the tool's profile from Chrome once, then always reuse it.
+
+        Chrome 136+ refuses remote debugging on the real default data directory,
+        and a fresh copy of a profile is a *new device* for Google — so the copy
+        is created once and then kept: signing in inside it makes the session
+        stick, which is what Validate and the Gemini prompt use afterwards.
         """
         base = self.sessions_dir / profile['id']
-        shutil.rmtree(base, ignore_errors=True)
         user_data = base / 'User Data'
+        if self.has_session_profile(profile):
+            return user_data
+
+        shutil.rmtree(base, ignore_errors=True)
         folder_dir = user_data / profile['profile_folder']
         folder_dir.mkdir(parents=True, exist_ok=True)
         source_root = Path(profile['root_path'])
@@ -715,14 +727,77 @@ class ChromeProfileManager:
         local_state = source_root / 'Local State'
         if local_state.is_file():
             shutil.copy2(local_state, user_data / 'Local State')
+            self._trim_local_state(user_data / 'Local State', profile['profile_folder'])
         for relative in SHADOW_PROFILE_FILES:
             source = source_profile / relative
-            if not source.is_file():
-                continue
-            destination = folder_dir / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
+            if source.is_file():
+                destination = folder_dir / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+        # Local Storage carries the Gemini shell's own state; without it the app
+        # reloads as a guest even when the cookies survive.
+        local_storage = source_profile / 'Local Storage'
+        if local_storage.is_dir():
+            try:
+                shutil.copytree(local_storage, folder_dir / 'Local Storage', dirs_exist_ok=True)
+            except OSError:
+                pass
+        (base / 'session.json').write_text(
+            json.dumps({'source_profile_id': profile['id'], 'profile_folder': profile['profile_folder']}),
+            encoding='utf-8',
+        )
         return user_data
+
+    @staticmethod
+    def _trim_local_state(path: Path, folder: str) -> None:
+        """Keep only the copied profile in ``info_cache``.
+
+        Chrome's profile menu is built from that cache; leaving the other entries
+        in would offer profiles whose folders do not exist in the tool's profile,
+        and switching to one would open an empty browser.
+        """
+        try:
+            data = json.loads(path.read_text(encoding='utf-8', errors='replace'))
+        except (OSError, ValueError):
+            return
+        section = data.get('profile') if isinstance(data, dict) else None
+        if not isinstance(section, dict):
+            return
+        cache = section.get('info_cache')
+        entry = cache.get(folder) if isinstance(cache, dict) else None
+        section['info_cache'] = {folder: entry if isinstance(entry, dict) else {'name': folder}}
+        section['last_used'] = folder
+        try:
+            path.write_text(json.dumps(data), encoding='utf-8')
+        except OSError:
+            pass
+
+    def reset_session_profile(self, profile_id_value: str) -> dict[str, Any]:
+        """Throw the tool's profile away (forces a fresh seed and a new sign-in)."""
+        profile = self.get_profile(profile_id_value)
+        if profile is None:
+            raise ChromeProfileError('That Chrome profile is no longer available.', 'error')
+        shutil.rmtree(self.sessions_dir / profile['id'], ignore_errors=True)
+        return {'status': 'ok', 'profile_id': profile['id'], 'message': 'The tool\'s Chrome profile was reset.'}
+
+    def session_in_use(self, profile: dict[str, Any]) -> bool:
+        """True while the tool's own Chrome window holds this profile open."""
+        target = _key(self.session_dir(profile))
+        for _pid, command_line in chrome_processes():
+            user_data_dir = _flag_value(command_line, '--user-data-dir')
+            if user_data_dir and _key(user_data_dir) == target:
+                return True
+        return False
+
+    def _ensure_not_busy(self, profile: dict[str, Any]) -> None:
+        folder = profile['profile_folder']
+        if self.session_in_use(profile):
+            raise ChromeProfileError(
+                f"The tool's Chrome window for {folder} is open. Close it, then try again.", 'locked',
+            )
+        if profile['is_locked'] and not self.has_session_profile(profile):
+            # Seeding needs a quiet source profile: Chrome may be mid-write.
+            raise ChromeProfileError(locked_message(folder), 'locked')
 
     # -- validation -----------------------------------------------------------
 
@@ -731,8 +806,10 @@ class ChromeProfileManager:
         profile = self.get_profile(profile_id_value)
         if profile is None:
             return _validation(profile_id_value, 'error', 'That Chrome profile is no longer available. Refresh the list.')
-        if profile['is_locked']:
-            return _validation(profile['id'], 'locked', LOCKED_MESSAGE)
+        try:
+            self._ensure_not_busy(profile)
+        except ChromeProfileError as error:
+            return _validation(profile['id'], error.status, str(error))
         if not playwright_available():
             return _validation(profile['id'], 'error', MISSING_PLAYWRIGHT_MESSAGE)
         if chrome_executable() is None:
@@ -752,7 +829,12 @@ class ChromeProfileManager:
     # -- manual login ---------------------------------------------------------
 
     def open_manual(self, profile_id_value: str) -> dict[str, Any]:
-        """Open this profile in the normal Chrome window, on Gemini."""
+        """Open the tool's own profile in Chrome, on Gemini, so you can sign in.
+
+        Signing in here (not in your normal Chrome window) is what makes the
+        session usable: Validate and the Gemini prompt then open this very
+        profile, and Google sees the same browser it saw at sign-in.
+        """
         profile = self.get_profile(profile_id_value)
         if profile is None:
             return {'success': False, 'status': 'error',
@@ -760,11 +842,13 @@ class ChromeProfileManager:
         executable = chrome_executable()
         if executable is None:
             return {'success': False, 'status': 'error', 'message': MISSING_CHROME_MESSAGE}
-        root = Path(profile['root_path'])
-        command = [str(executable)]
-        if _key(root) != _key(default_chrome_root()):
-            command.append(f'--user-data-dir={root}')
-        command.extend([f'--profile-directory={profile["profile_folder"]}', GEMINI_URL])
+        user_data_dir = self.session_profile(profile)
+        command = [
+            str(executable),
+            f'--user-data-dir={user_data_dir}',
+            f'--profile-directory={profile["profile_folder"]}',
+            GEMINI_URL,
+        ]
         flags = 0
         if sys.platform == 'win32':
             flags = getattr(subprocess, 'DETACHED_PROCESS', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
@@ -776,7 +860,10 @@ class ChromeProfileManager:
             'success': True,
             'status': 'manual_login',
             'profile_id': profile['id'],
-            'message': 'Chrome opened on Gemini with this profile. Sign in there yourself, then press "Validate Gemini".',
+            'message': (
+                "The tool's own Chrome window opened on Gemini. Sign in there (top-right \"Sign in\"), "
+                'close that window, then press "Validate Gemini".'
+            ),
         }
 
 
@@ -814,10 +901,11 @@ def _launch_error_message(error: Exception) -> str:
 def gemini_state(page: Any) -> tuple[str, str, str]:
     """(status, message, url) for the Gemini tab, using only the visible UI.
 
-    Gemini renders the prompt box whether or not the profile is signed in, so the
-    signed-in state is read from the account menu in the header. A "Sign in"
-    button at the top means the profile has no Gemini session; there is no
-    attempt to create one.
+    Gemini always renders a composer, so "signed in" is read as the *absence* of a
+    sign-in call to action next to it: the account chip is drawn by Google's
+    ``ogs.google.com`` iframe and is not reliably visible from this frame. Two
+    consecutive readings are required, so a half-loaded page cannot pass as a
+    session.
     """
     try:
         page.goto(GEMINI_URL, wait_until='domcontentloaded', timeout=PLAYWRIGHT_TIMEOUT_MS)
@@ -825,27 +913,33 @@ def gemini_state(page: Any) -> tuple[str, str, str]:
         return 'error', f'Gemini did not load: {str(error).splitlines()[0][:300]}', _safe_url(page)
 
     deadline = time.monotonic() + GEMINI_SETTLE_SECONDS
+    settled = 0
     while time.monotonic() < deadline:
         url = _safe_url(page)
         if 'accounts.google.com' in url:
             return ('login_required',
                     'Gemini redirected to the Google sign-in page. Use "Open manual login" and sign in yourself.',
                     url)
-        if _shows_account_menu(page):
-            return 'ready', 'Gemini is signed in for this profile.', url
         if _shows_sign_in(page):
             return ('login_required',
-                    'Gemini shows the signed-out header in this profile. Use "Open manual login", sign in to '
-                    'Gemini in Chrome, then validate again.',
+                    'Gemini is signed out in the tool\'s own browser for this profile. Use "Open manual login" '
+                    'and sign in to Gemini in the window it opens (not your normal Chrome), then validate again.',
                     url)
+        if _shows_account_menu(page) or _has_prompt_box(page):
+            settled += 1
+            if settled >= 2:
+                return 'ready', 'Gemini is signed in for this profile.', url
+        else:
+            settled = 0
         try:
             page.wait_for_timeout(500)
         except Exception:
             break
     return ('error',
-            'Gemini neither showed an account menu nor a sign-in button within '
+            'Gemini never showed a usable page (no composer, no sign-in button) within '
             f'{int(GEMINI_SETTLE_SECONDS)} s. The page may have changed.',
             _safe_url(page))
+
 
 
 def _safe_url(page: Any) -> str:
@@ -864,9 +958,22 @@ ACCOUNT_MENU_SELECTORS = (
 
 
 def _shows_account_menu(page: Any) -> bool:
+    """A *visible* account menu — a hidden or half-loaded node is not a session."""
     for selector in ACCOUNT_MENU_SELECTORS:
         try:
-            if page.locator(selector).count() > 0:
+            locator = page.locator(selector)
+            if locator.count() > 0 and locator.first.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _has_prompt_box(page: Any) -> bool:
+    for selector in ('rich-textarea', 'div.ql-editor[contenteditable="true"]', '[role="textbox"]'):
+        try:
+            locator = page.locator(selector)
+            if locator.count() > 0 and locator.first.is_visible():
                 return True
         except Exception:
             continue
@@ -874,7 +981,19 @@ def _shows_account_menu(page: Any) -> bool:
 
 
 def _shows_sign_in(page: Any) -> bool:
-    """A visible "Sign in" button in the header (not the footer link)."""
+    """A visible sign-in call to action.
+
+    Gemini renders its header as a plain ``Sign in`` link to
+    ``accounts.google.com/ServiceLogin`` (the button role is not guaranteed
+    across versions), so the link is checked first and the role second.
+    """
+    for selector in ('a[href*="ServiceLogin"]',):
+        try:
+            locator = page.locator(selector)
+            if locator.count() > 0 and locator.first.is_visible():
+                return True
+        except Exception:
+            continue
     try:
         buttons = page.get_by_role('button', name=re.compile(r'^\s*sign in\s*$', re.IGNORECASE))
         total = buttons.count()
@@ -882,7 +1001,8 @@ def _shows_sign_in(page: Any) -> bool:
         return False
     for index in range(min(total, 4)):
         try:
-            box = buttons.nth(index).bounding_box()
+            node = buttons.nth(index)
+            box = node.bounding_box()
         except Exception:
             continue
         if box and box.get('width') and box.get('y', 1000) < 120:
@@ -922,6 +1042,9 @@ def snapshot() -> dict[str, Any]:
     """Everything the Chrome Profiles panel needs, in one round trip."""
     profile_manager = manager()
     profiles = profile_manager.refresh_profiles()
+    for profile in profiles:
+        # The panel explains the first run: sign in once inside the tool's window.
+        profile['session_ready'] = profile_manager.has_session_profile(profile)
     state = profile_manager.config.read()
     selected_id = state.get('selected_profile_id', '')
     selected = next((profile for profile in profiles if profile['id'] == selected_id), None)

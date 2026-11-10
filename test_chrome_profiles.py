@@ -1,12 +1,14 @@
-"""List the Chrome profiles on this PC and check the saved one.
+"""List the Chrome profiles on this PC, check the saved one, and drive Gemini.
 
     python test_chrome_profiles.py
-    python test_chrome_profiles.py --validate
-    python test_chrome_profiles.py --select "Profile 1"
+    python test_chrome_profiles.py --select "Profile 5"
+    python test_chrome_profiles.py --open                 # sign in manually
+    python test_chrome_profiles.py --validate             # signed in?
+    python test_chrome_profiles.py --ask "Where were you last night?"
     python test_chrome_profiles.py --json
 
 Run it with the app's interpreter (``.venv\\Scripts\\python.exe``) so the backend
-package — and Playwright, when you validate — resolves.
+package — and Playwright, when a browser is opened — resolves.
 
 Scanning reads Chrome's own metadata only: ``Local State`` and each profile's
 ``Preferences``. No cookie, password, token or ``Login Data`` file is opened, and
@@ -17,8 +19,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 
-from backend.app import chrome_profiles
+from backend.app import chrome_profiles, gemini_web
 
 __test__ = False  # a manual script, not a pytest module
 
@@ -36,11 +39,22 @@ def _find(profiles: list[dict], needle: str) -> dict | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description='Detect Chrome profiles (metadata only).')
+    parser = argparse.ArgumentParser(description='Detect Chrome profiles (metadata only) and drive Gemini web.')
     parser.add_argument('--validate', action='store_true',
-                        help='open the saved profile on gemini.google.com and report the login state')
+                        help='open the profile on gemini.google.com and report the login state')
     parser.add_argument('--profile', metavar='FOLDER', help='profile folder or id (defaults to the saved one)')
     parser.add_argument('--select', metavar='FOLDER', help='save this profile folder (or id) as the selection')
+    parser.add_argument('--open', action='store_true',
+                        help="open the tool's own Chrome profile on Gemini, so you can sign in once")
+    parser.add_argument('--signin', action='store_true',
+                        help='--open, wait until you close that window, then validate')
+    parser.add_argument('--reset-session', action='store_true',
+                        help="delete the tool's own Chrome profile (forces a new sign-in)")
+    parser.add_argument('--ask', metavar='LINE', help='send one line to Gemini web and print the answer')
+    parser.add_argument('--translate', metavar='LINE',
+                        help='translate one subtitle line through Gemini web (see --to)')
+    parser.add_argument('--to', default='Khmer', metavar='LANGUAGE',
+                        help='target language for --translate (default: Khmer)')
     parser.add_argument('--json', action='store_true', help='print the raw result instead of a table')
     args = parser.parse_args(argv)
 
@@ -85,18 +99,64 @@ def main(argv: list[str] | None = None) -> int:
     for message in manager.last_scan_errors:
         print(f'warning   : {message}')
 
+    def target_for(needle: str | None, action: str) -> dict | None:
+        profile = _find(profiles, needle) if needle else (manager.get_selected_profile() or None)
+        if profile is None:
+            print(f'\nNo profile to {action}: pass --profile "Profile 1" or select one first.')
+        return profile
+
     if args.select:
         target = _find(profiles, args.select)
         if target is None:
             print(f'\nNo profile matches "{args.select}".')
             return 2
         manager.select_profile(target['id'])
+        selected = target
         print(f'\nSaved selection: {target["profile_folder"]} ({target["id"]})')
 
-    if args.validate:
-        target = _find(profiles, args.profile) if args.profile else (manager.get_selected_profile() or None)
+    if args.open or args.signin:
+        target = target_for(args.profile, 'open')
         if target is None:
-            print('\nNo profile to validate: pass --profile "Profile 1" or select one first.')
+            return 2
+        result = manager.open_manual(target['id'])
+        print(f'\n{result["message"]}')
+        if not result['success'] or not args.signin:
+            return 0 if result['success'] else 2
+
+        print('  1. click "Verify it\'s you" if Chrome asks (that is Chrome, not Gemini)')
+        print('  2. sign in to Gemini in that window (top-right "Sign in")')
+        print('  3. close that window when the Gemini header shows your avatar')
+        print('\nWaiting for the window to close (up to 10 minutes) ...', end='', flush=True)
+        deadline = time.monotonic() + 600
+        while manager.session_in_use(target) and time.monotonic() < deadline:
+            time.sleep(3)
+            print('.', end='', flush=True)
+        still_open = manager.session_in_use(target)
+        print()
+
+        print(f'Validating {target["profile_folder"]} on {chrome_profiles.GEMINI_URL} ...')
+        check = manager.validate_profile(target['id'])
+        print(f'status    : {check["status"]}')
+        print(f'message   : {check["message"]}')
+        if check['status'] == 'ready':
+            print('\nReady. Try one subtitle line:')
+            print(f'  .venv\\Scripts\\python.exe test_chrome_profiles.py --ask "Where were you last night?"')
+            return 0
+        if still_open:
+            print('\nThat window is still open — close it, then run --validate again.')
+        return 2
+
+    if args.reset_session:
+        target = target_for(args.profile, 'reset')
+        if target is None:
+            return 2
+        result = manager.reset_session_profile(target['id'])
+        print(f"\n{result['message']}")
+        return 0
+
+    if args.validate:
+        target = target_for(args.profile, 'validate')
+        if target is None:
             return 2
         print(f'\nValidating {target["profile_folder"]} on {chrome_profiles.GEMINI_URL} ...')
         result = manager.validate_profile(target['id'])
@@ -107,6 +167,54 @@ def main(argv: list[str] | None = None) -> int:
         if result.get('via'):
             print(f'opened    : {result["via"]}')
         return 0 if result['status'] == 'ready' else 2
+
+    if args.translate:
+        target = target_for(args.profile, 'translate')
+        if target is None:
+            return 2
+        if not selected or selected['id'] != target['id']:
+            manager.select_profile(target['id'])
+            print(f'\nSaved selection: {target["profile_folder"]}')
+        prompt = gemini_web.build_translation_prompt(args.translate, args.to)
+        print(f'\nTranslating into {args.to} in {target["profile_folder"]}: {args.translate!r}')
+        try:
+            result = gemini_web.GeminiWebAutomator(manager).ask(prompt)
+        except gemini_web.GeminiWebError as error:
+            print(f'error     : {error}')
+            return 2
+        print(f'status    : {result.get("status")}')
+        if result.get('success'):
+            print('line      :')
+            print(f'\n{result.get("reply", "")}\n')
+            return 0
+        print(f'message   : {result.get("message", "")}')
+        return 2
+
+    if args.ask:
+        target = target_for(args.profile, 'ask')
+        if target is None:
+            return 2
+        if not selected or selected['id'] != target['id']:
+            # The automator always uses the saved selection, so save it first.
+            manager.select_profile(target['id'])
+            print(f'\nSaved selection: {target["profile_folder"]}')
+        print(f'\nAsking Gemini in {target["profile_folder"]}: {args.ask!r}')
+        try:
+            result = gemini_web.GeminiWebAutomator(manager).ask(args.ask)
+        except gemini_web.GeminiWebError as error:
+            print(f'error     : {error}')
+            return 2
+        print(f'status    : {result.get("status")}')
+        if result.get('success'):
+            print('answer    :')
+            print(f'\n{result.get("reply", "")}\n')
+            if result.get('via'):
+                print(f'opened    : {result["via"]}')
+            return 0
+        print(f'message   : {result.get("message", "")}')
+        if result.get('status') == 'login_required':
+            print('\nSign in in the tool\'s window first:  python test_chrome_profiles.py --open')
+        return 2
 
     return 0
 

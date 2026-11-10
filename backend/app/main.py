@@ -661,6 +661,11 @@ async def provider_keys_status() -> dict[str, Any]:
     status: dict[str, Any] = {}
     for provider in api_keys.PROVIDERS:
         status[provider] = {'has_key': api_keys.has_key(provider)}
+    # The browser engine has no key: it is "ready" when a Chrome profile is
+    # selected, so the picker can enable it with the same shape.
+    from backend.app.providers import GeminiWebTranslationProvider
+
+    status['gemini_web'] = {'has_key': GeminiWebTranslationProvider.is_available()}
     return status
 
 
@@ -2224,6 +2229,12 @@ def _translation_model_hint(engine: str | None) -> str:
             from backend.app.providers import GeminiTranslationProvider
 
             return GeminiTranslationProvider.model_name()
+        if engine == 'gemini_web':
+            from backend.app import gemini_web
+
+            # Its own namespace: a line cached by Argos/Google must not be
+            # replayed as if Gemini web had translated it (and the reverse).
+            return gemini_web.MODEL_LABEL
         if engine == 'custom':
             from backend.app import custom_api
 
@@ -3929,3 +3940,15 @@ async def websocket_status(websocket: WebSocket) -> None:
     finally:
         if websocket in active_connections:
             active_connections.remove(websocket)
+
+
+# --- Built frontend (optional) ------------------------------------------------
+# `npm run build` writes frontend/dist. Serving it from here means the whole app
+# can be opened with one process and a browser (http://127.0.0.1:8001) — no Vite
+# dev server, no desktop window. The mount is registered last so it can never
+# shadow an API route.
+_FRONTEND_DIST = get_app_root() / 'frontend' / 'dist'
+if (_FRONTEND_DIST / 'index.html').is_file():
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount('/', StaticFiles(directory=str(_FRONTEND_DIST), html=True), name='ui')

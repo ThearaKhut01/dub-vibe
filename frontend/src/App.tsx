@@ -801,11 +801,18 @@ function App() {
   }, [exportFiles]);
 
   const hasMedia = Boolean(importedFile || project.hasMedia);
-  // The engine picker offers a provider when its single saved key exists.
-  const engineReady = (provider: 'gemini' | 'openai' | 'codecraft'): boolean =>
+  // The engine picker offers a provider when its single saved key exists; the
+  // browser engine is "ready" when a Chrome profile is selected instead.
+  const engineReady = (provider: 'gemini' | 'openai' | 'codecraft' | 'gemini_web'): boolean =>
     Boolean(providerKeys[provider]?.has_key);
-  const engineSuffix = (provider: 'gemini' | 'openai' | 'codecraft'): string =>
-    (providerKeys[provider]?.has_key ? ' — key configured' : ' — add a key in API Settings');
+  const engineSuffix = (provider: 'gemini' | 'openai' | 'codecraft' | 'gemini_web'): string => {
+    if (provider === 'gemini_web') {
+      return providerKeys.gemini_web?.has_key
+        ? ' — Chrome profile ready'
+        : ' — select a Chrome profile first';
+    }
+    return providerKeys[provider]?.has_key ? ' — key configured' : ' — add a key in API Settings';
+  };
   // mediaVersion busts the browser cache after a cut rewrites the media file.
   const previewUrl = videoUrl || (project.hasMedia && project.id
     ? `${apiBaseUrl}/api/projects/${project.id}/media?v=${mediaVersion}`
@@ -2427,6 +2434,9 @@ function App() {
                   <option value="codecraft" disabled={!engineReady('codecraft')}>
                     CodeCraft (online){engineSuffix('codecraft')}
                   </option>
+                  <option value="gemini_web" disabled={!engineReady('gemini_web')}>
+                    Gemini web (Chrome profile){engineSuffix('gemini_web')}
+                  </option>
                   <option value="custom" disabled={!customApi?.configured}>
                     Custom API (online){customApi?.configured
                       ? ` — ${customApi.primary || customApi.model}${customApi.models.length > 1 ? ` +${customApi.models.length - 1} fallback` : ''}`
@@ -2438,6 +2448,8 @@ function App() {
                     ? 'Paid engine: every translated line is a billed API request. Uses the same key as the voice engine.'
                     : translationProvider === 'codecraft'
                       ? 'CodeCraft free tier: 1M tokens/month, no card required. Translation only — it has no voice engine.'
+                      : translationProvider === 'gemini_web'
+                        ? 'Gemini web: one Chrome window types a batch of subtitle lines into gemini.google.com and reads the answer. Signed-in profile only, nothing is uploaded, and it runs one batch at a time.'
                       : translationProvider === 'custom'
                         ? `Custom API: ${customApi?.base_url ?? 'not configured'}${customApi?.primary ? ` (${customApi.primary}${customApi.models.length > 1 ? ` +${customApi.models.length - 1} fallback` : ''})` : ''}. Every line is a request to that endpoint; it is used for translation only.`
                         : translationProvider === 'qwen'
