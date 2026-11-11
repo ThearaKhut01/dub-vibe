@@ -30,9 +30,8 @@ class SpeechUnavailableError(RuntimeError):
     """The voice engine answered but produced no audio for this voice/language.
 
     Distinct from a generic failure: it usually means the engine is having a
-    server-side problem with that language (Edge TTS returning no audio) or has no
-    installed voice for it (SAPI5). Callers use it to stop retrying the same engine
-    for every line and to explain the problem to the user.
+    server-side problem with that language (Edge TTS returning no audio). Callers use it to stop
+    retrying the same engine for every line and to explain the problem to the user.
     """
 
 
@@ -1769,143 +1768,6 @@ class HybridTranslationProvider(TranslationProvider):
         raise RuntimeError('No translation provider is available')
 
 
-# ---------------------------------------------------------------------------
-# TTS: pyttsx3 (local offline) with Edge TTS fallback
-# ---------------------------------------------------------------------------
-
-@lru_cache(maxsize=1)
-def _pyttsx3_available() -> bool:
-    """Return True if pyttsx3 is installed and can initialise an engine.
-
-    Cached because ``pyttsx3.init()`` creates a SAPI5/COM engine, which is
-    expensive and not something to repeat on every provider status poll.
-    """
-    try:
-        import importlib.util
-        if importlib.util.find_spec('pyttsx3') is None:
-            return False
-        import pyttsx3
-        engine = pyttsx3.init()
-        engine.stop()
-        return True
-    except Exception:
-        return False
-
-
-class Pyttsx3Provider(TextToSpeechProvider):
-    """Offline TTS using the Windows SAPI5 voices bundled with the OS.
-
-    Produces WAV files (zero external downloads required).
-
-    This is a blocking implementation (COM + ``runAndWait``); callers must not
-    run it directly on an asyncio event loop.
-    """
-
-    def synthesize(self, text: str, voice: str, output_path: str, language: str) -> dict:
-        # SAPI5 requires COM on the calling thread, and synthesis may run inside
-        # a worker thread (asyncio.to_thread) where COM is not initialised yet.
-        try:
-            import comtypes
-            comtypes.CoInitialize()
-        except Exception:
-            comtypes = None
-        try:
-            return self._synthesize(text, voice, output_path, language)
-        finally:
-            if comtypes is not None:
-                try:
-                    comtypes.CoUninitialize()
-                except Exception:
-                    pass
-
-    def _synthesize(self, text: str, voice: str, output_path: str, language: str) -> dict:
-        import pyttsx3
-
-        # Map DubVibe voice labels to pyttsx3 voice selection logic.
-        engine = pyttsx3.init()
-        voices = engine.getProperty('voices')
-
-        # Try to find a matching voice by language / gender heuristic.
-        lang_code = _resolve_lang_code(language)
-        is_female = 'female' in voice.lower()
-
-        selected_voice_id = None
-        # First pass: match language and gender.
-        for v in voices:
-            v_name = (v.name or '').lower()
-            v_langs = [lid.lower() for lid in (v.languages or [])] if v.languages else []
-            lang_match = any(lang_code in lid for lid in v_langs) or lang_code in v_name
-            gender_match = ('female' in v_name or 'zira' in v_name or 'hazel' in v_name) == is_female
-            if lang_match and gender_match:
-                selected_voice_id = v.id
-                break
-        # Second pass: match language only.
-        if selected_voice_id is None:
-            for v in voices:
-                v_name = (v.name or '').lower()
-                v_langs = [lid.lower() for lid in (v.languages or [])] if v.languages else []
-                if any(lang_code in lid for lid in v_langs) or lang_code in v_name:
-                    selected_voice_id = v.id
-                    break
-        # Fallback: use the first available voice.
-        if selected_voice_id is None and voices:
-            selected_voice_id = voices[0].id
-
-        if selected_voice_id:
-            engine.setProperty('voice', selected_voice_id)
-        engine.setProperty('rate', 160)
-
-        # pyttsx3 can only save WAV, so render there first, then place the audio at
-        # the caller's exact out_path. Writing to a different extension (the old
-        # behaviour) left the caller pointing at a file that did not exist.
-        wav_path = str(Path(output_path).with_suffix('.wav'))
-        Path(wav_path).parent.mkdir(parents=True, exist_ok=True)
-        engine.save_to_file(text, wav_path)
-        engine.runAndWait()
-        engine.stop()
-
-        final_path = output_path
-        rendered = Path(wav_path)
-        if not rendered.is_file():
-            raise RuntimeError('The Windows voice produced no audio file.')
-        try:
-            import shutil
-            ffmpeg = shutil.which('ffmpeg')
-            if ffmpeg and Path(output_path).suffix.lower() == '.mp3':
-                subprocess.run(
-                    [ffmpeg, '-y', '-i', wav_path, '-codec:a', 'libmp3lame', '-q:a', '4', output_path],
-                    check=True,
-                    capture_output=True,
-                )
-                rendered.unlink(missing_ok=True)
-            elif str(rendered) != str(output_path):
-                shutil.move(str(rendered), output_path)
-        except Exception:
-            # Keep the WAV, but still place it where the caller expects it.
-            import shutil
-            if str(rendered) != str(output_path) and rendered.is_file():
-                shutil.move(str(rendered), output_path)
-
-        # A Windows voice with no matching language still "saves" — as a header-only
-        # file with no audio frames. Report that as a failure so the chain can move on
-        # instead of shipping a silent dub.
-        if not _audio_has_sound(final_path):
-            Path(final_path).unlink(missing_ok=True)
-            raise SpeechUnavailableError(
-                f'The Windows voice cannot speak {language} '
-                '(no matching SAPI5 voice is installed).'
-            )
-
-        voice_name = selected_voice_id.split('\\')[-1] if selected_voice_id and '\\' in selected_voice_id else (selected_voice_id or voice)
-        return {
-            'provider': 'pyttsx3 (Offline)',
-            'voice': voice_name,
-            'text': text,
-            'output': final_path,
-            'status': 'ok',
-        }
-
-
 _MPEG1_KBPS: dict[int, tuple[int, ...]] = {
     3: (0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448),
     2: (0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384),
@@ -2203,51 +2065,6 @@ class EdgeTTSProvider(TextToSpeechProvider):
         }
 
 
-class HybridTTSProvider(TextToSpeechProvider):
-    """Try Edge TTS (online, higher quality) first, fall back to pyttsx3 (offline)."""
-
-    def __init__(self) -> None:
-        self._online = EdgeTTSProvider()
-        self._offline: TextToSpeechProvider | None = None
-        self._mode: str = 'online'
-
-        if _pyttsx3_available():
-            self._offline = Pyttsx3Provider()
-
-    @property
-    def active_mode(self) -> str:
-        return self._mode
-
-    async def synthesize(self, text: str, voice: str, output_path: str, language: str) -> dict:
-        # Try Edge TTS (online) first for better quality.
-        online_error: Exception | None = None
-        try:
-            result = await self._online.synthesize(text, voice, output_path, language)
-            self._mode = 'online'
-            return result
-        except Exception as error:
-            online_error = error
-            logger.info('Edge TTS failed (%s), trying offline fallback.', error)
-
-        # Fall back to pyttsx3 (offline). It is fully blocking, so keep it off
-        # the event loop inside a worker thread.
-        if self._offline is not None:
-            try:
-                result = await asyncio.to_thread(
-                    self._offline.synthesize, text, voice, output_path, language
-                )
-                self._mode = 'offline'
-                return result
-            except Exception as offline_error:
-                logger.warning('Offline TTS also failed: %s', offline_error)
-                raise RuntimeError(
-                    f'Both online (Edge TTS) and offline (pyttsx3) TTS failed. '
-                    f'Online: {online_error}  Offline: {offline_error}'
-                ) from offline_error
-
-        raise RuntimeError(f'Edge TTS failed and no offline TTS is available: {online_error}') from online_error
-
-
 # ---------------------------------------------------------------------------
 # Speaker detection (stub)
 # ---------------------------------------------------------------------------
@@ -2269,7 +2086,6 @@ def get_provider_status() -> list[dict]:
 
     whisper_ok = importlib.util.find_spec('faster_whisper') is not None
     argos_ok = _argos_available()
-    pyttsx3_ok = _pyttsx3_available()
     edge_ok = importlib.util.find_spec('edge_tts') is not None
     try:
         from . import qwen_local
@@ -2385,14 +2201,6 @@ def get_provider_status() -> list[dict]:
             'connected': demucs_ok,
             'primary': False,
             'fallback': False,
-        },
-        {
-            'id': 'pyttsx3',
-            'name': 'System TTS (SAPI5)',
-            'mode': 'LOCAL AI',
-            'connected': pyttsx3_ok,
-            'primary': False,
-            'fallback': pyttsx3_ok,
         },
         {
             'id': 'edge_tts',

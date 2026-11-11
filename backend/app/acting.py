@@ -8,7 +8,7 @@ Two analysis backends:
 The output is converted into provider-specific TTS instructions:
 - Gemini TTS: a natural-language style sentence spoken before the line.
 - OpenAI gpt-4o-mini-tts: the `instructions` field.
-- Edge/SAPI5: no real acting control — the instruction is intentionally None
+- Edge: no real acting control — the instruction is intentionally None
   (the capability table keeps this honest instead of faking pitch tweaks).
 """
 from __future__ import annotations
@@ -133,5 +133,5 @@ def style_instruction(provider: str, analysis: dict) -> str | None:
         if analysis.get('pause_before'):
             parts.append('leave a brief pause before speaking')
         return ', '.join(parts) + '.'
-    # Edge TTS / SAPI5 have no real acting control — do not fake it with pitch.
+    # Edge TTS has no real acting control — do not fake it with pitch.
     return None

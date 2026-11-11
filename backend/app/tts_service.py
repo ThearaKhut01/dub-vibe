@@ -3,7 +3,7 @@
 One service for every interface. Resolution order:
   1. Character profile override (provider + voice live on the character).
   2. Requested provider preference.
-  3. Quality-ordered fallback: gemini -> openai -> edge -> voxcpm2 -> sapi5.
+  3. Quality-ordered fallback: gemini -> openai -> edge -> voxcpm2.
 Language capability is checked per provider (Khmer is NOT claimed where the
 provider does not officially support it — it falls back to Edge TTS, which
 does support Khmer). voxcpm2 is an offline model limited to the languages it
@@ -33,7 +33,7 @@ from .online_providers import (
     openai_synthesize,
 )
 
-QUALITY_ORDER = ['gemini', 'openai', 'edge', 'voxcpm2', 'sapi5']
+QUALITY_ORDER = ['gemini', 'openai', 'edge', 'voxcpm2']
 OFFLINE_MULTILINGUAL_PROVIDERS = ('voxcpm2',)
 # After an engine reports "no audio" for a language, skip it for that language for
 # this long. Without this a 300-line project retries a dead voice 3x per line.
@@ -82,7 +82,7 @@ def language_supported(provider: str, lang_code: str) -> bool:
         from . import voxcpm_local
 
         return voxcpm_local.supports_language(lang)
-    return True  # Edge TTS (incl. Khmer) and SAPI5 carry their own voices
+    return True  # Edge TTS (incl. Khmer) carries its own voices
 
 
 def _default_voice(provider: str, requested: str | None) -> str:
@@ -105,7 +105,7 @@ def candidate_providers(pref: str, lang_code: str, profile: dict | None) -> list
         head.append(pref)
     ordered = head + [p for p in QUALITY_ORDER if p not in head]
     # Providers that cannot speak the target language are skipped entirely.
-    return [provider for provider in ordered if language_supported(provider, lang_code)] or ['edge', 'sapi5']
+    return [provider for provider in ordered if language_supported(provider, lang_code)] or ['edge']
 
 
 def _model_for(provider: str, model_pref: str | None) -> str | None:
@@ -172,17 +172,12 @@ def synthesize_line(text: str, out_path: str, *, provider_pref: str, language_na
                 from .voxcpm_local import VoxCPMProvider
 
                 VoxCPMProvider().synthesize(text, voice, out_path, language_name, speed=speed)
-            elif provider == 'sapi5':
-                from .providers import Pyttsx3Provider
-
-                Pyttsx3Provider().synthesize(text, voice, out_path, language_name)
             else:
                 attempts.append(f'{provider}: unknown provider')
                 continue
 
-            # A provider can "succeed" yet produce no audible audio — SAPI5 given
-            # Khmer text on an English-only Windows voice writes a header-only MP3.
-            # Accepting that silently is what made exports come out with no voice.
+            # A provider can "succeed" yet produce no audible audio — a header-only
+            # MP3 with no frames (that is what made exports come out with no voice).
             if not _has_audio(Path(out_path)):
                 attempts.append(f'{provider}: produced no audible audio')
                 Path(out_path).unlink(missing_ok=True)
@@ -291,7 +286,7 @@ def preview_line(text: str, *, provider: str, language_name: str, lang_code: str
         character.get('next'),
         character.get('name'),
         language_name,
-                    use_openai=use_openai_acting and provider not in ('sapi5', *OFFLINE_MULTILINGUAL_PROVIDERS),
+                    use_openai=use_openai_acting and provider not in OFFLINE_MULTILINGUAL_PROVIDERS,
     )
     if emotion and emotion != 'Auto':
         analysis = {**analysis, 'emotion': emotion, 'intensity': intensity}

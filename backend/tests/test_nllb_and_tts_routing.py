@@ -31,10 +31,9 @@ def test_unknown_language_is_refused():
         nllb_local.nllb_code('Klingon')
 
 
-def test_khmer_auto_order_tries_online_edge_before_offline_models():
+def test_khmer_auto_order_routes_to_edge():
     order = tts_service.candidate_providers('auto', 'km', None)
-    assert order[0] == 'edge'
-    assert 'sapi5' in order
+    assert order == ['edge']
 
 
 def test_english_never_routes_to_a_khmer_only_model():

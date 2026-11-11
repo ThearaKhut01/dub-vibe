@@ -295,7 +295,7 @@ def test_clip_records_the_engine_that_actually_produced_it(tmp_path, monkeypatch
 
     def fallback_synthesize_line(text, out_path, **kwargs):
         Path(out_path).write_bytes(b'mp3')
-        return {'provider': 'sapi5', 'voice': 'Female Voice B', 'path': out_path}
+        return {'provider': 'voxcpm2', 'voice': 'Speaker 1', 'path': out_path}
 
     monkeypatch.setattr(tts_service, 'synthesize_line', fallback_synthesize_line)
     entry = segment_tts.synthesize_segment(
@@ -303,13 +303,13 @@ def test_clip_records_the_engine_that_actually_produced_it(tmp_path, monkeypatch
         segment={'id': 'e1', 'start': 0.0, 'end': 2.0, 'speaker': 'Speaker 1', 'translation': 'សួស្តី'},
         previous=None, voice='Female Voice B', provider='edge', language_name='Khmer', lang_code='km',
     )
-    assert entry['voice'] == 'sapi5:Female Voice B'
+    assert entry['voice'] == 'voxcpm2:Speaker 1'
     assert not entry['voice'].startswith('edge:')
 
 
 def test_engine_of_clip_reads_the_engine_that_made_it():
     assert segment_tts.engine_of_clip({'voice': 'edge:Female Voice B'}) == 'edge'
-    assert segment_tts.engine_of_clip({'voice': 'sapi5:Female Voice B'}) == 'sapi5'
+    assert segment_tts.engine_of_clip({'voice': 'voxcpm2:Speaker 1'}) == 'voxcpm2'
 
 
 def test_engine_of_clip_falls_back_when_unrecorded():

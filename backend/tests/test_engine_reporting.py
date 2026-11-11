@@ -23,6 +23,6 @@ def test_no_clips_reports_none_not_edge():
 
 
 def test_fallback_is_never_reported_as_edge():
-    clips = [{'voice': 'sapi5:Female Voice B'}]
+    clips = [{'voice': 'gemini:Kore'}]
     assert main._engines_used(clips) != 'Edge TTS'
-    assert main._engines_used(clips) == 'sapi5'
+    assert main._engines_used(clips) == 'gemini'

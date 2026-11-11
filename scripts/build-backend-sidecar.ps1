@@ -64,7 +64,6 @@ $arguments = @(
   "--collect-all", "tokenizers",
   "--collect-all", "edge_tts",
   "--collect-all", "argostranslate",
-  "--collect-all", "pyttsx3",
   "--collect-all", "demucs",
   "--collect-all", "resemblyzer",
   "--collect-all", "webrtcvad",

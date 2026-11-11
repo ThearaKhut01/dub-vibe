@@ -256,7 +256,7 @@ async def health() -> dict[str, str]:
 
 @app.get('/api/providers')
 async def list_providers() -> list[ProviderSettings]:
-    # Provider probes (e.g. pyttsx3 COM init) can block; keep them off the event loop.
+    # Provider probes can block; keep them off the event loop.
     status = await run_in_threadpool(get_provider_status)
     return [ProviderSettings(**provider) for provider in status]
 
@@ -990,15 +990,6 @@ async def tts_capabilities(model: str | None = None) -> dict[str, Any]:
             'khmer_supported': True,
             'key_configured': True,
             'label': 'Edge TTS (free)',
-        },
-        'sapi5': {
-            'voices': [],
-            'emotions': [],
-            'style_control': False,
-            'languages': ['en', 'km'],
-            'khmer_supported': True,
-            'key_configured': True,
-            'label': 'System TTS (offline)',
         },
         'voxcpm2': {
             'voices': [],

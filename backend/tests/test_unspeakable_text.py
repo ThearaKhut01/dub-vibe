@@ -20,7 +20,6 @@ import pytest
 from backend.app import tts_service
 from backend.app.providers import (
     EdgeTTSProvider,
-    Pyttsx3Provider,
     UnspeakableTextError,
     _text_speakable,
 )
@@ -102,21 +101,14 @@ def test_edge_provider_still_synthesizes_speakable_text(monkeypatch, tmp_path):
 def test_unspeakable_line_raises_immediately_and_never_blacklists(monkeypatch, tmp_path):
     """A text-specific failure must not poison (engine, language) for the other lines."""
     edge_calls: list[str] = []
-    sapi_calls: list[str] = []
 
-    monkeypatch.setattr(tts_service, 'candidate_providers',
-                        lambda pref, lang, profile: ['edge', 'sapi5'])
+    monkeypatch.setattr(tts_service, 'candidate_providers', lambda pref, lang, profile: ['edge'])
 
     def unspeakable(self, text, voice, output_path, language):
         edge_calls.append(text)
         raise UnspeakableTextError('nothing speakable')
 
-    def never(self, text, voice, output_path, language):
-        sapi_calls.append(text)
-        raise AssertionError('sapi5 must not be tried for unspeakable text')
-
     monkeypatch.setattr(EdgeTTSProvider, 'synthesize', unspeakable)
-    monkeypatch.setattr(Pyttsx3Provider, 'synthesize', never)
 
     for tag in ('a', 'b'):
         with pytest.raises(UnspeakableTextError):
@@ -126,7 +118,6 @@ def test_unspeakable_line_raises_immediately_and_never_blacklists(monkeypatch, t
                 intensity=70, character_profile=None, analysis={},
             )
     assert len(edge_calls) == 2  # re-probed per line: a text problem, not an engine outage
-    assert sapi_calls == []
     assert tts_service._unavailable_until == {}
 
 

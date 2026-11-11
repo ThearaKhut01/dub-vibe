@@ -168,18 +168,19 @@ def test_unverifiable_container_is_accepted_without_ffprobe(tmp_path, no_ffprobe
 def test_synthesize_line_falls_through_when_a_provider_makes_no_audio(monkeypatch, tmp_path):
     """A provider that writes an empty file is skipped, and the next one is used."""
     import backend.app.providers as providers
+    from backend.app import voxcpm_local
 
-    monkeypatch.setattr(tts_service, 'candidate_providers', lambda pref, lang, profile: ['sapi5', 'edge'])
+    monkeypatch.setattr(tts_service, 'candidate_providers', lambda pref, lang, profile: ['voxcpm2', 'edge'])
 
-    def silent_sapi(self, text, voice, output_path, language):
+    def silent_voxcpm(self, text, voice, output_path, language, speed=1.0):
         Path(output_path).write_bytes(b'')
-        return {'provider': 'sapi5', 'voice': voice, 'output': output_path, 'status': 'ok'}
+        return {'provider': 'voxcpm2', 'voice': voice, 'output': output_path, 'status': 'ok'}
 
     async def good_edge(self, text, voice, output_path, language):
         Path(output_path).write_bytes(b'ID3' + b'\0' * 4000)
         return {'provider': 'Edge TTS', 'voice': voice, 'output': output_path, 'status': 'ok'}
 
-    monkeypatch.setattr(providers.Pyttsx3Provider, 'synthesize', silent_sapi)
+    monkeypatch.setattr(voxcpm_local.VoxCPMProvider, 'synthesize', silent_voxcpm)
     monkeypatch.setattr(providers.EdgeTTSProvider, 'synthesize', good_edge)
     monkeypatch.setattr(tts_service, '_has_audio', lambda path: Path(path).stat().st_size > 2000)
     monkeypatch.setattr(tts_service, 'strip_audio_silence', lambda path: None)
@@ -256,15 +257,19 @@ def test_reset_unavailable_lets_the_user_retry(monkeypatch, tmp_path):
 
 
 def test_all_engines_unavailable_gives_one_clear_sentence(monkeypatch, tmp_path):
-    monkeypatch.setattr(tts_service, 'candidate_providers', lambda pref, lang, profile: ['edge', 'sapi5'])
+    monkeypatch.setattr(tts_service, 'candidate_providers', lambda pref, lang, profile: ['edge', 'voxcpm2'])
 
-    from backend.app.providers import EdgeTTSProvider as RealEdge, Pyttsx3Provider as RealSapi
+    from backend.app import voxcpm_local
+    from backend.app.providers import EdgeTTSProvider as RealEdge
 
     def unavailable(self, text, voice, output_path, language):
         raise SpeechUnavailableError(f'engine cannot speak {language}')
 
+    def offline_unavailable(self, text, voice, output_path, language, speed=1.0):
+        raise SpeechUnavailableError(f'engine cannot speak {language}')
+
     monkeypatch.setattr(RealEdge, 'synthesize', unavailable)
-    monkeypatch.setattr(RealSapi, 'synthesize', unavailable)
+    monkeypatch.setattr(voxcpm_local.VoxCPMProvider, 'synthesize', offline_unavailable)
 
     with pytest.raises(SpeechUnavailableError) as info:
         tts_service.synthesize_line(

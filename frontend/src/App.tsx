@@ -96,7 +96,7 @@ const TARGET_LANGUAGES: Array<{ name: string; code: string }> = [
 ];
 
 /** Engine order used when the engine is "Auto" (mirrors tts_service.QUALITY_ORDER). */
-const VOICE_ENGINE_ORDER = ['gemini', 'openai', 'edge', 'voxcpm2', 'sapi5'] as const;
+const VOICE_ENGINE_ORDER = ['gemini', 'openai', 'edge', 'voxcpm2'] as const;
 
 const VOICE_ENGINE_LABELS: Record<string, string> = {
   gemini: 'Google Gemini TTS',
@@ -104,7 +104,6 @@ const VOICE_ENGINE_LABELS: Record<string, string> = {
   edge: 'Edge TTS',
   voxcpm2: 'VoxCPM2',
   voxcpm_clone: 'VoxCPM2 Voice Clone',
-  sapi5: 'System TTS',
 };
 
 /** Map the backend's audio_segments rows to the timeline's dub segments. */
@@ -1078,9 +1077,8 @@ function App() {
     if (activeStep.id === 'voice') {
       if (ttsProvider === 'edge') return new Set(['edge_tts']);
       if (ttsProvider === 'voxcpm2') return new Set(['voxcpm2']);
-      if (ttsProvider === 'sapi5') return new Set(['pyttsx3']);
       if (ttsProvider === 'gemini' || ttsProvider === 'openai') return new Set<string>();
-      return new Set(['edge_tts', 'pyttsx3']);
+      return new Set(['edge_tts']);
     }
     return new Set<string>();
   })();
@@ -1280,7 +1278,7 @@ function App() {
 
   const engineSupportsLanguage = (engine: string, language: string): boolean => {
     const caps = voiceCapabilities[engine];
-    if (!caps) return engine === 'edge' || engine === 'sapi5';
+    if (!caps) return engine === 'edge';
     return caps.languages.includes(languageCodeOf(language));
   };
 
@@ -1306,7 +1304,6 @@ function App() {
       if (voices.length > 0) return voices.map((voice) => ({ id: voice.id, label: voice.label }));
       return [{ id: 'auto', label: 'Default voice for this language' }];
     }
-    if (resolved === 'sapi5') return [{ id: 'auto', label: 'System voice (offline)' }];
     return [{ id: 'auto', label: "The model's own voice (no choice)" }];
   };
 
@@ -1750,7 +1747,7 @@ function App() {
                 ? 'Connecting to the local processing service...'
                 : apiAvailable === false
                   ? 'Local processing service is offline. Run npm run dev from the project folder. Video preview remains available.'
-                  : 'Transcription runs locally via Faster-Whisper. Translation: offline (Argos) or online (Google). TTS: online (Edge) with offline fallback (SAPI5).'}
+                  : 'Transcription runs locally via Faster-Whisper. Translation: offline (Argos) or online (Google). TTS: online (Edge), with VoxCPM2 as the offline fallback.'}
             </div>
 
             <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-white/10 bg-slate-900/80 p-4">
@@ -2340,7 +2337,6 @@ function App() {
                       ? 'VoxCPM2 Voice Clone (English) — download in AI Models'
                       : targetLanguage !== 'English' ? 'VoxCPM2 Voice Clone (English) — target must be English' : 'VoxCPM2 Voice Clone (English, own voice)'}
                   </option>
-                  <option value="sapi5">System TTS (offline)</option>
                 </select>
                 <p className="mt-1 text-[10px] leading-4 text-slate-500">
                   {ttsProvider === 'auto'
@@ -2697,7 +2693,6 @@ function App() {
                               <option value="gemini">Gemini</option>
                               <option value="openai">OpenAI</option>
                               <option value="edge">Edge</option>
-                              <option value="sapi5">System</option>
                             </select>
                             <select
                               value={currentVoice}
