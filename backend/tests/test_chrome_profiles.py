@@ -6,6 +6,7 @@ real ``%LOCALAPPDATA%\\Google\\Chrome`` folder and never need a browser.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -505,6 +506,46 @@ def test_resetting_the_session_profile_removes_it(monkeypatch: pytest.MonkeyPatc
 
     assert profile_manager.has_session_profile(profile) is False
 
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='the selector loop only exists on Windows')
+def test_playwright_gets_the_proactor_policy_and_the_previous_one_is_restored() -> None:
+    """Playwright cannot spawn its driver on a Windows selector loop."""
+    import asyncio
+
+    previous = asyncio.get_event_loop_policy()
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        with cp._playwright_loop_policy():
+            inside = asyncio.get_event_loop_policy()
+        after = asyncio.get_event_loop_policy()
+    finally:
+        asyncio.set_event_loop_policy(previous)
+
+    assert isinstance(inside, asyncio.WindowsProactorEventLoopPolicy)
+    assert isinstance(after, asyncio.WindowsSelectorEventLoopPolicy)
+
+
+def test_attach_shared_names_the_event_loop_when_the_driver_cannot_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A bare NotImplementedError from Playwright must not reach the UI as-is."""
+    import sys
+    import types
+
+    fake = types.ModuleType('playwright.sync_api')
+
+    def start() -> None:
+        raise NotImplementedError
+
+    fake.sync_playwright = start
+    monkeypatch.setitem(sys.modules, 'playwright.sync_api', fake)
+    profile_manager = cp.ChromeProfileManager(config_path=tmp_path / 'config.json',
+                                              sessions_dir=tmp_path / 'sessions')
+
+    with pytest.raises(cp.ChromeProfileError) as info:
+        profile_manager._attach_shared({'id': 'abc', 'profile_folder': 'Default'}, 9333)
+
+    assert 'event loop' in str(info.value)
 
 
 class _Node:

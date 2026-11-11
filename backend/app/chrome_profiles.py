@@ -25,6 +25,8 @@ cookies; this code never sees them.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -37,7 +39,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from backend.app.providers import get_storage_dir
 
@@ -103,6 +105,32 @@ class ChromeProfileError(RuntimeError):
     def __init__(self, message: str, status: str = 'error') -> None:
         super().__init__(message)
         self.status = status
+
+
+@contextlib.contextmanager
+def _playwright_loop_policy() -> Iterator[None]:
+    """Give Playwright a Windows event loop that can spawn its driver.
+
+    The sync API creates its own loop in the calling thread and starts the
+    Node.js driver with ``asyncio.create_subprocess_exec``. A Windows
+    ``SelectorEventLoop`` cannot start a subprocess and raises a *bare*
+    ``NotImplementedError`` — which is what uvicorn installs when it runs with
+    ``--reload`` (and ``run_server.py`` sets explicitly). Playwright creates the
+    loop inside ``sync_playwright().start()``, so the Proactor policy only has to
+    be in place for that one call; the policy is restored immediately after.
+    """
+    if sys.platform != 'win32':
+        yield
+        return
+    previous = asyncio.get_event_loop_policy()
+    if isinstance(previous, asyncio.WindowsProactorEventLoopPolicy):
+        yield
+        return
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    try:
+        yield
+    finally:
+        asyncio.set_event_loop_policy(previous)
 
 
 # --- local paths -------------------------------------------------------------
@@ -736,7 +764,11 @@ class ChromeProfileManager:
 
         from playwright.sync_api import sync_playwright  # imported lazily: optional dependency
 
-        playwright = sync_playwright().start()
+        try:
+            with _playwright_loop_policy():
+                playwright = sync_playwright().start()
+        except Exception as error:
+            raise ChromeProfileError(_launch_error_message(error), _launch_error_status(error)) from error
         try:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(user_data_dir),
@@ -924,7 +956,11 @@ class ChromeProfileManager:
         """Open the tool's own tab in the running window."""
         from playwright.sync_api import sync_playwright
 
-        playwright = sync_playwright().start()
+        try:
+            with _playwright_loop_policy():
+                playwright = sync_playwright().start()
+        except Exception as error:
+            raise ChromeProfileError(_launch_error_message(error), _launch_error_status(error)) from error
         try:
             browser = playwright.chromium.connect_over_cdp(f'http://127.0.0.1:{port}')
             context = browser.contexts[0] if browser.contexts else browser.new_context()
@@ -1093,6 +1129,13 @@ def _launch_error_status(error: Exception) -> str:
 def _launch_error_message(error: Exception) -> str:
     text = str(error)
     lowered = text.lower()
+    if isinstance(error, NotImplementedError):
+        # Playwright's driver cannot start on a Windows SelectorEventLoop; the
+        # exception itself carries no text, so name the cause here.
+        return (
+            'The browser driver could not start because the backend is running on the '
+            'Windows selector event loop. Restart the backend, then try again.'
+        )
     if 'already in use' in lowered or 'processsingleton' in lowered or 'singletonlock' in lowered:
         return LOCKED_MESSAGE
     if 'executable' in lowered and 'does not exist' in lowered:
