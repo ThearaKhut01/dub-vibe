@@ -15,10 +15,16 @@ what the Live tab draws.
 from __future__ import annotations
 
 import re
+import threading
 import time
 from typing import Any
 
 from backend.app import api_events, chrome_profiles
+# The same target-script check the keyed engines use. A browser answer can drift
+# into the source language (a mostly-Chinese batch makes Gemini answer English
+# lines in Chinese) or echo the source; such a line is a missing line, not a
+# translation, and must be re-asked before it reaches the dub.
+from backend.app.providers import _resolve_lang_code, _translation_script_ok
 
 PROMPT_SELECTORS = (
     'rich-textarea div.ql-editor[contenteditable="true"]',
@@ -38,6 +44,11 @@ POLL_INTERVAL_MS = 700
 # Closing the tab the instant the text stops growing loses that round trip (the
 # chat then never shows up in Gemini's history), so give it a moment first.
 CONVERSATION_SAVE_SECONDS = 2.5
+# One browser, one tab, one conversation at a time. Two prompts at once would
+# make the second launch close the first one's page, so every request in this
+# module waits for the lock — a batch that overlaps another would otherwise
+# fail and fall back to one-line chats.
+_ASK_LOCK = threading.Lock()
 CONVERSATION_ID = re.compile(r'/app/[0-9a-z]{6,}', re.IGNORECASE)
 # Gemini inserts zero-width spaces between Khmer syllables; subtitles should not
 # carry them (they break wrapping and look like typos in an editor).
@@ -48,6 +59,9 @@ MODEL_LABEL = 'gemini.google.com'
 # Gemini web answers a numbered list reliably up to about this many lines; more
 # than that and it starts merging or skipping entries.
 BATCH_SIZE = 20
+# When a batch answer skips lines (or drifts to Thai/Chinese), retrying the same
+# large group can skip them again. Small groups are far more reliable.
+RETRY_BATCH_SIZE = 5
 MIN_BATCH_SECONDS = 120.0
 
 
@@ -83,6 +97,12 @@ def clean_chat_titles(raw: list[str], limit: int = 20) -> list[str]:
 
 def recent_chats(limit: int = 20) -> list[str]:
     """The chats this profile can see in Gemini's sidebar (the tool's runs included)."""
+    # Never open a second session while a prompt is being answered.
+    with _ASK_LOCK:
+        return _recent_chats(limit)
+
+
+def _recent_chats(limit: int) -> list[str]:
     manager = chrome_profiles.manager()
     with manager.launch_selected_profile() as session:
         page = session.page
@@ -116,12 +136,15 @@ def srt_time(seconds: float) -> str:
 
 def build_batch_prompt(lines: list[str], target_language: str = 'Khmer', source_language: str = '',
                        glossary: str = '', cues: list[tuple[float, float]] | None = None,
-                       context: list[str] | None = None) -> str:
+                       context: list[str] | None = None, strict: bool = False) -> str:
     """One message for a whole subtitle batch.
 
     With ``cues`` the batch is sent as SRT blocks — number, timecode, text — so the
     model can see how long each line has to be spoken and keep the translation
     short enough. Without cues it falls back to a plain numbered list.
+
+    ``strict`` is used for the retry of lines whose first answer was in the wrong
+    language: it repeats that every block must be rewritten in the target.
     """
     source = f' from {source_language}' if source_language else ''
     terms = str(glossary or '').strip()
@@ -131,6 +154,23 @@ def build_batch_prompt(lines: list[str], target_language: str = 'Khmer', source_
         ' Previous lines, for context only — do not translate them: '
         + ' | '.join(earlier) + '.'
     ) if earlier else ''
+    # The source may mix languages (Chinese dialogue with English names, or a
+    # subtitle file with both). Saying so up front stops the model from carrying
+    # the source language into the answer, which is the most common failure on a
+    # long film.
+    script_part = (
+        f'Every answer must be written in {target_language}, even when a source line is already in '
+        'another language. Never copy a source line unchanged, never answer in a different language, '
+        'and never reply with an apology, a note, or an explanation.'
+    )
+    guard = _script_guard(target_language)
+    if guard:
+        script_part += f' {guard}'
+    if strict:
+        script_part += (
+            f' The previous attempt for some blocks was not in {target_language}: '
+            f'translate every block again, each answer in {target_language} only.'
+        )
 
     if cues and len(cues) == len(lines):
         blocks = '\n\n'.join(
@@ -142,7 +182,8 @@ def build_batch_prompt(lines: list[str], target_language: str = 'Khmer', source_
             'Keep each block number and its timecode exactly as they are and replace only the text. '
             'The timecode tells you how long the line is spoken: keep the translation short enough to be said in '
             'that time, without adding words the speaker did not say. '
-            f'Reply with the blocks only — no notes, no quotes, no explanations.{glossary_part}{context_part}\n\n'
+            f'Reply with the blocks only — no notes, no quotes, no explanations. '
+            f'{script_part}{glossary_part}{context_part}\n\n'
             f'{blocks}'
         )
 
@@ -151,12 +192,27 @@ def build_batch_prompt(lines: list[str], target_language: str = 'Khmer', source_
         f'Translate each numbered subtitle line{source} into {target_language}. '
         'Reply with one line per item, each starting with its number and a period — '
         'for example "1. <translation>" — in the same order, never merged, never skipped. '
-        f'No quotes, no transliteration, no notes, no explanations.{glossary_part}{context_part}\n'
+        f'No quotes, no transliteration, no notes, no explanations. '
+        f'{script_part}{glossary_part}{context_part}\n'
         f'{numbered}'
     )
 
 
 _NUMBERED = re.compile(r'^\s*(\d{1,3})\s*[.)\]:-]\s*(.+?)\s*$', re.MULTILINE)
+
+# Gemini confuses Khmer with Thai on Chinese sources (both scripts are
+# Indic-derived), and a Thai answer is worthless for a Khmer dub. Naming the
+# wrong script and showing a Khmer sample anchors it; verified live.
+_SCRIPT_GUARDS = {
+    'km': (
+        'Use Khmer (Cambodian) Unicode letters — for example សួស្តី — '
+        'never Thai letters (ก ข ค ง), Chinese characters, or English words.'
+    ),
+}
+
+
+def _script_guard(target_language: str) -> str:
+    return _SCRIPT_GUARDS.get(_resolve_lang_code(target_language), '')
 
 
 def parse_numbered_answer(reply: str, count: int) -> list[str | None]:
@@ -200,6 +256,52 @@ def parse_numbered_answer(reply: str, count: int) -> list[str | None]:
     return [None] * count
 
 
+def _answer_is_translation(value: str | None, source: str, target_language: str) -> bool:
+    """True when the answer is a real translation, not the source or a refusal.
+
+    Gemini drifts on mixed-language batches: a mostly-Chinese film makes it answer
+    the English lines in Chinese, echo them unchanged, or apologise. Those lines
+    must go back into the retry batch instead of reaching the dub.
+    """
+    if value is None or not str(value).strip():
+        return False
+    return _translation_script_ok(str(value), source, '', target_language)
+
+
+def _retry_indices(
+    automator: Any,
+    parsed: list[str | None],
+    batch: list[str],
+    indices: list[int],
+    target_language: str,
+    source_language: str,
+    glossary: str,
+    batch_cues: list[tuple[float, float]] | None,
+    timeout_s: float,
+) -> None:
+    """Re-ask for `indices` in one message and keep only valid translations."""
+    if not indices:
+        return
+    retry_cues = [batch_cues[index] for index in indices] if batch_cues else None
+    try:
+        retry = automator.ask(
+            build_batch_prompt(
+                [batch[index] for index in indices], target_language, source_language,
+                glossary, cues=retry_cues, strict=True,
+            ),
+            timeout_s=timeout_s,
+            lines=len(indices),
+        )
+    except Exception:
+        return
+    if not retry.get('success'):
+        return
+    again = parse_numbered_answer(retry.get('reply', ''), len(indices))
+    for slot, index in enumerate(indices):
+        if _answer_is_translation(again[slot], batch[index], target_language):
+            parsed[index] = again[slot]
+
+
 def translate_lines(
     lines: list[str],
     target_language: str = 'Khmer',
@@ -211,8 +313,10 @@ def translate_lines(
 ) -> list[str | None]:
     """Translate subtitle lines through the selected profile, one message per batch.
 
-    A line the answer skipped is retried once on its own; if it is still missing
-    the entry stays ``None`` so the caller can fall back for that line only.
+    A line the answer skipped, or answered in the wrong language, is retried in
+    one message with the rest of the bad lines (split into small groups when the
+    group is large); if it is still missing the entry stays ``None`` so the caller
+    can report it instead of dubbing it.
     """
     automator = GeminiWebAutomator()
     results: list[str | None] = []
@@ -225,28 +329,45 @@ def translate_lines(
         if not answer.get('success'):
             raise GeminiWebError(str(answer.get('message') or 'Gemini web did not answer.'), answer.get('status', 'error'))
         parsed = parse_numbered_answer(answer.get('reply', ''), len(batch))
-        missing = [index for index, item in enumerate(parsed) if item is None]
-        if missing:
-            # One more message for whatever the answer skipped: a per-line retry
-            # would cost a full round trip (and a chat) for every line.
-            retry = automator.ask(
-                build_batch_prompt([batch[index] for index in missing], target_language, source_language, glossary),
-                timeout_s=timeout_s,
-                lines=len(missing),
-            )
-            if retry.get('success'):
-                again = parse_numbered_answer(retry.get('reply', ''), len(missing))
-                for slot, index in enumerate(missing):
-                    if again[slot] is not None:
-                        parsed[index] = again[slot]
+        invalid = [
+            index for index, item in enumerate(parsed)
+            if not _answer_is_translation(item, batch[index], target_language)
+        ]
+        # A wrong-language answer is not a translation: drop it before the retry,
+        # otherwise it would survive whenever the retry also fails.
+        for index in invalid:
+            parsed[index] = None
+        if invalid:
+            # Re-ask for whatever the answer skipped or wrote in the wrong
+            # language. One message for a handful of lines; a large group is
+            # split into small groups, because the same size that failed once
+            # tends to fail again. Still a few chats, never one per line.
+            if len(invalid) <= RETRY_BATCH_SIZE * 2:
+                groups = [invalid]
+            else:
+                groups = [
+                    invalid[position:position + RETRY_BATCH_SIZE]
+                    for position in range(0, len(invalid), RETRY_BATCH_SIZE)
+                ]
+            for group in groups:
+                _retry_indices(
+                    automator, parsed, batch, group, target_language, source_language,
+                    glossary, batch_cues, timeout_s,
+                )
         # Last resort, capped: a single line at a time for at most three lines.
-        for index in [slot for slot, item in enumerate(parsed) if item is None][:3]:
+        leftovers = [
+            index for index, item in enumerate(parsed)
+            if not _answer_is_translation(item, batch[index], target_language)
+        ][:3]
+        for index in leftovers:
             single = automator.ask(
                 build_translation_prompt(batch[index], target_language, source_language),
                 timeout_s=timeout_s,
             )
             if single.get('success'):
-                parsed[index] = str(single.get('reply') or '').strip().strip('"“”') or None
+                candidate = str(single.get('reply') or '').strip().strip('"“”') or None
+                if _answer_is_translation(candidate, batch[index], target_language):
+                    parsed[index] = candidate
         results.extend(parsed)
     return results
 
@@ -258,10 +379,13 @@ def build_translation_prompt(text: str, target_language: str = 'Khmer', source_l
     instruction asks for the translation only and forbids commentary.
     """
     source = f' from {source_language}' if source_language else ''
+    guard = _script_guard(target_language)
+    guard_part = f' {guard}' if guard else ''
     return (
-        f'Translate this subtitle line{source} into {target_language}. '
-        'Reply with the translation only — no quotes, no transliteration, no notes, '
-        'no explanation, nothing else.\n'
+        f'Translate this subtitle line{source} into {target_language}, even if the line is already in '
+        'another language. '
+        f'Reply with the translation only — written in {target_language}, no quotes, no transliteration, '
+        f'no notes, no explanation, nothing else.{guard_part}\n'
         f'Line: {text}'
     )
 
@@ -323,6 +447,11 @@ class GeminiWebAutomator:
         return result
 
     def _ask_in_profile(self, text: str, timeout_s: float) -> dict[str, Any]:
+        # One browser session at a time: launching another closes this one's page.
+        with _ASK_LOCK:
+            return self._ask_locked(text, timeout_s)
+
+    def _ask_locked(self, text: str, timeout_s: float) -> dict[str, Any]:
         try:
             with self.manager.launch_selected_profile() as session:
                 page = session.page
@@ -490,12 +619,29 @@ def _last_answer_text(page: Any) -> str:
         try:
             locator = page.locator(selector)
             if locator.count() > 0:
-                text = locator.last.inner_text().strip()
+                text = _clean_answer_text(locator.last.inner_text())
                 if text:
-                    # Gemini prefixes its answers with a "Gemini said" label.
-                    text = re.sub(r'^Gemini\s+said\s*\n+', '', text, flags=re.IGNORECASE)
-                    text = _ZERO_WIDTH.sub('', text)
-                    return re.sub(r'\n{3,}', '\n\n', text).strip()
+                    return text
         except Exception:
             continue
     return ''
+
+
+# While Gemini works it renders its activity line ("Translating English to Khmer
+# subtitles") and the "Gemini said" label before the answer itself. That header
+# is stable for a few polls, so without this guard it was read as the answer on
+# long batches — and every line in the batch then looked untranslated.
+_STATUS_LINE = re.compile(
+    r'^(?:gemini\s+said|translating\b.*|thinking\b.*|analysing\b.*|analyzing\b.*'
+    r'|generating\b.*|searching\b.*|show thinking|stop response|working\b.*)$',
+    re.IGNORECASE,
+)
+
+
+def _clean_answer_text(raw: str) -> str:
+    """Drop Gemini's status header and keep the answer body."""
+    text = _ZERO_WIDTH.sub('', str(raw or ''))
+    lines = text.splitlines()
+    while lines and (not lines[0].strip() or _STATUS_LINE.match(lines[0].strip())):
+        lines.pop(0)
+    return re.sub(r'\n{3,}', '\n\n', '\n'.join(lines)).strip()

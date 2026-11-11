@@ -7,6 +7,8 @@ records one success.
 """
 from __future__ import annotations
 
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -163,6 +165,46 @@ def test_an_empty_answer_is_not_reported_as_success(monkeypatch: pytest.MonkeyPa
     assert 'no answer appeared' in result['message']
 
 
+def test_concurrent_prompts_wait_for_the_single_browser(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second prompt must not launch a session that closes the first one's page."""
+    monkeypatch.setattr(chrome_profiles, 'playwright_available', lambda: True)
+    monkeypatch.setattr(chrome_profiles, 'gemini_state', lambda page: ('ready', 'signed in', page.url))
+
+    state = {'active': 0, 'peak': 0}
+    guard = threading.Lock()
+
+    class GuardedSession(_Session):
+        def __enter__(self) -> 'GuardedSession':
+            with guard:
+                state['active'] += 1
+                state['peak'] = max(state['peak'], state['active'])
+            time.sleep(0.05)
+            return self
+
+        def __exit__(self, *_exc) -> None:
+            with guard:
+                state['active'] -= 1
+            return None
+
+    class GuardedManager(_Manager):
+        def launch_selected_profile(self, headless=None) -> _Session:
+            return GuardedSession(self.page)
+
+    results: list[dict] = []
+
+    def run() -> None:
+        results.append(gemini_web.GeminiWebAutomator(GuardedManager(_FakePage())).ask(SUBTITLE))
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert state['peak'] == 1, 'two browser sessions were open at the same time'
+    assert [result['success'] for result in results] == [True, True]
+
+
 def test_translation_prompt_asks_for_the_line_only() -> None:
     prompt = gemini_web.build_translation_prompt('Hello', 'Khmer')
 
@@ -180,6 +222,34 @@ def test_the_gemini_said_label_is_not_part_of_the_answer(monkeypatch: pytest.Mon
     result = gemini_web.GeminiWebAutomator(_Manager(page)).ask(SUBTITLE)
 
     assert result['reply'] == 'យប់មិញអ្នកនៅឯណា?'
+
+
+def test_a_status_header_is_not_read_as_the_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gemini's "Translating..." line is stable before the answer exists."""
+    monkeypatch.setattr(chrome_profiles, 'playwright_available', lambda: True)
+    monkeypatch.setattr(chrome_profiles, 'gemini_state', lambda page: ('ready', 'signed in', page.url))
+    monkeypatch.setattr(gemini_web, 'MIN_ANSWER_SECONDS', 5.0)
+
+    class HeaderPage(_FakePage):
+        def __init__(self) -> None:
+            super().__init__(answer='')
+            self.reads = 0
+
+        @property
+        def answer(self) -> str:
+            self.reads += 1
+            if self.reads <= 3:
+                return 'Translating English to Khmer subtitles\nGemini said'
+            return ANSWER
+
+        @answer.setter
+        def answer(self, value: str) -> None:
+            self._answer = value
+
+    result = gemini_web.GeminiWebAutomator(_Manager(HeaderPage())).ask(SUBTITLE)
+
+    assert result['success'] is True
+    assert result['reply'] == ANSWER
 
 
 def test_a_batch_prompt_numbers_every_line() -> None:
@@ -257,6 +327,70 @@ def test_the_skipped_lines_are_retried_in_one_message(monkeypatch: pytest.Monkey
 
     assert results == ['យប់មិញអ្នកនៅឯណា?', 'ខ្ញុំនៅការិយាល័យ។']
     assert len(calls) == 2, 'the batch, then one retry message — not one per line'
+
+
+def test_the_prompt_forbids_carrying_the_source_language_over() -> None:
+    prompt = gemini_web.build_batch_prompt(['Well played boy'], 'Khmer', 'Chinese')
+
+    assert 'even when a source line is already in another language' in prompt
+    assert 'Never copy a source line unchanged' in prompt
+
+
+def test_a_wrong_language_answer_is_retried_in_one_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Chinese/English answer must not be accepted as Khmer — ask again once."""
+    calls: list[str] = []
+
+    class FakeAutomator:
+        def ask(self, prompt, timeout_s=180.0, lines=1):
+            calls.append(prompt)
+            if 'previous attempt' in prompt:
+                return {'success': True, 'reply': '1. លេងបានល្អណាស់ កូនក្មេង។'}
+            # First answer: line 1 came back in Chinese, line 2 in Khmer.
+            return {'success': True, 'reply': '1. 做得好，小子\n2. មកដល់ហើយ។'}
+
+    monkeypatch.setattr(gemini_web, 'GeminiWebAutomator', FakeAutomator)
+
+    results = gemini_web.translate_lines(['Well played boy', 'We are here.'], 'Khmer')
+
+    assert results == ['លេងបានល្អណាស់ កូនក្មេង។', 'មកដល់ហើយ។']
+    assert len(calls) == 2, 'the wrong line is retried inside one batch message'
+
+
+def test_a_large_skipped_group_is_retried_in_small_batches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 20-line answer that skips most lines must not be re-asked as 20 again."""
+    calls: list[int] = []
+
+    class FakeAutomator:
+        def ask(self, prompt, timeout_s=180.0, lines=1):
+            calls.append(lines)
+            if lines > gemini_web.RETRY_BATCH_SIZE * 2:
+                return {'success': True, 'reply': '1. បន្ទាត់ទី១'}
+            body = '\n'.join(f'{index}. បន្ទាត់ទី{index}' for index in range(1, lines + 1))
+            return {'success': True, 'reply': body}
+
+    monkeypatch.setattr(gemini_web, 'GeminiWebAutomator', FakeAutomator)
+
+    results = gemini_web.translate_lines([f'line {index}' for index in range(20)], 'Khmer')
+
+    assert all(results), 'every line must be filled by the small retry groups'
+    assert calls[0] == 20
+    assert all(size <= gemini_web.RETRY_BATCH_SIZE for size in calls[1:]), calls
+
+
+def test_an_echoed_or_refused_line_is_not_returned_as_a_translation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The source copied back and an apology are missing lines, never subtitles."""
+
+    class FakeAutomator:
+        def ask(self, prompt, timeout_s=180.0, lines=1):
+            if prompt.startswith('Translate this subtitle line'):
+                return {'success': True, 'reply': "I'm having a hard time fulfilling your request."}
+            return {'success': True, 'reply': '1. Now it is time to die'}
+
+    monkeypatch.setattr(gemini_web, 'GeminiWebAutomator', FakeAutomator)
+
+    results = gemini_web.translate_lines(["Now it's time to die"], 'Khmer')
+
+    assert results == [None], 'a copied English line would be dubbed as English'
 
 
 def test_the_browser_engine_has_its_own_cache_namespace() -> None:

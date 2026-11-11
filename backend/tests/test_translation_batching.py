@@ -6,6 +6,8 @@ completion, exactly as a real engine's answer would be.
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
 
 import pytest
 
@@ -496,3 +498,93 @@ def test_route_falls_back_to_one_line_for_an_unfilled_batch(monkeypatch, tmp_pat
 
     assert single == ['Bye'], 'only the missing line goes through the single-line path'
     assert [item['translation'] for item in payload['translation']] == ['សួស្តី', 'លាហើយ']
+
+
+def test_browser_batches_never_run_in_parallel(monkeypatch, tmp_path):
+    """One Chrome tab serves one batch: a second one closes the first page."""
+    texts = [f'line {index}' for index in range(90)]
+    main, project_id = _prepare_project(monkeypatch, tmp_path, texts)
+    state = {'active': 0, 'peak': 0}
+    guard = threading.Lock()
+
+    class FakeTranslator:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def check_preferred_engine(self, *args, **kwargs) -> None:
+            return None
+
+        def first_engine(self) -> str:
+            return 'gemini_web'
+
+        def supports_batch(self) -> bool:
+            return True
+
+        def max_parallel_lines(self) -> int:
+            return 1
+
+        def translate_batch(self, lines, **kwargs):
+            with guard:
+                state['active'] += 1
+                state['peak'] = max(state['peak'], state['active'])
+            time.sleep(0.05)
+            with guard:
+                state['active'] -= 1
+            return [f'បកប្រែ {line}' for line in lines]
+
+        def translate(self, *args, **kwargs):
+            raise AssertionError('no one-line calls expected for a browser engine')
+
+    monkeypatch.setattr(main, 'HybridTranslationProvider', FakeTranslator)
+    try:
+        from fastapi.testclient import TestClient
+
+        response = TestClient(main.app).post(
+            '/api/process/translate', json={'project_id': project_id, 'target_language': 'Khmer'},
+        )
+        assert response.status_code == 200, response.text
+    finally:
+        main.projects.pop(project_id, None)
+
+    assert state['peak'] == 1, 'browser batches overlapped and would close each other'
+
+
+def test_browser_engine_does_not_retry_leftovers_one_chat_per_line(monkeypatch, tmp_path):
+    """A browser engine opens a new chat per request: never fall back per line."""
+    main, project_id = _prepare_project(monkeypatch, tmp_path, ['Hello', 'Bye'])
+
+    class FakeTranslator:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def check_preferred_engine(self, *args, **kwargs) -> None:
+            return None
+
+        def first_engine(self) -> str:
+            return 'gemini_web'
+
+        def supports_batch(self) -> bool:
+            return True
+
+        def max_parallel_lines(self) -> int:
+            return 1
+
+        def translate_batch(self, lines, **kwargs):
+            return ['សួស្តី', None]
+
+        def translate(self, *args, **kwargs):
+            raise AssertionError('the browser must not get one chat per line')
+
+    monkeypatch.setattr(main, 'HybridTranslationProvider', FakeTranslator)
+    try:
+        from fastapi.testclient import TestClient
+
+        response = TestClient(main.app).post(
+            '/api/process/translate', json={'project_id': project_id, 'target_language': 'Khmer'},
+        )
+    finally:
+        main.projects.pop(project_id, None)
+
+    assert response.status_code == 502
+    assert 'did not answer every line' in response.json()['detail']
+    assert 'Press Translate again' in response.json()['detail']

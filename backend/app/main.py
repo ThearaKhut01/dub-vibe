@@ -62,6 +62,7 @@ from backend.app import acting, api_events, api_keys, chrome_profiles, cuda_pack
 from backend.app import segment_tts
 from backend.app.models import ProjectRequest, ProjectSummary, ProviderSettings, ProcessingRequest, SegmentSplit, SegmentUpdate, WorkflowProgress
 from backend.app.providers import (
+    BROWSER_TRANSLATION_ENGINES,
     EDGE_LANGUAGE_VOICES,
     FasterWhisperProvider,
     HybridTranslationProvider,
@@ -2402,6 +2403,28 @@ def _translation_tone(emotion: str | None) -> str:
     return f'{label.lower()}, consistent across the scene'
 
 
+def _translation_batch_workers(translator: Any, total_batches: int) -> int:
+    """How many batches may run at once for this engine.
+
+    A browser or a local model serves one request at a time. A second batch
+    would close the first one's page (or fight for the model), that batch would
+    fail, and the run would fall back to one request per line — which on the
+    Gemini web path means one new chat per subtitle line. Paid keyed endpoints
+    can overlap two batches safely, so they keep the old parallelism.
+    """
+    if total_batches <= 1:
+        return 1
+    limit = 2
+    if hasattr(translator, 'max_parallel_lines'):
+        try:
+            limit = min(limit, max(1, int(translator.max_parallel_lines())))
+        except Exception:
+            limit = 1
+    elif getattr(translator, 'first_engine', lambda: None)() in ('google', 'nllb', 'qwen'):
+        limit = 1
+    return max(1, min(limit, total_batches))
+
+
 @app.post('/api/process/translate')
 async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
     project = projects.get(payload.project_id)
@@ -2576,8 +2599,10 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
             return batch, result, local
 
         total_batches = len(batches)
-        # Two batches at a time: enough to hide latency, well under the rate limit.
-        with ThreadPoolExecutor(max_workers=min(2, total_batches)) as pool:
+        # One browser or one local model serves one batch at a time; paid keyed
+        # endpoints can overlap two. See _translation_batch_workers.
+        batch_workers = _translation_batch_workers(translator, total_batches)
+        with ThreadPoolExecutor(max_workers=batch_workers) as pool:
             futures = [pool.submit(run_batch, batch) for batch in batches]
             for completed, future in enumerate(as_completed(futures), start=1):
                 try:
@@ -2611,6 +2636,15 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
                 )
 
         # 2) Lines a batch could not fill: the old one-line request, for those only.
+        # A browser engine opens a new chat for every request, so retrying the
+        # leftovers line by line would flood the account with chats (and each
+        # chat costs a full answer). The batch already gave every line its
+        # retry; the run reports what is left and the next press of Translate
+        # resumes it as a batch.
+        if translator.first_engine() in BROWSER_TRANSLATION_ENGINES:
+            if remaining and first_error is None:
+                first_error = RuntimeError('the browser did not answer every line in this run')
+            return
         for text in [item for item in ordered if item in remaining]:
             try:
                 value = translator.translate(text, payload.target_language, source_language)
