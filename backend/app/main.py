@@ -68,12 +68,15 @@ from backend.app.providers import (
     HybridTranslationProvider,
     TRANSLATION_CONTEXT_LINES,
     _resolve_lang_code,
+    _translation_script_ok,
     edge_gender_voice,
     edge_voice_options,
     get_app_root,
     get_provider_status,
     get_storage_dir,
     split_translation_batches,
+    _text_snippet,
+    UnspeakableTextError,
 )
 
 app = FastAPI(title='DubVibe Studio API', version='0.1.0')
@@ -2197,6 +2200,31 @@ async def process_separate(payload: ProcessingRequest) -> dict[str, Any]:
     return {'project_id': payload.project_id, 'status': 'ok', 'stems': project['stems'], 'message': final_message}
 
 
+_MAJORITY_SHARE = 0.6
+
+
+def _majority_language(languages: list[str]) -> str | None:
+    """The language most transcription chunks detected, when it clearly dominates.
+
+    A film has one spoken language, but Whisper re-detects per chunk and a
+    song-heavy chunk flips to another language (an ending theme transcribed as
+    English). The dominant detection is the film's language; a detection split
+    below this share is too even to trust, so the per-chunk results stay.
+    """
+    counts: dict[str, int] = {}
+    for code in languages:
+        counts[code] = counts.get(code, 0) + 1
+    if not counts:
+        return None
+    best = max(counts.values())
+    if best < _MAJORITY_SHARE * len(languages):
+        return None
+    for code in languages:
+        if counts[code] == best:
+            return code
+    return None
+
+
 @app.post('/api/process/transcribe')
 async def process_transcribe(payload: ProcessingRequest) -> dict[str, Any]:
     project = projects.get(payload.project_id)
@@ -2267,11 +2295,11 @@ async def process_transcribe(payload: ProcessingRequest) -> dict[str, Any]:
     try:
         if chunks:
             merged_segments: list[dict[str, Any]] = []
-            detected_language: str | None = None
             total = len(chunks)
             cancelled = False
+            chunk_results: list[dict[str, Any]] = []
             for index, chunk in enumerate(chunks):
-                result = await run_in_threadpool(
+                chunk_result = await run_in_threadpool(
                     stt.transcribe,
                     str(chunk['path']),
                     make_reporter(index, total, float(chunk.get('duration') or 0)),
@@ -2280,10 +2308,48 @@ async def process_transcribe(payload: ProcessingRequest) -> dict[str, Any]:
                     payload.beam_size,
                     payload.word_timestamps,
                 )
-                if detected_language is None:
-                    detected_language = result['language']
+                chunk_results.append(chunk_result)
+                if chunk_result.get('cancelled'):
+                    cancelled = True
+                    break
+            # One film, one spoken language. Whisper re-detects per chunk, and a
+            # song-heavy chunk (opening/ending theme) flips to another language —
+            # the transcript then changes script mid-film: Chinese dialogue, then
+            # "I'm nothing I..." hallucinated over the ending song. The dominant
+            # detection is the film's language, so the divergent chunks are
+            # re-decoded with it forced. Skipped when the user picked the language
+            # (every chunk is already forced) or when detections split too evenly
+            # to call a majority.
+            majority = (
+                _majority_language([item['language'] for item in chunk_results if item.get('language')])
+                if not language and not cancelled
+                else None
+            )
+            if majority:
+                for index, chunk in enumerate(chunks[:len(chunk_results)]):
+                    if chunk_results[index].get('language') == majority:
+                        continue
+                    await emit_progress(
+                        payload.project_id, 'Transcribing', 18 + int(38 * index / total),
+                        f'Part {index + 1} of {total} was detected as {chunk_results[index]["language"]}; '
+                        f're-decoding it in {majority}...',
+                    )
+                    redone = await run_in_threadpool(
+                        stt.transcribe,
+                        str(chunk['path']),
+                        make_reporter(index, total, float(chunk.get('duration') or 0)),
+                        should_cancel,
+                        majority,
+                        payload.beam_size,
+                        payload.word_timestamps,
+                    )
+                    if redone.get('cancelled'):
+                        cancelled = True
+                        break  # keep the chunk's first pass
+                    chunk_results[index] = redone
+            for index, chunk in enumerate(chunks[:len(chunk_results)]):
                 offset = float(chunk.get('start') or 0)
-                for segment in result['segments']:
+                for segment in chunk_results[index]['segments']:
                     merged_segments.append({
                         'id': f'seg_{len(merged_segments) + 1}',
                         'start': round(float(segment['start']) + offset, 3),
@@ -2291,13 +2357,13 @@ async def process_transcribe(payload: ProcessingRequest) -> dict[str, Any]:
                         'speaker': segment.get('speaker', 'Speaker 1'),
                         'text': segment['text'],
                     })
-                if result.get('cancelled'):
-                    cancelled = True
-                    break
+            detected = majority or next(
+                (item.get('language') for item in chunk_results if item.get('language')), None
+            )
             result = {
                 'provider': 'Faster-Whisper',
                 'model': model_id,
-                'language': detected_language or 'en',
+                'language': detected or 'en',
                 'segments': merged_segments,
                 'source_file': media_path,
                 'chunks': total,
@@ -2425,6 +2491,19 @@ def _translation_batch_workers(translator: Any, total_batches: int) -> int:
     return max(1, min(limit, total_batches))
 
 
+def _translation_ok(source_text: str, translation: str, source_language: str, target_language: str) -> bool:
+    """True when `translation` is plausibly a translation of `source_text`.
+
+    The same script check the engines are held to at translate time, applied to
+    saved lines and cache hits: the untranslated source echoed back, or English
+    kept on a Khmer dub, is re-translated instead of trusted forever.
+    """
+    saved = str(translation or '').strip()
+    if not saved:
+        return False
+    return _translation_script_ok(saved, str(source_text or ''), source_language, target_language)
+
+
 @app.post('/api/process/translate')
 async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
     project = projects.get(payload.project_id)
@@ -2463,8 +2542,20 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
             'Re-translating every line from scratch (saved translations ignored).',
         )
     # Resume support: segments that already carry a translation are kept, so
-    # re-running after a failure continues instead of starting over.
-    pending = [segment for segment in translatable if not segment.get('translation')]
+    # re-running after a failure continues instead of starting over. But a saved
+    # line is only resumed when it IS a translation — data saved by older
+    # versions can hold the untranslated source (an English line left as-is on a
+    # Khmer dub), and those lines are re-translated instead of surviving every
+    # resume forever.
+    def _saved_translation_ok(segment: dict[str, Any]) -> bool:
+        return _translation_ok(
+            str(segment.get('text') or ''),
+            str(segment.get('translation') or ''),
+            source_language,
+            payload.target_language,
+        )
+
+    pending = [segment for segment in translatable if not _saved_translation_ok(segment)]
     already_done = total - len(pending)
     if already_done:
         await emit_progress(
@@ -2555,7 +2646,11 @@ async def process_translate(payload: ProcessingRequest) -> dict[str, Any]:
             cached = translation_memory.lookup(
                 text, source_language, payload.target_language, model_hint, glossary,
             )
-            if not cached:
+            # A cache entry must clear the same bar a fresh answer must: an old
+            # echo stored by an earlier version is re-translated, not replayed.
+            if not cached or not _translation_ok(
+                text, cached, source_language, payload.target_language,
+            ):
                 continue
             members = remaining.pop(text)
             for member in members:
@@ -2816,6 +2911,9 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
     previous_by_id = {str(item.get('id')): item for item in project.get('audio_segments', [])}
     audio_segments: list[dict[str, Any]] = []
     reused = 0
+    # Lines skipped because their text has nothing speakable in it (leftover
+    # untranslated source, punctuation only). Reported after the loop.
+    unspeakable: list[dict[str, Any]] = []
     try:
         for index, segment in enumerate(segments):
             previous = previous_by_id.get(str(segment['id']))
@@ -2882,21 +2980,33 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
                 line_voice = payload.voice
                 if mixed_labels is not None and not profile.get('voice'):
                     line_voice = mixed_labels[index]
-                line_result = await run_in_threadpool(
-                    tts_service.synthesize_line,
-                    segment['translation'],
-                    str(output_path),
-                    provider_pref=payload.tts_provider,
-                    language_name=payload.target_language,
-                    lang_code=lang_code,
-                    voice_pref=profile.get('voice') or line_voice,
-                    model_pref=payload.tts_model,
-                    speed=payload.speed,
-                    emotion=emotion,
-                    intensity=int(intensity),
-                    character_profile=profile,
-                    analysis=analysis,
-                )
+                try:
+                    line_result = await run_in_threadpool(
+                        tts_service.synthesize_line,
+                        segment['translation'],
+                        str(output_path),
+                        provider_pref=payload.tts_provider,
+                        language_name=payload.target_language,
+                        lang_code=lang_code,
+                        voice_pref=profile.get('voice') or line_voice,
+                        model_pref=payload.tts_model,
+                        speed=payload.speed,
+                        emotion=emotion,
+                        intensity=int(intensity),
+                        character_profile=profile,
+                        analysis=analysis,
+                    )
+                except UnspeakableTextError as error:
+                    # One line with nothing speakable in it must not abort the dub
+                    # or blacklist the engine — every other line synthesizes fine.
+                    # Flag it, keep going, and report the full list at the end.
+                    unspeakable.append({'index': index + 1, 'text': segment['translation']})
+                    await emit_progress(
+                        payload.project_id, 'Generating Voice',
+                        70 + int(24 * (index + 1) / total_segments),
+                        f'Line {index + 1} skipped: {error}',
+                    )
+                    continue
                 audio_segments.append({
                     'id': segment['id'],
                     'start': segment['start'],
@@ -2926,6 +3036,24 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
             status_code=502,
             detail=f'Voice generation failed: {error}. Press Dub again to resume where it stopped.',
         ) from error
+
+    if unspeakable:
+        persist_project(payload.project_id)
+        update_project(payload.project_id, status='Ready', progress=70)
+        shown = '; '.join(
+            f'line {item["index"]} ("{_text_snippet(item["text"])}")'
+            for item in unspeakable[:8]
+        )
+        extra = f' (+{len(unspeakable) - 8} more)' if len(unspeakable) > 8 else ''
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f'{len(unspeakable)} line(s) have no text a {payload.target_language} voice can pronounce '
+                f'— usually lines that were never translated: {shown}{extra}. '
+                'Fix those lines in the Dubbing Track editor and press Dub again; '
+                f'{len(audio_segments)} finished line(s) are kept.'
+            ),
+        )
 
     await emit_progress(
         payload.project_id, 'Generating Voice', 95,

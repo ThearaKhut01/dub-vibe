@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import wave
 from abc import ABC, abstractmethod
 from functools import lru_cache
@@ -32,6 +33,17 @@ class SpeechUnavailableError(RuntimeError):
     server-side problem with that language (Edge TTS returning no audio) or has no
     installed voice for it (SAPI5). Callers use it to stop retrying the same engine
     for every line and to explain the problem to the user.
+    """
+
+
+class UnspeakableTextError(ValueError):
+    """The line's text has no character the target voice could ever pronounce.
+
+    Distinct from SpeechUnavailableError: the engine is healthy, the TEXT is the
+    problem — typically a leftover untranslated line (“千年前” aimed at a Khmer
+    voice) or punctuation-only text. Retrying the same text can never succeed and
+    blacklisting the language would let one bad line take every other line down,
+    so callers flag this line and keep going instead.
     """
 
 
@@ -249,6 +261,42 @@ NON_LATIN_SCRIPT_RANGES: dict[str, str] = {
     'ar': '\u0600-\u06FF',               # Arabic (also fa, ur...)
     'hi': '\u0900-\u097F',               # Devanagari (also mr, ne...)
 }
+
+
+def _text_snippet(text: str, limit: int = 40) -> str:
+    """A short single-line version of the text for error messages."""
+    body = re.sub(r'\s+', ' ', str(text or '')).strip()
+    return body[:limit] + ('…' if len(body) > limit else '')
+
+
+def _text_speakable(text: str, language: str, voice: str | None = None) -> bool:
+    """Return False when a voice for `language` has nothing to pronounce in `text`.
+
+    Edge neural voices answer NoAudioReceived for text that contains no word they
+    can say. Verified live against the Khmer and en-US voices (2026-11): a pure
+    leftover-Chinese line (“千年前” for a Khmer voice), punctuation-only text
+    (“...”, “។”) and a Khmer word on an English voice all fail deterministically,
+    while digits (ASCII and native), romanized names and mixed text
+    (“សមរភូមិ 千年前”) synthesize fine — the voice just speaks the part it can.
+    So a character counts as speakable when it is a letter/digit of the target
+    language's script, an ASCII letter/digit, or — when the voice is an explicit
+    neural id — a letter of the voice's own prefix (“km-KH-...” can say Khmer no
+    matter the requested dub language).
+    """
+    lang = language
+    if voice and _NEURAL_ID_RE.match(voice):
+        lang = voice.split('-', 1)[0]
+    script = NON_LATIN_SCRIPT_RANGES.get(_resolve_lang_code(lang))
+    for char in str(text or ''):
+        if unicodedata.category(char)[0] not in ('L', 'N'):
+            continue  # whitespace, punctuation (“...”, “។”), symbols, combining marks
+        if char.isascii():
+            return True  # an ASCII letter/digit: every Edge voice pronounces it
+        if script is None:
+            continue  # Latin-script target: only ASCII letters/digits are safe to assume
+        if re.match(f'[{script}]', char):
+            return True  # a letter/digit the target language's voice pronounces
+    return False
 
 
 def target_uses_non_latin_script(target_language: str) -> bool:
@@ -2071,6 +2119,17 @@ def edge_voice_options(language: str) -> list[dict[str, str]]:
 class EdgeTTSProvider(TextToSpeechProvider):
     async def synthesize(self, text: str, voice: str, output_path: str, language: str) -> dict:
         import edge_tts
+
+        if not _text_speakable(text, language, voice):
+            # The service deterministically answers NoAudioReceived for text with
+            # nothing speakable in it (a leftover untranslated line, punctuation
+            # only). Calling it anyway used to burn 3 retries + the alternate
+            # voice and then blacklist the whole language for 10 minutes.
+            raise UnspeakableTextError(
+                f'This line has no characters a {language} voice can pronounce '
+                f'(“{_text_snippet(text)}”) — usually a line that was never translated. '
+                'Fix the line\'s translation (or delete it), then generate audio again.'
+            )
 
         if _NEURAL_ID_RE.match(voice or ''):
             # An explicit neural voice id (gender auto-assign or a manual

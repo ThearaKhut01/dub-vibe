@@ -54,7 +54,8 @@ def _fake_translator(monkeypatch, calls, main):
 
 
 def test_saved_translations_are_kept_without_the_flag(monkeypatch, tmp_path) -> None:
-    main, project_id = _project(tmp_path, monkeypatch, ['Yes.', 'No.'], ['Yes-Khmer', 'No-Khmer'])
+    # Valid Khmer translations: resume must reuse them without any engine call.
+    main, project_id = _project(tmp_path, monkeypatch, ['Yes.', 'No.'], ['បាទ', 'ទេ'])
     calls: list[list[str]] = []
     _fake_translator(monkeypatch, calls, main)
     try:
@@ -69,7 +70,7 @@ def test_saved_translations_are_kept_without_the_flag(monkeypatch, tmp_path) -> 
 
 
 def test_the_retranslate_flag_sends_every_line_again(monkeypatch, tmp_path) -> None:
-    main, project_id = _project(tmp_path, monkeypatch, ['Yes.', 'No.'], ['Yes-Khmer', 'No-Khmer'])
+    main, project_id = _project(tmp_path, monkeypatch, ['Yes.', 'No.'], ['បាទ', 'ទេ'])
     calls: list[list[str]] = []
     _fake_translator(monkeypatch, calls, main)
     try:

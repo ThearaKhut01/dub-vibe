@@ -24,7 +24,7 @@ from backend.app import api_events, chrome_profiles
 # into the source language (a mostly-Chinese batch makes Gemini answer English
 # lines in Chinese) or echo the source; such a line is a missing line, not a
 # translation, and must be re-asked before it reaches the dub.
-from backend.app.providers import _resolve_lang_code, _translation_script_ok
+from backend.app.providers import LANGUAGE_CODES, _resolve_lang_code, _translation_script_ok
 
 PROMPT_SELECTORS = (
     'rich-textarea div.ql-editor[contenteditable="true"]',
@@ -56,6 +56,16 @@ _ZERO_WIDTH = re.compile('[\u200b\u200c\u200d\ufeff]')
 # Never give up on an answer sooner than this, even when a caller asks for less.
 MIN_ANSWER_SECONDS = 15.0
 MODEL_LABEL = 'gemini.google.com'
+# The caller passes the source language as an ISO code ('zh'); prompts read
+# better with the language's name ("from Chinese into Khmer"), and a named
+# source anchors the answer language on mixed-script transcripts.
+_LANGUAGE_NAMES = {code: name for name, code in LANGUAGE_CODES.items()}
+
+
+def _language_label(language: str) -> str:
+    """'zh' -> 'Chinese': a name the model understands instead of a bare code."""
+    code = str(language or '').strip().lower()
+    return _LANGUAGE_NAMES.get(code, str(language or '').strip())
 # Gemini web answers a numbered list reliably up to about this many lines; more
 # than that and it starts merging or skipping entries.
 BATCH_SIZE = 20
@@ -146,7 +156,7 @@ def build_batch_prompt(lines: list[str], target_language: str = 'Khmer', source_
     ``strict`` is used for the retry of lines whose first answer was in the wrong
     language: it repeats that every block must be rewritten in the target.
     """
-    source = f' from {source_language}' if source_language else ''
+    source = f' from {_language_label(source_language)}' if source_language else ''
     terms = str(glossary or '').strip()
     glossary_part = f' Use these term translations exactly: {terms}.' if terms else ''
     earlier = [line for line in (context or []) if str(line or '').strip()][-3:]
@@ -378,7 +388,7 @@ def build_translation_prompt(text: str, target_language: str = 'Khmer', source_l
     Subtitles need the line itself, not a conversation about it, so the
     instruction asks for the translation only and forbids commentary.
     """
-    source = f' from {source_language}' if source_language else ''
+    source = f' from {_language_label(source_language)}' if source_language else ''
     guard = _script_guard(target_language)
     guard_part = f' {guard}' if guard else ''
     return (

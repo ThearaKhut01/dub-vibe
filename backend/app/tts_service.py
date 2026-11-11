@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 from . import acting, api_keys
-from .providers import SpeechUnavailableError
+from .providers import SpeechUnavailableError, UnspeakableTextError
 from .online_providers import (
     GEMINI_DEFAULT_MODEL,
     GEMINI_VOICES,
@@ -199,6 +199,14 @@ def synthesize_line(text: str, out_path: str, *, provider_pref: str, language_na
                 'cached': False,
                 'attempts': attempts,
             }
+        except UnspeakableTextError as error:
+            # The TEXT is the problem — a line with nothing speakable in it, not an
+            # engine outage. No other engine speaks this language any better, so
+            # stop here and let the caller flag the line. Never blacklist: that is
+            # what let one leftover untranslated line take a whole language down
+            # for 600 seconds.
+            attempts.append(f'{provider}: {error}')
+            raise
         except SpeechUnavailableError as error:
             attempts.append(f'{provider}: {error}')
             unavailable.append(provider)
