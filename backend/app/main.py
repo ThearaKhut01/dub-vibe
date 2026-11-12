@@ -60,6 +60,7 @@ from urllib.parse import quote
 from backend.app.chunking import SmartChunkEngine, format_timestamp, split_subtitle_cues
 from backend.app import acting, api_events, api_keys, chrome_profiles, cuda_pack, export_design, gemini_web, model_manager, online_providers, speaker_diarization, translation_memory, tts_service, voxcpm_local
 from backend.app import segment_tts
+from backend.app import ocr_subs
 from backend.app.models import ProjectRequest, ProjectSummary, ProviderSettings, ProcessingRequest, SegmentSplit, SegmentUpdate, WorkflowProgress
 from backend.app.providers import (
     BROWSER_TRANSLATION_ENGINES,
@@ -1417,6 +1418,131 @@ def _quality_report(project: dict[str, Any]) -> dict[str, Any]:
             'overlaps': overlaps[:15],
         },
     }
+
+
+@app.post('/api/projects/{project_id}/ocr/test')
+async def ocr_test(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Read one frame inside the user's OCR box.
+
+    This is the call behind the "Test OCR" button: the user draws a rectangle
+    over a paused frame and the text it reads appears before any full-video run.
+    The box is saved on the project so a later pass can reuse it, and so the
+    choice survives a reload.
+    """
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail='Project not found')
+    media_path = str(project.get('media_path') or '')
+    if not media_path or not Path(media_path).is_file():
+        raise HTTPException(status_code=409, detail='Import a video before testing OCR.')
+    box = ocr_subs.normalize_box(payload.get('box'))
+    if box is None:
+        raise HTTPException(status_code=409, detail='Draw an OCR box over the preview first.')
+    if not ocr_subs.ocr_available():
+        raise HTTPException(status_code=503, detail=ocr_subs.INSTALL_HINT)
+    try:
+        time = float(payload.get('time') or 0.0)
+    except (TypeError, ValueError):
+        time = 0.0
+    source_language = str(payload.get('source_language') or project.get('source_language') or '')
+    try:
+        result = await run_in_threadpool(
+            ocr_subs.read_frame, media_path, time, box, source_language,
+        )
+    except ocr_subs.OCRUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except Exception as error:  # noqa: BLE001 - report the engine's own message
+        raise HTTPException(status_code=502, detail=f'OCR failed: {error}') from error
+    project['ocr_box'] = box
+    persist_project(project_id)
+    return {'status': 'ok', **result, 'box': box}
+
+
+@app.post('/api/projects/{project_id}/ocr/extract')
+async def ocr_extract(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Read the burned-in subtitles across the video and replace the transcript.
+
+    The OCR box the user drew is reused for every sampled frame; consecutive
+    frames with the same text become one segment with real start/end times.
+    The result lands in ``project['segments']`` in exactly the shape the
+    existing Translate and Voice steps expect, so the rest of the workflow runs
+    unchanged.
+    """
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail='Project not found')
+    media_path = str(project.get('media_path') or '')
+    if not media_path or not Path(media_path).is_file():
+        raise HTTPException(status_code=409, detail='Import a video before extracting subtitles.')
+    box = ocr_subs.normalize_box(payload.get('box') or project.get('ocr_box'))
+    if box is None:
+        raise HTTPException(status_code=409, detail='Draw an OCR box over the preview first.')
+    if not ocr_subs.ocr_available():
+        raise HTTPException(status_code=503, detail=ocr_subs.INSTALL_HINT)
+
+    def number(key: str, default: float | None) -> float | None:
+        value = payload.get(key)
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    start = max(0.0, number('start', 0.0) or 0.0)
+    end = number('end', None)
+    fps = number('fps', 1.0) or 1.0
+    source_language = str(payload.get('source_language') or project.get('source_language') or '')
+
+    loop = asyncio.get_running_loop()
+
+    def report(done: int, total: int) -> None:
+        percent = 25 + int(60 * done / max(total, 1))
+        try:
+            asyncio.run_coroutine_threadsafe(
+                emit_progress(
+                    project_id, 'Reading subtitles', percent,
+                    f'Reading burned-in subtitles: {done}/{total} frames',
+                ),
+                loop,
+            )
+        except RuntimeError:
+            pass  # the request ended; the work still finishes and is saved
+
+    await emit_progress(project_id, 'Reading subtitles', 20, 'Reading burned-in subtitles…')
+    try:
+        cues = await run_in_threadpool(
+            ocr_subs.extract_cues, media_path, box, source_language,
+            start=start, end=end, fps=fps, progress=report,
+        )
+    except ocr_subs.OCRUnavailableError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except Exception as error:  # noqa: BLE001 - report the engine's own message
+        raise HTTPException(status_code=502, detail=f'OCR failed: {error}') from error
+
+    segments = [
+        {
+            'id': f'ocr-{uuid.uuid4().hex[:10]}',
+            'start': cue['start'],
+            'end': cue['end'],
+            'speaker': 'Speaker 1',
+            'text': cue['text'],
+            'translation': '',
+        }
+        for cue in cues
+    ]
+    if segments:
+        project['segments'] = segments
+        project['audio_segments'] = []
+        project['ocr_box'] = box
+        if source_language and not project.get('source_language'):
+            project['source_language'] = source_language
+        persist_project(project_id)
+    await emit_progress(
+        project_id, 'Reading subtitles', 85,
+        f'Read {len(segments)} subtitle lines.' if segments else 'No burned-in text found in the box.',
+    )
+    return {'status': 'ok', 'count': len(segments), 'segments': segments, 'box': box}
 
 
 @app.get('/api/projects/{project_id}/quality')

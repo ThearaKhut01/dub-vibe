@@ -351,6 +351,9 @@ function App() {
   const [currentTime, setCurrentTime] = useState(0);
   const [videoDuration, setVideoDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [ocrBusy, setOcrBusy] = useState(false);
+  const [ocrExtracting, setOcrExtracting] = useState(false);
+  const [ocrMessage, setOcrMessage] = useState<string | null>(null);
   const [dubbedTime, setDubbedTime] = useState(0);
   const [dubbedDuration, setDubbedDuration] = useState(0);
   const [dubbedPlaying, setDubbedPlaying] = useState(false);
@@ -364,6 +367,93 @@ function App() {
     'Dubbed Voice': { muted: false, hidden: false, locked: false },
     'Subtitle': { muted: false, hidden: false, locked: false },
   });
+
+  // --- OCR box preview: read the frame under the user's rectangle -----------
+  // One request, one frame: the user drags the box, presses Test OCR, and sees
+  // the text before any full-video run. The box is saved on the project too.
+  const testOcr = async () => {
+    if (!project.id) {
+      setOcrMessage('Import a video first.');
+      return;
+    }
+    const box = useDesignStore.getState().ocrBox;
+    setOcrBusy(true);
+    setOcrMessage(null);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/projects/${project.id}/ocr/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          time: currentTime,
+          box: { x: box.x, y: box.y, w: box.w, h: box.h },
+          // The transcription picker is the user's own statement of what the
+          // source says; when empty the backend uses the project's language.
+          ...(transcribeLanguage ? { source_language: transcribeLanguage } : {}),
+        }),
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        setOcrMessage(payload?.detail ?? `OCR failed (HTTP ${response.status}).`);
+        return;
+      }
+      const text = String(payload?.text ?? '').trim();
+      const score = Number(payload?.score ?? 0);
+      setOcrMessage(text
+        ? `${text}  (${Math.round(score * 100)}%)`
+        : 'No text found in the box — move or resize it.');
+    } catch (error) {
+      setOcrMessage(error instanceof Error ? error.message : 'OCR request failed.');
+    } finally {
+      setOcrBusy(false);
+    }
+  };
+
+  // --- OCR full pass: turn the box into a real transcript -------------------
+  // Reads the box across the whole video, groups identical consecutive frames
+  // into cues, and replaces the transcript so Translate/Voice run unchanged.
+  const extractOcr = async () => {
+    if (!project.id) {
+      setOcrMessage('Import a video first.');
+      return;
+    }
+    if (transcript.length && !window.confirm(
+      `Replace the current ${transcript.length}-line transcript with text read from the video?`,
+    )) {
+      return;
+    }
+    const box = useDesignStore.getState().ocrBox;
+    setOcrExtracting(true);
+    setOcrMessage(null);
+    setNotice('Reading burned-in subtitles… this can take a few minutes.');
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/projects/${project.id}/ocr/extract`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          box: { x: box.x, y: box.y, w: box.w, h: box.h },
+          fps: 1,
+          ...(transcribeLanguage ? { source_language: transcribeLanguage } : {}),
+        }),
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        setOcrMessage(payload?.detail ?? `OCR failed (HTTP ${response.status}).`);
+        return;
+      }
+      const count = Number(payload?.count ?? 0);
+      if (!count) {
+        setOcrMessage('No burned-in text found in the box — move or resize it.');
+        return;
+      }
+      await switchProject(project.id);
+      setOcrMessage(`${count} subtitle lines added. Translate them next.`);
+      setNotice(`OCR added ${count} lines. Run Translate to dub them.`);
+    } catch (error) {
+      setOcrMessage(error instanceof Error ? error.message : 'OCR extraction failed.');
+    } finally {
+      setOcrExtracting(false);
+    }
+  };
 
   // --- Preview layout (persisted): one row shared by both players ----------
   const {
@@ -2065,7 +2155,13 @@ function App() {
               </div>
 
               {/* Controls for the canvas above: platform, background, transform, caption. */}
-              <DesignBar />
+              <DesignBar
+                onTestOcr={testOcr}
+                onExtractOcr={extractOcr}
+                ocrBusy={ocrBusy}
+                ocrExtracting={ocrExtracting}
+                ocrMessage={ocrMessage}
+              />
 
               {/* Drag to change the preview height: 180 px → 70% of the window. */}
               <div

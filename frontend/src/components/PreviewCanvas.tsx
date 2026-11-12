@@ -54,7 +54,7 @@ export function PreviewCanvas({
   subtitleText,
   empty,
 }: PreviewCanvasProps) {
-  const { platform, editing, background, video, subtitle, blurBox, safeZone, setVideo, setBlurBox } = useDesignStore();
+  const { platform, editing, background, video, subtitle, blurBox, ocrBox, safeZone, setVideo, setBlurBox, setOcrBox } = useDesignStore();
   const containerRef = useRef<HTMLDivElement>(null);
   const backgroundRef = useRef<HTMLVideoElement>(null);
 
@@ -267,6 +267,62 @@ export function PreviewCanvas({
     if (target.hasPointerCapture?.(event.pointerId)) target.releasePointerCapture(event.pointerId);
   };
 
+  // --- OCR box: the region the engine reads, dragged like the blur box -------
+  const ocrDragRef = useRef<{ startX: number; startY: number; x: number; y: number } | null>(null);
+
+  const onOcrPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!editing || !box) return;
+    event.preventDefault();
+    event.stopPropagation();
+    capture(event);
+    ocrDragRef.current = { startX: event.clientX, startY: event.clientY, x: ocrBox.x, y: ocrBox.y };
+  };
+
+  const onOcrPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const start = ocrDragRef.current;
+    if (!start || !box) return;
+    setOcrBox({
+      x: start.x + (event.clientX - start.startX) / box.width,
+      y: start.y + (event.clientY - start.startY) / box.height,
+    });
+  };
+
+  const endOcrDrag = (event: React.PointerEvent<HTMLDivElement>) => {
+    ocrDragRef.current = null;
+    const target = event.currentTarget;
+    if (target.hasPointerCapture?.(event.pointerId)) target.releasePointerCapture(event.pointerId);
+  };
+
+  const ocrResizeRef = useRef<{
+    corner: string; startX: number; startY: number; box: typeof ocrBox;
+  } | null>(null);
+
+  const onOcrHandleDown = (corner: 'nw' | 'ne' | 'sw' | 'se') => (event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    capture(event);
+    ocrResizeRef.current = { corner, startX: event.clientX, startY: event.clientY, box: { ...ocrBox } };
+  };
+
+  const onOcrHandleMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const start = ocrResizeRef.current;
+    if (!start || !box) return;
+    const deltaX = (event.clientX - start.startX) / box.width;
+    const deltaY = (event.clientY - start.startY) / box.height;
+    const next = { ...start.box };
+    if (start.corner.includes('e')) next.w = start.box.w + deltaX;
+    if (start.corner.includes('s')) next.h = start.box.h + deltaY;
+    if (start.corner.includes('w')) { next.x = start.box.x + deltaX; next.w = start.box.w - deltaX; }
+    if (start.corner.includes('n')) { next.y = start.box.y + deltaY; next.h = start.box.h - deltaY; }
+    setOcrBox(next);
+  };
+
+  const endOcrResize = (event: React.PointerEvent<HTMLDivElement>) => {
+    ocrResizeRef.current = null;
+    const target = event.currentTarget;
+    if (target.hasPointerCapture?.(event.pointerId)) target.releasePointerCapture(event.pointerId);
+  };
+
   // Same calibration as the background bars: 0–50 at a 720 px-wide frame.
   const blurPx = (blurBox.strength * (box?.width ?? BLUR_REFERENCE_WIDTH)) / BLUR_REFERENCE_WIDTH;
 
@@ -402,6 +458,57 @@ export function PreviewCanvas({
                 onPointerUp={endBlurResize}
                 onPointerCancel={endBlurResize}
                 title="Drag to resize the blur box"
+              />
+            ))}
+          </>
+        )}
+
+        {/* OCR box: the region "Test OCR" reads. Amber and dashed so it is never
+            confused with the blur box; it draws nothing over the video. */}
+        {src && ocrBox.enabled && (
+          <>
+            <div
+              className={`absolute z-20 border-2 border-dashed border-amber-400/80 bg-amber-400/10 ${editing ? 'cursor-move' : 'pointer-events-none'}`}
+              style={{
+                left: `${ocrBox.x * 100}%`,
+                top: `${ocrBox.y * 100}%`,
+                width: `${ocrBox.w * 100}%`,
+                height: `${ocrBox.h * 100}%`,
+              }}
+              onPointerDown={onOcrPointerDown}
+              onPointerMove={onOcrPointerMove}
+              onPointerUp={endOcrDrag}
+              onPointerCancel={endOcrDrag}
+              title={editing ? 'Drag to move the OCR box' : undefined}
+            />
+            {editing && (
+              <div
+                className="absolute z-40 flex h-3.5 w-9 -translate-x-1/2 -translate-y-1/2 cursor-move items-center justify-center rounded-full border border-white bg-amber-500 text-[8px] font-bold leading-none text-white"
+                style={{ left: `${(ocrBox.x + ocrBox.w / 2) * 100}%`, top: `${ocrBox.y * 100}%` }}
+                onPointerDown={onOcrPointerDown}
+                onPointerMove={onOcrPointerMove}
+                onPointerUp={endOcrDrag}
+                onPointerCancel={endOcrDrag}
+                title="Drag to move the OCR box"
+              >
+                ⠿
+              </div>
+            )}
+            {editing && ([
+              { key: 'nw', cursor: 'cursor-nwse-resize', style: { left: `${ocrBox.x * 100}%`, top: `${ocrBox.y * 100}%` } },
+              { key: 'ne', cursor: 'cursor-nesw-resize', style: { left: `${(ocrBox.x + ocrBox.w) * 100}%`, top: `${ocrBox.y * 100}%` } },
+              { key: 'sw', cursor: 'cursor-nesw-resize', style: { left: `${ocrBox.x * 100}%`, top: `${(ocrBox.y + ocrBox.h) * 100}%` } },
+              { key: 'se', cursor: 'cursor-nwse-resize', style: { left: `${(ocrBox.x + ocrBox.w) * 100}%`, top: `${(ocrBox.y + ocrBox.h) * 100}%` } },
+            ] as const).map((handle) => (
+              <div
+                key={handle.key}
+                className={`absolute z-30 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-sm border border-white bg-amber-400 ${handle.cursor}`}
+                style={handle.style}
+                onPointerDown={onOcrHandleDown(handle.key)}
+                onPointerMove={onOcrHandleMove}
+                onPointerUp={endOcrResize}
+                onPointerCancel={endOcrResize}
+                title="Drag to resize the OCR box"
               />
             ))}
           </>

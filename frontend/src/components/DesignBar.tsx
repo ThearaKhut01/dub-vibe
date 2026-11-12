@@ -28,11 +28,20 @@ function Choice({ active, onClick, title, children }: {
  *
  * It only edits normalised values — the preview components and the FFmpeg export
  * both read them — so nothing here depends on the current preview's pixel size.
+ *
+ * The OCR controls need the project and the backend, which this bar does not
+ * own, so the parent passes the action and the latest result down.
  */
-export function DesignBar() {
+export function DesignBar({ onTestOcr, onExtractOcr, ocrBusy = false, ocrExtracting = false, ocrMessage = null }: {
+  onTestOcr?: () => void;
+  onExtractOcr?: () => void;
+  ocrBusy?: boolean;
+  ocrExtracting?: boolean;
+  ocrMessage?: string | null;
+} = {}) {
   const {
-    platform, editing, background, video, subtitle, blurBox, safeZone,
-    setPlatform, setEditing, setBackground, setVideo, setSubtitle, setBlurBox, toggleSafeZone, reset,
+    platform, editing, background, video, subtitle, blurBox, ocrBox, safeZone,
+    setPlatform, setEditing, setBackground, setVideo, setSubtitle, setBlurBox, setOcrBox, toggleSafeZone, reset,
   } = useDesignStore();
 
   return (
@@ -149,6 +158,33 @@ export function DesignBar() {
             <span className="w-4 text-right tabular-nums text-slate-300">{blurBox.strength}</span>
           </label>
         )}
+        <label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-slate-300"
+               title="Marks where burned-in subtitles sit, so OCR can read them from any frame">
+          <input
+            type="checkbox" checked={ocrBox.enabled}
+            onChange={(event) => setOcrBox({ enabled: event.target.checked })}
+            className="h-3 w-3 accent-amber-500"
+          />
+          OCR box
+        </label>
+        {ocrBox.enabled && onTestOcr && (
+          <button
+            type="button" onClick={onTestOcr} disabled={ocrBusy || ocrExtracting}
+            className="rounded-md border border-amber-400/40 bg-amber-500/15 px-2 py-1 text-[10px] font-semibold text-amber-200 transition hover:bg-amber-500/25 disabled:cursor-wait disabled:opacity-60"
+            title="Read the frame under the box and show the text it finds"
+          >
+            {ocrBusy ? 'Reading…' : 'Test OCR'}
+          </button>
+        )}
+        {ocrBox.enabled && onExtractOcr && (
+          <button
+            type="button" onClick={onExtractOcr} disabled={ocrBusy || ocrExtracting}
+            className="rounded-md border border-amber-400/40 bg-amber-500/15 px-2 py-1 text-[10px] font-semibold text-amber-200 transition hover:bg-amber-500/25 disabled:cursor-wait disabled:opacity-60"
+            title="Read the box across the whole video and replace the transcript with what it finds"
+          >
+            {ocrExtracting ? 'Extracting…' : 'Extract subtitles'}
+          </button>
+        )}
         <label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-slate-300">
           <input
             type="checkbox" checked={safeZone} onChange={toggleSafeZone}
@@ -167,11 +203,17 @@ export function DesignBar() {
         <button
           type="button" onClick={reset}
           className="ml-auto rounded-md border border-white/10 bg-slate-900 px-2 py-1 text-[10px] font-medium text-slate-300 transition hover:bg-slate-800"
-          title="Reset the video position, scale, rotation, flips, caption and blur box"
+          title="Reset the video position, scale, rotation, flips, caption, blur box and OCR box"
         >
           Reset
         </button>
       </div>
+
+      {ocrMessage && (
+        <p className="mt-1.5 truncate rounded-md bg-slate-950/60 px-2 py-1 text-[10px] text-slate-300" title={ocrMessage}>
+          <span className="font-semibold text-amber-300">OCR:</span> {ocrMessage}
+        </p>
+      )}
     </section>
   );
 }

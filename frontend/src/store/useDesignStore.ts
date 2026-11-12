@@ -85,6 +85,18 @@ interface DesignState {
     /** 0–50, the same scale as the background blur. */
     strength: number;
   };
+  /**
+   * A rectangle over the frame where burned-in subtitles sit. The user drags it
+   * once; OCR reads that same region from any frame. Same normalised space as
+   * the blur box, but no strength — it is read, not drawn.
+   */
+  ocrBox: {
+    enabled: boolean;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  };
   safeZone: boolean;
 
   setPlatform: (platform: DesignPlatform) => void;
@@ -93,6 +105,7 @@ interface DesignState {
   setVideo: (update: Partial<DesignState['video']>) => void;
   setSubtitle: (update: Partial<DesignState['subtitle']>) => void;
   setBlurBox: (update: Partial<DesignState['blurBox']>) => void;
+  setOcrBox: (update: Partial<DesignState['ocrBox']>) => void;
   toggleSafeZone: () => void;
   reset: () => void;
 }
@@ -102,6 +115,9 @@ const DEFAULT_SUBTITLE = { enabled: true, x: 0.5, y: 0.88, size: 0.06, wordsPerL
 // Sits over the letterbox bar where burned-in subtitles usually are; wide and
 // short, so it reads as a strip rather than a blank rectangle.
 const DEFAULT_BLUR_BOX = { enabled: false, x: 0.05, y: 0.7, w: 0.9, h: 0.12, strength: 20 };
+// Taller than the blur strip: diacritics sit above and below the baseline, and
+// a clipped mark makes OCR read the wrong character.
+const DEFAULT_OCR_BOX = { enabled: false, x: 0.05, y: 0.7, w: 0.9, h: 0.22 };
 const DEFAULT_BACKGROUND = {
   mode: 'blur' as BackgroundMode,
   blur: 20,
@@ -119,6 +135,7 @@ export const useDesignStore = create<DesignState>()(
       video: { ...DEFAULT_VIDEO },
       subtitle: { ...DEFAULT_SUBTITLE },
       blurBox: { ...DEFAULT_BLUR_BOX },
+      ocrBox: { ...DEFAULT_OCR_BOX },
       safeZone: false,
 
       setPlatform: (platform) => set({ platform }),
@@ -162,6 +179,15 @@ export const useDesignStore = create<DesignState>()(
         const h = clamp(merged.h, 0.02, 1 - y);
         return { blurBox: { ...merged, x, y, w, h, strength } };
       }),
+      setOcrBox: (update) => set((state) => {
+        const merged = { ...state.ocrBox, ...update };
+        // Same clamping as the blur box: the rectangle never leaves the frame.
+        const x = clamp(merged.x, 0, 0.98);
+        const y = clamp(merged.y, 0, 0.98);
+        const w = clamp(merged.w, 0.02, 1 - x);
+        const h = clamp(merged.h, 0.02, 1 - y);
+        return { ocrBox: { ...merged, x, y, w, h } };
+      }),
       toggleSafeZone: () => set((state) => ({ safeZone: !state.safeZone })),
       // Layout only: the platform and the blur keep their settings, because those
       // describe the output, not where the video sits inside it.
@@ -169,6 +195,7 @@ export const useDesignStore = create<DesignState>()(
         video: { ...DEFAULT_VIDEO },
         subtitle: { ...DEFAULT_SUBTITLE },
         blurBox: { ...DEFAULT_BLUR_BOX },
+        ocrBox: { ...DEFAULT_OCR_BOX },
       }),
     }),
     {
@@ -181,6 +208,7 @@ export const useDesignStore = create<DesignState>()(
         video: state.video,
         subtitle: state.subtitle,
         blurBox: state.blurBox,
+        ocrBox: state.ocrBox,
         safeZone: state.safeZone,
       }),
     },

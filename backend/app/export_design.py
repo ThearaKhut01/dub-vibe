@@ -141,6 +141,24 @@ def normalize_design(payload: Any) -> Design | None:
     )
 
 
+def box_to_pixels(x: float, y: float, w: float, h: float,
+                  width: int, height: int) -> tuple[int, int, int, int]:
+    """Normalised 0..1 rectangle -> (x, y, w, h) in pixels, kept inside the frame.
+
+    The preview draws the blur box and the OCR box from the same normalised
+    numbers, so both FFmpeg and the OCR engine must read them through this one
+    conversion. Rounding and clamping are identical to what the blur box used
+    inline before, so the exported blur is unchanged.
+    """
+    box_x = int(round(_clamp(x, 0.0, 1.0) * width))
+    box_y = int(round(_clamp(y, 0.0, 1.0) * height))
+    box_w = max(2, int(round(_clamp(w, 0.0, 1.0) * width)))
+    box_h = max(2, int(round(_clamp(h, 0.0, 1.0) * height)))
+    box_w = min(box_w, width - box_x) if box_x < width else width
+    box_h = min(box_h, height - box_y) if box_y < height else height
+    return box_x, box_y, box_w, box_h
+
+
 def _even(value: float) -> int:
     """Round to the nearest even pixel; libx264 rejects odd dimensions."""
     number = max(2, int(round(value)))
@@ -202,12 +220,9 @@ def frame_filter_graph(design: Design, width: int, height: int, *,
     # goes after the video is placed (so it covers the source's own subtitles)
     # and before the caption (so our text stays sharp).
     if design.blur_enabled and design.blur_strength > 0:
-        box_x = int(round(_clamp(design.blur_x, 0.0, 1.0) * width))
-        box_y = int(round(_clamp(design.blur_y, 0.0, 1.0) * height))
-        box_w = max(2, int(round(_clamp(design.blur_w, 0.0, 1.0) * width)))
-        box_h = max(2, int(round(_clamp(design.blur_h, 0.0, 1.0) * height)))
-        box_w = min(box_w, width - box_x) if box_x < width else width
-        box_h = min(box_h, height - box_y) if box_y < height else height
+        box_x, box_y, box_w, box_h = box_to_pixels(
+            design.blur_x, design.blur_y, design.blur_w, design.blur_h, width, height,
+        )
         radius = int(round(design.blur_strength * width / 720.0))
         if radius > 0 and box_w >= 2 and box_h >= 2:
             chains.append(f'{final}split=2[bmain][bpatch]')
