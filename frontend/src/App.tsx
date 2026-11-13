@@ -217,7 +217,13 @@ function App() {
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const [targetLanguage, setTargetLanguage] = useState(() => localStorage.getItem('dubvibe-target-language') ?? 'Khmer');
-  const [selectedVoice, setSelectedVoice] = useState(() => localStorage.getItem('dubvibe-voice') ?? 'Male Voice A');
+  const [selectedVoice, setSelectedVoice] = useState(() => {
+    // Auto-detect is the point of pressing START DUBBING: default to Mixed (each
+    // line is voiced by its detected speaker gender). 'Male Voice A' was the old
+    // pre-detection default, so a stored copy of exactly that counts as unset.
+    const stored = localStorage.getItem('dubvibe-voice');
+    return stored && stored !== 'Male Voice A' ? stored : 'mixed';
+  });
   const [chunkSelection, setChunkSelection] = useState('2');
   const [apiAvailable, setApiAvailable] = useState<boolean | null>(null);
   const [subtitleSync, setSubtitleSync] = useState(() => localStorage.getItem('dubvibe-subtitle-sync') !== 'false');

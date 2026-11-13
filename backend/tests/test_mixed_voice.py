@@ -51,25 +51,26 @@ def test_saved_line_gender_wins_over_the_profile(no_classifier):
 
 
 def test_classifier_fills_unknown_lines_and_persists(monkeypatch):
+    """Every line is heard on its own — never branded by another line's result."""
     calls: list[float] = []
 
     def classify(media_path, start, end, ffmpeg):
         calls.append(start)
-        return 'Female' if start == 0.0 else None  # Speaker 2's line is too noisy
+        return 'Female' if start == 0.0 else None  # lines 2 and 3 are too noisy
 
     monkeypatch.setattr(main.speaker_diarization, 'classify_segment_gender', classify)
     segments = [
         _segment(1, 0.0, 1.0, 'Speaker 1'),
-        _segment(2, 1.0, 2.0, 'Speaker 1'),  # same speaker: memoized, not re-classified
+        _segment(2, 1.0, 2.0, 'Speaker 1'),  # same label, still heard separately
         _segment(3, 2.0, 3.0, 'Speaker 2'),
     ]
     characters: dict = {}
     labels = main.mixed_voice_labels(segments, characters, 'media.mp4', 'ffmpeg')
-    assert calls == [0.0, 2.0]
-    assert labels == ['Female Voice B', 'Female Voice B', 'Female Voice B']  # unsure line inherits
+    assert calls == [0.0, 1.0, 2.0]
+    assert labels == ['Female Voice B', 'Female Voice B', 'Female Voice B']  # unsure lines inherit
     assert segments[0]['gender'] == 'Female'
-    assert 'gender' not in segments[1]  # memo hit: nothing new was detected
-    assert characters['Speaker 1']['gender'] == 'Female'
+    assert 'gender' not in segments[1] and 'gender' not in segments[2]  # unsure: nothing saved
+    assert characters == {}  # speaker profiles belong to Speaker Detection, not one line
 
 
 def test_no_gender_signal_falls_back_to_the_pause_heuristic(monkeypatch):
@@ -123,6 +124,8 @@ def test_dub_run_uses_detected_genders_for_mixed(tmp_path, monkeypatch):
         )
         assert response.status_code == 200, response.text
         assert used_voices == ['Female Voice B', 'Male Voice A']
+        # The response carries the per-line genders so the editor auto-selects them.
+        assert [row.get('gender') for row in response.json()['result']['segments']] == ['Female', 'Male']
         # The detections were saved on the lines for the editor and the next run.
         assert [segment['gender'] for segment in main.projects[pid]['segments']] == ['Female', 'Male']
     finally:
@@ -158,12 +161,12 @@ def test_detect_genders_endpoint_classifies_and_persists(tmp_path, monkeypatch):
         response = TestClient(main.app).post(f'/api/projects/{pid}/segments/detect-genders')
         assert response.status_code == 200, response.text
         body = response.json()
-        assert body['detected'] == {'a': 'Female', 'b': 'Male', 'c': 'Female'}  # c memoized from a
-        assert calls == [0.0, 1.0]
-        assert body['message'].startswith('Detected 1 male and 2 female line(s).')
+        # Every line is re-listened from scratch — no per-speaker branding.
+        assert body['detected'] == {'a': 'Female', 'b': 'Male', 'c': 'Male'}
+        assert calls == [0.0, 1.0, 2.0]
+        assert body['message'].startswith('Detected 2 male and 1 female line(s).')
         segments = {segment['id']: segment for segment in main.projects[pid]['segments']}
         assert segments['a']['gender'] == 'Female' and segments['b']['gender'] == 'Male'
-        assert main.projects[pid]['characters']['Speaker 1']['gender'] == 'Female'
     finally:
         main.projects.pop(pid, None)
 
@@ -196,9 +199,11 @@ def test_detect_genders_keeps_saved_picks_and_reports_unsure(tmp_path, monkeypat
         response = TestClient(main.app).post(f'/api/projects/{pid}/segments/detect-genders')
         assert response.status_code == 200, response.text
         body = response.json()
-        assert body['detected'] == {'a': 'Male'}  # saved pick kept, no guess for b
+        # Auto-detect all re-listens to every line; the saved pick is kept only
+        # because this recording could not be heard.
+        assert body['detected'] == {'a': 'Male'}
         assert body['unsure_lines'] == [2]
-        assert calls == [1.0]
+        assert calls == [0.0, 1.0]
         assert 'pick a voice manually' in body['message']
     finally:
         main.projects.pop(pid, None)
@@ -252,11 +257,10 @@ def test_per_line_generate_auto_detects_saves_and_uses_the_gender(tmp_path, monk
         assert main.projects[pid]['segments'][0]['gender'] == 'Female'
         assert classify_calls == [0.0]
 
-        # A saved gender (the detection above, or an editor pick) is honored
-        # without listening again.
+        # Auto is the "hear it again" action: it re-classifies even a saved line.
         response = client.post(f'/api/projects/{pid}/segments/a/tts', json={'gender': 'auto'})
         assert response.status_code == 200, response.text
-        assert classify_calls == [0.0]
+        assert classify_calls == [0.0, 0.0]
     finally:
         main.projects.pop(pid, None)
 

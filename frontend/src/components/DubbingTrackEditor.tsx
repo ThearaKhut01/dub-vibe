@@ -146,7 +146,10 @@ export function DubbingTrackEditor({
     </button>
   );
 
-  const genderFor = (segment: TimelineSegment): Gender => genders[segment.id] ?? (segment.gender ?? 'Male');
+  // Highlight ONLY a gender that was actually decided (editor pick or detection);
+  // an undecided line highlights nothing instead of pretending to be Male.
+  const genderFor = (segment: TimelineSegment): Gender | null =>
+    genders[segment.id] ?? (segment.gender === 'Male' || segment.gender === 'Female' ? segment.gender : null);
 
   const rowStatus = (segment: TimelineSegment): 'ready' | 'stale' | 'missing' | 'unsaved' => {
     const draft = drafts[segment.id];
@@ -192,12 +195,16 @@ export function DubbingTrackEditor({
           return copy;
         });
       }
+      // An explicit pick (⚡ Auto, a clicked button, a saved detection) is used
+      // as-is; a line nothing was decided for is auto-detected from its audio.
+      const requested = gender ?? genders[segment.id]
+        ?? (segment.gender === 'Male' || segment.gender === 'Female' ? segment.gender : 'auto');
       const detected = await generateSegmentAudio(projectId, segment.id, {
-        gender: gender ?? genderFor(segment),
+        gender: requested,
         provider,
         targetLanguage,
       });
-      onNotice(gender === 'auto' && detected
+      onNotice(requested === 'auto' && detected
         ? `Audio generated for ${formatTimecode(segment.start)} — detected a ${detected.gender.toLowerCase()} voice.`
         : `Audio generated for ${formatTimecode(segment.start)}.`);
     } catch (error) {

@@ -1273,7 +1273,22 @@ export const useStudioStore = create<StudioState>((set, get) => ({
                 translation: byId.get(String(segment.id)) ?? segment.translation,
               }));
             })()
-            : state.transcript,
+            : workflow === 'tts' && Array.isArray(payload.result?.segments)
+              // The dub detected each line's speaker gender: write it back so the
+              // Dubbing Track's Male/Female buttons auto-select the detection.
+              ? (() => {
+                const byId = new Map<string, string>();
+                for (const row of payload.result.segments as Array<{ id?: string; gender?: string }>) {
+                  if (row?.id && (row.gender === 'Male' || row.gender === 'Female')) {
+                    byId.set(String(row.id), row.gender);
+                  }
+                }
+                return state.transcript.map((segment) => {
+                  const gender = byId.get(String(segment.id));
+                  return gender ? { ...segment, gender } : segment;
+                });
+              })()
+              : state.transcript,
         dubAudioSegments: workflow === 'tts' && Array.isArray(payload.result?.segments)
           ? payload.result.segments.map((segment: any, index: number) => ({
             id: segment.id ?? `dub-${index + 1}`,
@@ -1285,6 +1300,7 @@ export const useStudioStore = create<StudioState>((set, get) => ({
             voice: segment.voice ?? options?.voice ?? 'Dubbed Voice',
             color: '#34d399',
             path: segment.path ?? '',
+            gender: genderOf(segment.gender),
           }))
           : state.dubAudioSegments,
       }));
