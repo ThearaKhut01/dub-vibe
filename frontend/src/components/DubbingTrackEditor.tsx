@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, ChevronUp, Loader2, Mic, Plus, Trash2, AlertTriangle } from 'lucide-react';
+import { ChevronDown, ChevronUp, Loader2, Mic, Plus, Trash2, AlertTriangle, Sparkles } from 'lucide-react';
 import type { TimelineSegment } from '../types';
 import { useStudioStore } from '../store/useStudioStore';
 
@@ -50,6 +50,7 @@ export function DubbingTrackEditor({
   onNotice,
 }: DubbingTrackEditorProps) {
   const generateSegmentAudio = useStudioStore((state) => state.generateSegmentAudio);
+  const detectSegmentGenders = useStudioStore((state) => state.detectSegmentGenders);
   const updateSegment = useStudioStore((state) => state.updateSegment);
   const deleteSegment = useStudioStore((state) => state.deleteSegment);
 
@@ -119,6 +120,32 @@ export function DubbingTrackEditor({
     audioRef.current?.pause();
   }, []);
 
+  const [detectingAll, setDetectingAll] = useState(false);
+
+  const detectAll = async () => {
+    setDetectingAll(true);
+    try {
+      const result = await detectSegmentGenders(projectId);
+      onNotice(result.message);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : 'Voice detection failed.');
+    } finally {
+      setDetectingAll(false);
+    }
+  };
+
+  const detectAllButton = (
+    <button
+      onClick={() => void detectAll()}
+      disabled={detectingAll || busyId !== null || segments.length === 0}
+      className="inline-flex items-center gap-1 rounded-lg border border-violet-500/40 bg-violet-600/20 px-2 py-1 text-[11px] font-medium text-violet-200 hover:bg-violet-600/40 disabled:opacity-40"
+      title="Listen to every line, save whether the speaker is male or female, and auto-select the voice buttons"
+    >
+      <Sparkles size={12} className={detectingAll ? 'animate-pulse' : ''} />
+      {detectingAll ? 'Detecting…' : 'Auto-detect all'}
+    </button>
+  );
+
   const genderFor = (segment: TimelineSegment): Gender => genders[segment.id] ?? (segment.gender ?? 'Male');
 
   const rowStatus = (segment: TimelineSegment): 'ready' | 'stale' | 'missing' | 'unsaved' => {
@@ -149,7 +176,7 @@ export function DubbingTrackEditor({
     }
   };
 
-  const generate = async (segment: TimelineSegment) => {
+  const generate = async (segment: TimelineSegment, gender?: Gender | 'auto') => {
     const text = (drafts[segment.id] ?? segment.translation).trim();
     if (!text) {
       onNotice('Write the dubbed text before generating audio.');
@@ -165,12 +192,14 @@ export function DubbingTrackEditor({
           return copy;
         });
       }
-      await generateSegmentAudio(projectId, segment.id, {
-        gender: genderFor(segment),
+      const detected = await generateSegmentAudio(projectId, segment.id, {
+        gender: gender ?? genderFor(segment),
         provider,
         targetLanguage,
       });
-      onNotice(`Audio generated for ${formatTimecode(segment.start)}.`);
+      onNotice(gender === 'auto' && detected
+        ? `Audio generated for ${formatTimecode(segment.start)} — detected a ${detected.gender.toLowerCase()} voice.`
+        : `Audio generated for ${formatTimecode(segment.start)}.`);
     } catch (error) {
       // The store only replaces the clip after success, so the previous audio is still in place.
       onNotice(error instanceof Error ? error.message : 'Audio generation failed. The previous audio was kept.');
@@ -253,6 +282,7 @@ export function DubbingTrackEditor({
               aria-label="Dubbing track height"
             />
           </label>
+          {detectAllButton}
           <button
             onClick={() => addSegmentAfter(null)}
             disabled={busyId !== null}
@@ -330,7 +360,15 @@ export function DubbingTrackEditor({
                             aria-label={`Dubbed text ${formatTimecode(segment.start)}`}
                           />
                           <div className="flex shrink-0 flex-col gap-1">
-                            <div className="inline-flex overflow-hidden rounded-md border border-white/10" role="group" aria-label="Speaker voice">
+                            <div className="inline-flex overflow-hidden rounded-md border border-white/10" role="group" aria-label="Speaker voice (Auto listens to the line's audio)">
+                              <button
+                                onClick={() => void generate(segment, 'auto')}
+                                disabled={busy}
+                                className="inline-flex items-center gap-1 bg-violet-600/80 px-2 py-1 text-[11px] font-medium text-white hover:bg-violet-600 disabled:opacity-40"
+                                title="Detect the speaker gender from this line's audio, save it, and generate the voice"
+                              >
+                                <Sparkles size={11} /> Auto
+                              </button>
                               {(['Male', 'Female'] as Gender[]).map((gender) => (
                                 <button
                                   key={gender}

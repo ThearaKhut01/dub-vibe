@@ -144,7 +144,8 @@ interface StudioState {
   }) => Promise<{ vtt: string | null; videoUrl: string | null; parts: Array<{ index: number; name: string }>; folder: string | null; files: string[] }>;
   clearProject: () => void;
   updateDubAudioSegments: (segments: TimelineSegment[]) => void;
-  generateSegmentAudio: (projectId: string, segmentId: string, options: { gender: 'Male' | 'Female'; provider: string; targetLanguage: string; speed?: number }) => Promise<void>;
+  generateSegmentAudio: (projectId: string, segmentId: string, options: { gender: 'Male' | 'Female' | 'auto'; provider: string; targetLanguage: string; speed?: number }) => Promise<{ gender: 'Male' | 'Female' }>;
+  detectSegmentGenders: (projectId: string) => Promise<{ detected: Record<string, string>; unsureLines: number[]; message: string }>;
 }
 
 interface BackendProject {
@@ -714,6 +715,11 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       throw new Error(problem.detail ?? `Unable to generate audio (HTTP ${response.status})`);
     }
     const { audio } = await response.json();
+    // An auto request detected the speaker gender: reflect it on the transcript
+    // segment so the editor's buttons show (and reuse) the detection.
+    if (options.gender === 'auto') {
+      get().patchSegmentLocal(segmentId, { gender: genderOf(audio.gender) });
+    }
     // Replace this line's audio only now that the backend has written the new clip.
     set((state) => ({
       // The clip is served by index, so its URL does not change: bump the version
@@ -736,6 +742,31 @@ export const useStudioStore = create<StudioState>((set, get) => ({
         },
       ].sort((a, b) => a.start - b.start),
     }));
+    return { gender: genderOf(audio.gender) };
+  },
+  detectSegmentGenders: async (projectId) => {
+    const response = await fetch(`${apiBase}/api/projects/${projectId}/segments/detect-genders`, {
+      method: 'POST',
+    });
+    if (!response.ok) {
+      const problem = await response.json().catch(() => ({}));
+      throw new Error(problem.detail ?? `Unable to detect voices (HTTP ${response.status})`);
+    }
+    const body = await response.json();
+    // Auto-select the detected gender on every line: the editor's Male/Female
+    // buttons read segment.gender, so patching the transcript highlights them.
+    const detected: Record<string, string> = body.detected ?? {};
+    set((state) => ({
+      transcript: state.transcript.map((segment) => {
+        const gender = detected[segment.id];
+        return gender === 'Male' || gender === 'Female' ? { ...segment, gender } : segment;
+      }),
+    }));
+    return {
+      detected,
+      unsureLines: (body.unsure_lines ?? []).map((line: unknown) => Number(line)),
+      message: String(body.message ?? ''),
+    };
   },
   createSegment: async (projectId, timing) => {
     const response = await fetch(`${apiBase}/api/projects/${projectId}/segments`, {

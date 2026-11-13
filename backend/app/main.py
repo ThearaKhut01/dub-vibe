@@ -1241,7 +1241,27 @@ async def generate_segment_audio(project_id: str, segment_id: str, payload: dict
     if index < 0:
         raise HTTPException(status_code=404, detail='Segment not found')
     segment = project['segments'][index]
-    gender = 'Female' if str(payload.get('gender') or '').strip().lower() == 'female' else 'Male'
+    requested_gender = str(payload.get('gender') or '').strip().lower()
+    if requested_gender == 'auto':
+        # Detect this line's speaker gender from its own audio (the ECAPA
+        # classifier), then speak it with the matching voice. A gender the user
+        # already picked (editor button or a previous detection) is honored.
+        gender = str(segment.get('gender') or '').strip()
+        if gender not in ('Male', 'Female'):
+            detected = speaker_diarization.classify_segment_gender(
+                str(project.get('media_path') or ''),
+                float(segment.get('start') or 0), float(segment.get('end') or 0),
+                find_media_tool('ffmpeg') or '',
+            )
+            if detected not in ('Male', 'Female'):
+                raise HTTPException(
+                    status_code=503,
+                    detail='Could not hear this line clearly enough to tell the speaker gender. '
+                           'Run Detect speakers for the project, or pick Male voice / Female voice for this line.',
+                )
+            gender = detected
+    else:
+        gender = 'Female' if requested_gender == 'female' else 'Male'
     voice = segment_tts.voice_for_gender(gender)
     # Remember the speaker's voice on the line itself, so it survives a reload before audio
     # exists — including when synthesis below fails and no clip is written.
@@ -1287,6 +1307,65 @@ async def generate_segment_audio(project_id: str, segment_id: str, payload: dict
     if previous_path and previous_path != entry['path'] and Path(str(previous_path)).is_file():
         Path(str(previous_path)).unlink(missing_ok=True)
     return {'status': 'ok', 'audio': entry}
+
+
+@app.post('/api/projects/{project_id}/segments/detect-genders')
+async def detect_segment_genders(project_id: str) -> dict[str, Any]:
+    """Listen to every unclassified line and save its speaker gender.
+
+    The Dubbing Track's "Auto-detect all" button: no audio is generated — only
+    the Male/Female decision is stored per line (and on the speaker's profile),
+    so the editor's buttons auto-select the detected voice and the dub uses it.
+    Lines that are too short or too noisy are reported instead of guessed.
+    """
+    project = projects.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail='Project not found')
+    segments = project.get('segments', [])
+    if not segments:
+        raise HTTPException(status_code=409, detail='Transcribe the video before detecting voices')
+    media_path = str(project.get('media_path') or '')
+    if not media_path or not Path(media_path).is_file():
+        raise HTTPException(status_code=409, detail='Import the video before detecting voices')
+    ffmpeg = find_media_tool('ffmpeg')
+    if not ffmpeg:
+        raise HTTPException(status_code=503, detail='FFmpeg must be installed and available on PATH')
+
+    def detect_all() -> tuple[dict[str, str], list[int]]:
+        detected: dict[str, str] = {}
+        unsure: list[int] = []
+        speaker_gender: dict[str, str] = {}
+        characters = project.setdefault('characters', {})
+        for index, segment in enumerate(segments):
+            speaker = str(segment.get('speaker') or '')
+            gender = str(segment.get('gender') or '').strip()
+            if gender not in ('Male', 'Female') and speaker in speaker_gender:
+                gender = speaker_gender[speaker]  # same speaker: one hearing is enough
+            if gender not in ('Male', 'Female'):
+                detected_gender = speaker_diarization.classify_segment_gender(
+                    media_path, float(segment.get('start') or 0), float(segment.get('end') or 0), ffmpeg,
+                )
+                if detected_gender in ('Male', 'Female'):
+                    gender = detected_gender
+                    speaker_gender[speaker] = gender
+                    profile = characters.setdefault(speaker, {})
+                    if not profile.get('gender'):
+                        profile['gender'] = gender
+                    segment['gender'] = gender
+                else:
+                    unsure.append(index + 1)
+            if gender in ('Male', 'Female'):
+                detected[str(segment.get('id'))] = gender
+        return detected, unsure
+
+    detected, unsure = await run_in_threadpool(detect_all)
+    persist_project(project_id)
+    males = sum(1 for gender in detected.values() if gender == 'Male')
+    message = f'Detected {males} male and {len(detected) - males} female line(s).'
+    if unsure:
+        listed = ', '.join(str(line) for line in unsure[:10]) + ('…' if len(unsure) > 10 else '')
+        message += f' Could not hear line(s) {listed} — pick a voice manually.'
+    return {'status': 'ok', 'detected': detected, 'unsure_lines': unsure, 'message': message}
 
 
 @app.post('/api/projects/{project_id}/segments')
@@ -2342,6 +2421,80 @@ def _majority_language(languages: list[str]) -> str | None:
     return None
 
 
+def mixed_voice_labels(segments_list: list[dict[str, Any]], characters: dict[str, dict[str, Any]],
+                       media_path: str = '', ffmpeg: str | None = None) -> list[str]:
+    """Voice label per line for payload.voice == 'mixed'.
+
+    The speaker's real gender decides, in order of trust:
+      1. the line's saved gender — the Dubbing Track editor's explicit
+         Male/Female pick (also where the auto-detection below lands);
+      2. the character profile's gender — Speaker Detection's ECAPA classifier
+         (VoxCeleb-trained) heard that speaker's whole voice;
+      3. the line's own audio through the same classifier, saved back on the
+         line so the editor shows it and the next run skips re-classifying;
+      4. a line nobody could classify keeps the previous line's voice instead
+         of flipping on a pause.
+    Only a project with no gender signal at all falls back to the old pause
+    heuristic. Returns one label per line, aligned with `segments_list`.
+    """
+    def known_gender(segment: dict[str, Any]) -> str | None:
+        gender = str(segment.get('gender') or '').strip()
+        if gender in ('Male', 'Female'):
+            return gender
+        profile = characters.get(str(segment.get('speaker') or '')) or {}
+        gender = str(profile.get('gender') or '').strip()
+        return gender if gender in ('Male', 'Female') else None
+
+    labels: list[str] = []
+    current = 'Male Voice A'
+    speaker_gender: dict[str, str] = {}
+    classified_any = False
+    for segment in segments_list:
+        speaker = str(segment.get('speaker') or '')
+        gender = known_gender(segment) or speaker_gender.get(speaker)
+        if gender is None:
+            detected = speaker_diarization.classify_segment_gender(
+                media_path, float(segment.get('start') or 0), float(segment.get('end') or 0), ffmpeg or '',
+            )
+            if detected in ('Male', 'Female'):
+                speaker_gender[speaker] = detected
+                profile = characters.setdefault(speaker, {})
+                if not profile.get('gender'):
+                    profile['gender'] = detected
+                segment['gender'] = detected  # shown in the editor, reused next run
+                gender = detected
+        if gender in ('Male', 'Female'):
+            classified_any = True
+            current = 'Female Voice B' if gender == 'Female' else 'Male Voice A'
+        labels.append(current)
+    if not classified_any:
+        # No profile genders, no saved picks, no usable classifier: the timing
+        # heuristic is all that is left.
+        return _mixed_labels_by_pause(segments_list)
+    return labels
+
+
+def _mixed_labels_by_pause(segments_list: list[dict[str, Any]]) -> list[str]:
+    """The old fallback: alternate male/female on conversation breaks.
+
+    A pause longer than ~1 s suggests the other person started talking; lines
+    within one continuous run keep the same voice. Nothing about the voice is
+    actually heard, so accuracy is coin-flip — this only runs when the gender
+    classifier is unavailable and no speaker data exists.
+    """
+    labels: list[str] = []
+    current = 'Male Voice A'
+    previous_end: float | None = None
+    for segment in segments_list:
+        start = float(segment.get('start') or 0)
+        end = float(segment.get('end') or start)
+        if previous_end is not None and start - previous_end > 1.0:
+            current = 'Female Voice B' if current == 'Male Voice A' else 'Male Voice A'
+        labels.append(current)
+        previous_end = end
+    return labels
+
+
 @app.post('/api/process/transcribe')
 async def process_transcribe(payload: ProcessingRequest) -> dict[str, Any]:
     project = projects.get(payload.project_id)
@@ -2985,27 +3138,22 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
                 return f' (part {part_index + 1} of {len(project_chunks)})'
         return ''
 
-    def mixed_voice_labels(segments_list: list[dict[str, Any]]) -> list[str]:
-        """Voice label per line for payload.voice == 'mixed'.
-
-        Without speaker detection every line would get the same fallback
-        voice, so alternate male/female on conversation breaks — a pause
-        longer than ~1 s suggests the other person started talking. Lines
-        within one continuous run keep the same voice.
-        """
-        labels: list[str] = []
-        current = 'Male Voice A'
-        previous_end: float | None = None
-        for segment in segments_list:
-            start = float(segment.get('start') or 0)
-            end = float(segment.get('end') or start)
-            if previous_end is not None and start - previous_end > 1.0:
-                current = 'Female Voice B' if current == 'Male Voice A' else 'Male Voice A'
-            labels.append(current)
-            previous_end = end
-        return labels
-
-    mixed_labels = mixed_voice_labels(segments) if payload.voice == 'mixed' else None
+    if payload.voice == 'mixed':
+        await emit_progress(
+            payload.project_id, 'Generating Voice', 70,
+            "Detecting each line's speaker gender for the mixed voice...",
+        )
+        gender_before = [str(segment.get('gender') or '') for segment in segments]
+        mixed_labels = await run_in_threadpool(
+            mixed_voice_labels, segments, characters, str(project.get('media_path') or ''),
+            find_media_tool('ffmpeg'),
+        )
+        # Detected genders are saved on the lines (visible and overridable in the
+        # Dubbing Track editor), so the next run classifies only new lines.
+        if [str(segment.get('gender') or '') for segment in segments] != gender_before:
+            persist_project(payload.project_id)
+    else:
+        mixed_labels = None
     clone_references: dict[str, Path] | None = None
     if payload.tts_provider == 'voxcpm_clone':
         from . import voxcpm_dub
@@ -3093,7 +3241,8 @@ async def process_tts(payload: ProcessingRequest) -> dict[str, Any]:
                                 'analyzer': 'none'}
                 emotion = (analysis.get('emotion') or 'Neutral') if payload.emotion == 'Auto' else payload.emotion
                 intensity = analysis.get('intensity', payload.intensity) if payload.emotion == 'Auto' else payload.intensity
-                # Character voice wins; 'mixed' alternates genders per line.
+                # Character voice wins; 'mixed' assigns each line by its
+                # speaker's detected gender.
                 line_voice = payload.voice
                 if mixed_labels is not None and not profile.get('voice'):
                     line_voice = mixed_labels[index]

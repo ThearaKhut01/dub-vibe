@@ -170,6 +170,60 @@ def assign_speakers(media_path: str, segments: list[dict[str, Any]], ffmpeg: str
         wav_path.unlink(missing_ok=True)
 
 
+def classify_segment_gender(media_path: str, start: float, end: float, ffmpeg: str) -> str | None:
+    """Gender of one subtitle line's speaker, heard from that line's own audio.
+
+    Cuts the line to a mono 16 kHz wav, VAD-trims each window, and lets the
+    ECAPA classifier vote over them. Returns None — never a guess — when the
+    model is missing or not downloaded, the clip is too short, or the vote is
+    unsure, so callers keep their previous decision instead of flipping voices.
+    """
+    duration = float(end or 0) - float(start or 0)
+    if not media_path or not ffmpeg or duration < 0.4:
+        return None
+    if not gender_classifier.is_available() or not gender_classifier.is_downloaded():
+        return None  # a 62 MB download is never started silently inside a dub
+    wav_path = get_storage_dir('data') / 'gender-line.wav'
+    try:
+        import subprocess
+
+        subprocess.run(
+            [ffmpeg, '-y', '-ss', f'{max(0.0, float(start)):.3f}', '-t', f'{duration:.3f}',
+             '-i', str(media_path), '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', str(wav_path)],
+            check=True, capture_output=True, text=True, timeout=60,
+        )
+        import soundfile as sf
+
+        audio, sample_rate = sf.read(str(wav_path), dtype='float32')
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        window_len = int(2.0 * sample_rate)
+        hop_len = int(1.0 * sample_rate)
+        min_len = int(0.5 * sample_rate)
+        windows: list[Any] = []
+        for pos in range(0, max(1, len(audio) - min_len + 1), hop_len):
+            clip = audio[pos:pos + window_len]
+            if len(clip) < min_len:
+                continue
+            try:
+                from resemblyzer import preprocess_wav
+
+                voiced = preprocess_wav(clip, source_sr=sample_rate)
+            except Exception:
+                voiced = clip  # VAD is a quality boost, not a requirement
+            if len(voiced) >= min_len:
+                windows.append(voiced)
+            if len(windows) >= gender_classifier._MAX_WINDOWS_PER_SPEAKER:
+                break
+        result = gender_classifier.classify_speaker_windows(windows, sample_rate)
+        return (result or {}).get('gender')
+    except Exception as error:  # noqa: BLE001 - one unheard line must not fail the dub
+        logger.warning('Per-line gender classification failed: %s', error)
+        return None
+    finally:
+        wav_path.unlink(missing_ok=True)
+
+
 def _pitch_track(samples: Any, sample_rate: int) -> np.ndarray | None:
     """Fundamental-frequency frames (Hz) of a voiced clip, unvoiced frames dropped."""
     try:
